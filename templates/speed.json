@@ -1,0 +1,1 @@
+{"description":"Measures tokens per second only. Warmup plus 2 timed runs of 200 tokens. No scoring.","id":"speed","name":"Speed","num_predict":200,"prompts":["Write a short story about a blacksmith.","Write a short story about a sailor."],"scored":false}
