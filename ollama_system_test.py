@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-"""OLLAMA SYSTEM TEST v2 - benchmark the Ollama models on this PC.
+"""OLLAMA SYSTEM TEST v3 - benchmark the Ollama models on this PC.
 
 Native Qt desktop window. Talks to Ollama on localhost:11434
 (or the OLLAMA_HOST environment variable). No web server, no browser.
 HTTP is stdlib urllib only; the only third-party package is PySide6.
 
-v2 adds test templates (JSON files in templates/), per-task scoring,
+v2 added test templates (JSON files in templates/), per-task scoring,
 and immutable per-model result folders organised per system:
 results/<model>/<system>/<timestamp>-<template>.json
+
+v3 fixes the real-PC failures from v2 (nothing ticked by default, the
+run checks Ollama is answering before it starts, a Start Ollama button,
+retry once, and the run stops instead of marching on when Ollama goes
+away) and adds per-model profiles and pulling models from the app.
+
+DURABLE RULE: nothing is ever ticked by default. Every model and every
+template starts unchecked; the user ticks what they want to test.
 """
 
 import ast
@@ -31,6 +39,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -54,8 +63,17 @@ STALL_TIMEOUT = 120.0     # seconds with no chunk at all before giving up
 CODE_TIMEOUT = 10.0       # seconds allowed for one code test case
 ANSWER_TRUNCATE = 2000    # chars of raw answer kept in a run file
 OLLAMA_DOWN_MESSAGE = "Ollama is not running. Start it first, then open this again."
+OLLAMA_DOWN_RUN_MESSAGE = "Ollama is not running. Press Start Ollama, then Run again."
+OLLAMA_DIED_MESSAGE = "Ollama stopped responding. Start Ollama, then press Refresh and Run again."
+UNREACHABLE = "could not reach Ollama"
+UNREACHABLE_HINT = "could not reach Ollama — start it, then press Refresh"
+START_OLLAMA_TIMEOUT_MSG = "Ollama could not be started. Run ollama serve in a terminal to see the error."
+START_OLLAMA_MISSING_MSG = "Ollama is not installed. Install it first, then try again."
 NO_MODELS_MESSAGE = "No models installed yet. Pull one with ollama pull, then press Refresh."
 NO_TEMPLATES_MESSAGE = "No test templates found in the templates folder."
+RETRY_DELAY = 3.0            # seconds before retrying a failed generate once
+START_OLLAMA_TIMEOUT = 30.0  # seconds to wait for `ollama serve` to answer
+START_OLLAMA_POLL = 1.0      # seconds between checks while waiting
 KNOWN_RULES = ("contains", "numeric", "json", "code", "count_lines", "max_words")
 
 
@@ -65,6 +83,22 @@ class OllamaError(Exception):
 
 class Cancelled(Exception):
     """The user pressed Cancel."""
+
+
+class OllamaUnreachable(Exception):
+    """Ollama stopped answering mid-run; the whole run must stop."""
+
+
+def is_unreachable(exc):
+    """True when an error means Ollama itself went away (not one bad model)."""
+    return str(exc).startswith(UNREACHABLE)
+
+
+def describe_error(exc):
+    """Plain failure text: unreachable errors get the actionable hint."""
+    if is_unreachable(exc):
+        return UNREACHABLE_HINT
+    return str(exc)
 
 
 def ollama_base():
@@ -148,6 +182,15 @@ def http_get_json(path, timeout=10):
         raise OllamaError(_http_error_reason(exc))
     except (urllib.error.URLError, socket.timeout, OSError):
         raise OllamaError("could not reach Ollama")
+
+
+def ollama_reachable():
+    """True when Ollama answers on its HTTP API right now."""
+    try:
+        http_get_json("/api/tags", timeout=5)
+        return True
+    except OllamaError:
+        return False
 
 
 def list_models_cli():
@@ -235,6 +278,11 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
                 if time.monotonic() - last_chunk > STALL_TIMEOUT:
                     raise OllamaError("Ollama stopped responding")
                 continue
+            except OSError:
+                # Timeout is an OSError subclass, so this branch comes
+                # AFTER it: a reset or dropped connection mid-stream
+                # means Ollama went away, not that one model misbehaved.
+                raise OllamaError("could not reach Ollama")
             if not line:
                 break
             last_chunk = time.monotonic()
@@ -256,7 +304,9 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
     finally:
         resp.close()
     if done is None:
-        raise OllamaError("Ollama ended the run without a result")
+        # The stream ended before Ollama sent its done event: the
+        # connection went away mid-answer, so this is unreachable too.
+        raise OllamaError("could not reach Ollama")
     return {
         "prompt": prompt,
         "answer": "".join(answer_parts),
@@ -812,6 +862,169 @@ def render_run_summary(run_data):
 
 
 # ---------------------------------------------------------------------------
+# Per-model profiles (living summaries, regenerated from the run files)
+# ---------------------------------------------------------------------------
+# The run files stay immutable; PROFILE.md is the one file that is
+# rewritten, and only ever from the numbers in those run files. The
+# verdict is deterministic template text — no LLM, no invented claims.
+
+STRENGTH_AT = 80.0   # a template at this score or better is a strength
+WEAKNESS_UNDER = 50.0  # a template under this score is a weakness
+
+
+def load_model_runs(results_dir, model_slug):
+    """Every run file for one model, oldest first, full data."""
+    entries = list_history_runs(results_dir, model_slug)
+    entries.sort(key=lambda e: (e["timestamp"], e["filename"]))
+    runs = []
+    for entry in entries:
+        data = load_run_file(entry["path"])
+        if data is not None:
+            runs.append(data)
+    return runs
+
+
+def _verdict(overall_latest, strengths, weaknesses, avg_speed):
+    """Plain-language verdict from the numbers only."""
+    if overall_latest is None:
+        return (
+            "No scored tests yet, so there is no verdict. Run the scored "
+            "templates (Coding, Math, Reasoning, Instruction, Knowledge) "
+            "to find this model's strengths and weaknesses."
+        )
+    if overall_latest >= 80:
+        parts = ["Strong on this PC. This model passes most of what it is tested on."]
+    elif overall_latest >= 50:
+        parts = ["Solid on this PC, with clear strengths and gaps."]
+    else:
+        parts = ["Struggles on this PC. It fails most of what it is tested on."]
+    if strengths:
+        parts.append("Best at: " + ", ".join(strengths) + ".")
+    if weaknesses:
+        parts.append("Weakest at: " + ", ".join(weaknesses) + ".")
+    if avg_speed is not None:
+        parts.append(f"Average speed is {avg_speed:.1f} tokens per second.")
+    return " ".join(parts)
+
+
+def build_profile(results_dir, model_slug):
+    """Markdown profile for one model, built from all its run files.
+
+    Returns (model_name, text), or None when the model has no runs.
+    """
+    runs = load_model_runs(results_dir, model_slug)
+    if not runs:
+        return None
+    model_name = runs[-1].get("model") or model_slug
+    systems = sorted({r.get("system_id", "?") for r in runs})
+    last_tested = runs[-1].get("timestamp", "?")
+    by_template = {}
+    for run in runs:
+        by_template.setdefault(run.get("template", "?"), []).append(run)
+    template_rows = []
+    latest_scores = []
+    best_scores = []
+    for tid in sorted(by_template):
+        t_runs = by_template[tid]
+        name = t_runs[-1].get("template_name", tid)
+        scored = [r for r in t_runs if r.get("template_score") is not None]
+        if scored:
+            latest = scored[-1]["template_score"]
+            best = max(r["template_score"] for r in scored)
+            latest_scores.append(latest)
+            best_scores.append(best)
+            template_rows.append((name, latest, best, len(t_runs)))
+        else:
+            template_rows.append((name, None, None, len(t_runs)))
+    overall_latest = (
+        sum(latest_scores) / len(latest_scores) if latest_scores else None
+    )
+    overall_best = sum(best_scores) / len(best_scores) if best_scores else None
+    speeds = [
+        r["avg_decode_tok_s"]
+        for r in runs
+        if r.get("avg_decode_tok_s") is not None
+    ]
+    avg_speed = sum(speeds) / len(speeds) if speeds else None
+    strengths = [
+        name for name, latest, _best, _n in template_rows
+        if latest is not None and latest >= STRENGTH_AT
+    ]
+    weaknesses = [
+        name for name, latest, _best, _n in template_rows
+        if latest is not None and latest < WEAKNESS_UNDER
+    ]
+
+    lines = [
+        f"# {model_name}",
+        "",
+        f"Profile updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"Last tested: {last_tested}",
+        f"Runs: {len(runs)}",
+        f"Systems tested on: {', '.join(systems)}",
+        "",
+        "## Overall",
+        "",
+    ]
+    if overall_latest is None:
+        lines.append("Latest overall score: no scored tests yet")
+        lines.append("Best overall score: no scored tests yet")
+    else:
+        lines.append(f"Latest overall score: {overall_latest:.0f}%")
+        lines.append(f"Best overall score: {overall_best:.0f}%")
+    lines.append(f"Average decode speed: {fmt_toks(avg_speed)} tokens per second")
+    lines.append("")
+    lines.append("## Per template")
+    lines.append("")
+    lines.append("| Template | Latest | Best | Runs |")
+    lines.append("| --- | --- | --- | --- |")
+    for name, latest, best, count in template_rows:
+        if latest is None:
+            lines.append(f"| {name} | no scoring | no scoring | {count} |")
+        else:
+            lines.append(f"| {name} | {latest:.0f}% | {best:.0f}% | {count} |")
+    lines.append("")
+    lines.append("## Strengths")
+    lines.append("")
+    if strengths:
+        for name in strengths:
+            lines.append(f"- {name}")
+    else:
+        lines.append("None yet — no template at 80% or better.")
+    lines.append("")
+    lines.append("## Weaknesses")
+    lines.append("")
+    if weaknesses:
+        for name in weaknesses:
+            lines.append(f"- {name}")
+    else:
+        lines.append("None yet — no template under 50%.")
+    lines.append("")
+    lines.append("## Verdict")
+    lines.append("")
+    lines.append(_verdict(overall_latest, strengths, weaknesses, avg_speed))
+    lines.append("")
+    return model_name, "\n".join(lines)
+
+
+def write_profile(results_dir, model_slug):
+    """Regenerate results/<model-slug>/PROFILE.md from the run files.
+
+    Returns the path written, or None when the model has no runs.
+    """
+    built = build_profile(results_dir, model_slug)
+    if built is None:
+        return None
+    _name, text = built
+    folder = os.path.join(results_dir, model_slug)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "PROFILE.md")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Session report (summary of the current run, as in v1)
 # ---------------------------------------------------------------------------
 
@@ -891,7 +1104,8 @@ class BenchWorker(QThread):
     template_done = Signal(str, dict, str)  # model, run data, file path
     model_done = Signal(str, dict)
     progress = Signal(str, int)
-    run_finished = Signal(bool)  # True = completed, False = cancelled
+    # "done", "cancelled", or "ollama_down"
+    run_finished = Signal(str)
 
     def __init__(self, models, templates, sys_id, machine, results_dir):
         super().__init__()
@@ -907,6 +1121,27 @@ class BenchWorker(QThread):
 
     def _should_stop(self):
         return self._stop
+
+    def _generate(self, model, prompt, num_predict):
+        """One generate call, retried once if Ollama did not answer.
+
+        A single dropped connection is often transient (Ollama was
+        still starting, or the machine was swapping), so one retry
+        after a short pause is worth it. Anything else fails at once.
+        """
+        try:
+            return generate_once(
+                model, prompt, num_predict, TEMPERATURE, self._should_stop
+            )
+        except OllamaError as exc:
+            if not is_unreachable(exc) or self._stop:
+                raise
+            time.sleep(RETRY_DELAY)
+            if self._stop:
+                raise Cancelled()
+            return generate_once(
+                model, prompt, num_predict, TEMPERATURE, self._should_stop
+            )
 
     def _count_steps(self):
         steps = 0
@@ -936,10 +1171,12 @@ class BenchWorker(QThread):
             if self._stop:
                 raise Cancelled()
             try:
-                metrics = generate_once(
-                    model, prompt, num_predict, TEMPERATURE, self._should_stop
-                )
+                metrics = self._generate(model, prompt, num_predict)
             except OllamaError as exc:
+                if is_unreachable(exc):
+                    # Ollama itself went away: stop the whole run
+                    # instead of failing every remaining task and model.
+                    raise OllamaUnreachable(describe_error(exc))
                 task_results.append({
                     "id": job_id,
                     "prompt": prompt,
@@ -1004,7 +1241,7 @@ class BenchWorker(QThread):
         self._done_steps = 0
         for model in self.models:
             if self._stop:
-                self.run_finished.emit(False)
+                self.run_finished.emit("cancelled")
                 return
             self.model_started.emit(model)
             result = {
@@ -1020,15 +1257,18 @@ class BenchWorker(QThread):
                     f"{model}: warming up",
                     int(100 * self._done_steps / self._total_steps),
                 )
-                generate_once(
-                    model, WARMUP_PROMPT, WARMUP_PREDICT, TEMPERATURE,
-                    self._should_stop,
-                )
+                self._generate(model, WARMUP_PROMPT, WARMUP_PREDICT)
                 self._done_steps += 1
             except Cancelled:
-                self.run_finished.emit(False)
+                self.run_finished.emit("cancelled")
                 return
             except OllamaError as exc:
+                if is_unreachable(exc):
+                    # The warmup retry already failed: Ollama is gone.
+                    result["status"] = f"failed: {describe_error(exc)}"
+                    self.model_done.emit(model, result)
+                    self.run_finished.emit("ollama_down")
+                    return
                 result["status"] = f"failed: {exc}"
                 self.model_done.emit(model, result)
                 continue
@@ -1041,7 +1281,12 @@ class BenchWorker(QThread):
                     result["templates"][template["id"]]["run_file"] = path
                     self.template_done.emit(model, run_data, path)
             except Cancelled:
-                self.run_finished.emit(False)
+                self.run_finished.emit("cancelled")
+                return
+            except OllamaUnreachable as exc:
+                result["status"] = f"failed: {exc}"
+                self.model_done.emit(model, result)
+                self.run_finished.emit("ollama_down")
                 return
             scores = [
                 run["template_score"]
@@ -1061,7 +1306,116 @@ class BenchWorker(QThread):
             result["size_ram"] = ps_sizes().get(model)
             self.model_done.emit(model, result)
         self.progress.emit("Done.", 100)
-        self.run_finished.emit(True)
+        self.run_finished.emit("done")
+
+
+# ---------------------------------------------------------------------------
+# Ollama starter (runs `ollama serve` detached, then waits for it)
+# ---------------------------------------------------------------------------
+
+class OllamaStarter(QThread):
+    started_ok = Signal()
+    failed = Signal(str)  # plain message
+
+    def run(self):
+        if ollama_reachable():
+            self.started_ok.emit()
+            return
+        try:
+            subprocess.Popen(
+                ["ollama", "serve"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            self.failed.emit(START_OLLAMA_MISSING_MSG)
+            return
+        except OSError as exc:
+            self.failed.emit(f"Could not start Ollama: {exc}")
+            return
+        deadline = time.monotonic() + START_OLLAMA_TIMEOUT
+        while time.monotonic() < deadline:
+            if ollama_reachable():
+                self.started_ok.emit()
+                return
+            time.sleep(START_OLLAMA_POLL)
+        self.failed.emit(START_OLLAMA_TIMEOUT_MSG)
+
+
+# ---------------------------------------------------------------------------
+# Model puller (streams /api/pull progress in its own thread)
+# ---------------------------------------------------------------------------
+
+class PullWorker(QThread):
+    progress = Signal(int, str)  # percent 0-100, or -1 when unknown; status text
+    finished_ok = Signal(str)    # model name
+    failed = Signal(str)         # plain message
+
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+
+    def run(self):
+        payload = {"name": self.name, "stream": True}
+        req = urllib.request.Request(
+            ollama_base() + "/api/pull",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=READ_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            self.failed.emit(_http_error_reason(exc))
+            return
+        except (urllib.error.URLError, socket.timeout, OSError):
+            self.failed.emit(UNREACHABLE_HINT)
+            return
+        last_chunk = time.monotonic()
+        try:
+            while True:
+                try:
+                    line = resp.readline()
+                except socket.timeout:
+                    if time.monotonic() - last_chunk > STALL_TIMEOUT:
+                        self.failed.emit("Ollama stopped responding")
+                        return
+                    continue
+                except OSError:
+                    self.failed.emit(UNREACHABLE_HINT)
+                    return
+                if not line:
+                    break
+                last_chunk = time.monotonic()
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if event.get("error"):
+                    self.failed.emit(str(event["error"]).strip().splitlines()[0])
+                    return
+                status = event.get("status") or ""
+                if status == "success":
+                    self.finished_ok.emit(self.name)
+                    return
+                completed = event.get("completed")
+                total = event.get("total")
+                if total:
+                    percent = int(100 * (completed or 0) / total)
+                    text = (
+                        f"{status}: {(completed or 0) / 1_000_000:.1f} MB "
+                        f"of {total / 1_000_000:.1f} MB"
+                    )
+                else:
+                    percent = -1
+                    text = status
+                self.progress.emit(percent, text)
+        finally:
+            resp.close()
+        self.failed.emit("The pull ended without finishing. Try again.")
 
 
 class NumericItem(QTableWidgetItem):
@@ -1095,6 +1449,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(980, 720)
         self.worker = None
+        self.pull_worker = None
+        self.starter = None
         self.results = {}
         self.result_order = []
         self.templates = []
@@ -1111,9 +1467,10 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(bench_tab)
 
         intro = QLabel(
-            "Tick the models and the test templates, then press Run. "
-            "Each model runs each template in turn; every template run is "
-            "saved to its own file under results, and nothing is ever overwritten."
+            "Nothing is ticked to start with. Tick the models and the test "
+            "templates you want, then press Run. Each model runs each template "
+            "in turn; every template run is saved to its own file under results, "
+            "and nothing is ever overwritten."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1163,12 +1520,34 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(False)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_models)
+        self.start_ollama_button = QPushButton("Start Ollama")
+        self.start_ollama_button.clicked.connect(self.start_ollama)
         run_buttons.addWidget(self.run_button)
         run_buttons.addWidget(self.cancel_button)
         run_buttons.addWidget(self.save_button)
         run_buttons.addWidget(self.refresh_button)
+        run_buttons.addWidget(self.start_ollama_button)
         run_buttons.addStretch()
         layout.addLayout(run_buttons)
+
+        # ---- Pull a model ----
+        pull_row = QHBoxLayout()
+        pull_row.addWidget(QLabel("Pull a model:"))
+        self.pull_input = QLineEdit()
+        self.pull_input.setPlaceholderText("model name, e.g. qwen3:4b")
+        self.pull_input.returnPressed.connect(self.start_pull)
+        self.pull_button = QPushButton("Pull")
+        self.pull_button.clicked.connect(self.start_pull)
+        pull_row.addWidget(self.pull_input)
+        pull_row.addWidget(self.pull_button)
+        layout.addLayout(pull_row)
+        self.pull_bar = QProgressBar()
+        self.pull_bar.setRange(0, 100)
+        self.pull_bar.setValue(0)
+        layout.addWidget(self.pull_bar)
+        self.pull_status = QLabel("")
+        self.pull_status.setWordWrap(True)
+        layout.addWidget(self.pull_status)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -1209,6 +1588,9 @@ class MainWindow(QMainWindow):
         ))
         history_top = QHBoxLayout()
         self.history_model_combo = QComboBox()
+        # Grow to fit the longest model name; without this the picker
+        # stays at the width it had when empty and clips every name.
+        self.history_model_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.history_model_combo.currentIndexChanged.connect(self.on_history_model_changed)
         self.history_refresh_button = QPushButton("Refresh")
         self.history_refresh_button.clicked.connect(self.refresh_history)
@@ -1223,15 +1605,50 @@ class MainWindow(QMainWindow):
         self.history_view.setReadOnly(True)
         self.history_view.setPlainText("Pick a run to see its scores.")
         history_layout.addWidget(self.history_view)
+
+        # ---- Profiles tab ----
+        profiles_tab = QWidget()
+        tabs.addTab(profiles_tab, "Profiles")
+        profiles_layout = QVBoxLayout(profiles_tab)
+        profiles_layout.addWidget(QLabel(
+            "Each model gets a profile: its scores, strengths, and weaknesses, "
+            "built from every run it has ever done. Profiles rebuild themselves "
+            "after each run."
+        ))
+        profile_top = QHBoxLayout()
+        self.profile_model_combo = QComboBox()
+        # Grow to fit the longest model name; without this the picker
+        # stays at the width it had when empty and clips every name.
+        self.profile_model_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.profile_model_combo.currentIndexChanged.connect(self.on_profile_model_changed)
+        self.profile_regen_button = QPushButton("Regenerate")
+        self.profile_regen_button.clicked.connect(self.regenerate_profile)
+        profile_top.addWidget(self.profile_model_combo)
+        profile_top.addWidget(self.profile_regen_button)
+        profile_top.addStretch()
+        profiles_layout.addLayout(profile_top)
+        self.profile_view = QTextEdit()
+        self.profile_view.setReadOnly(True)
+        self.profile_view.setPlainText("Pick a model to see its profile.")
+        profiles_layout.addWidget(self.profile_view)
         tabs.currentChanged.connect(self.on_tab_changed)
 
         self.refresh_templates()
         self.refresh_models()
         self.refresh_history()
+        self.refresh_profiles()
 
     # -- models and templates --------------------------------------------
 
     def refresh_templates(self):
+        # A refresh keeps whatever the user had ticked; a fresh list
+        # starts with nothing ticked (durable rule: never default
+        # anything to selected).
+        checked = {
+            self.template_list.item(row).data(Qt.UserRole)
+            for row in range(self.template_list.count())
+            if self.template_list.item(row).checkState() == Qt.Checked
+        }
         templates, warnings = load_templates()
         self.templates = templates
         self.template_list.clear()
@@ -1242,13 +1659,20 @@ class MainWindow(QMainWindow):
                 label = f"{template['name']} (no scoring)"
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
+            item.setCheckState(
+                Qt.Checked if template["id"] in checked else Qt.Unchecked
+            )
             item.setData(Qt.UserRole, template["id"])
             self.template_list.addItem(item)
         self.template_warnings = warnings
         return warnings
 
     def refresh_models(self):
+        checked = {
+            self.model_list.item(row).text()
+            for row in range(self.model_list.count())
+            if self.model_list.item(row).checkState() == Qt.Checked
+        }
         self.refresh_templates()
         self.model_list.clear()
         try:
@@ -1264,7 +1688,9 @@ class MainWindow(QMainWindow):
         for name in names:
             item = QListWidgetItem(name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
+            item.setCheckState(
+                Qt.Checked if name in checked else Qt.Unchecked
+            )
             self.model_list.addItem(item)
         if not self.templates:
             self.status_label.setText(NO_TEMPLATES_MESSAGE)
@@ -1324,6 +1750,12 @@ class MainWindow(QMainWindow):
         if not templates:
             self.status_label.setText("Tick at least one test template first.")
             return
+        # The list may have come from the CLI fallback while the API was
+        # down, or Ollama may have stopped since the window opened: check
+        # it answers before starting, or every model fails one by one.
+        if not ollama_reachable():
+            self.status_label.setText(OLLAMA_DOWN_RUN_MESSAGE)
+            return
         # Sorting stays OFF while the run builds the table: a live sort
         # moves rows mid-update and later setItem calls land on the wrong
         # model. It goes back on when the run finishes.
@@ -1356,6 +1788,72 @@ class MainWindow(QMainWindow):
             self.worker.request_cancel()
             self.cancel_button.setEnabled(False)
             self.status_label.setText("Stopping after the current task...")
+
+    # -- start Ollama ----------------------------------------------------
+
+    def start_ollama(self):
+        if self.starter is not None:
+            return
+        self.start_ollama_button.setEnabled(False)
+        self.status_label.setText("Starting Ollama...")
+        self.starter = OllamaStarter()
+        self.starter.started_ok.connect(self.on_ollama_started)
+        self.starter.failed.connect(self.on_ollama_start_failed)
+        self.starter.start()
+
+    def on_ollama_started(self):
+        self.starter = None
+        self.start_ollama_button.setEnabled(True)
+        self.refresh_models()
+        self.status_label.setText("Ollama is running.")
+
+    def on_ollama_start_failed(self, message):
+        self.starter = None
+        self.start_ollama_button.setEnabled(True)
+        self.status_label.setText(message)
+
+    # -- pull a model ----------------------------------------------------
+
+    def start_pull(self):
+        name = self.pull_input.text().strip()
+        if not name:
+            self.pull_status.setText("Type a model name first.")
+            return
+        if self.pull_worker is not None:
+            return
+        self.pull_button.setEnabled(False)
+        self.pull_bar.setRange(0, 100)
+        self.pull_bar.setValue(0)
+        self.pull_status.setText(f"Pulling {name}...")
+        self.pull_worker = PullWorker(name)
+        self.pull_worker.progress.connect(self.on_pull_progress)
+        self.pull_worker.finished_ok.connect(self.on_pull_done)
+        self.pull_worker.failed.connect(self.on_pull_failed)
+        self.pull_worker.start()
+
+    def on_pull_progress(self, percent, text):
+        if percent < 0:
+            self.pull_bar.setRange(0, 0)
+        else:
+            self.pull_bar.setRange(0, 100)
+            self.pull_bar.setValue(percent)
+        self.pull_status.setText(text)
+
+    def on_pull_done(self, name):
+        self.pull_worker = None
+        self.pull_button.setEnabled(True)
+        self.pull_bar.setRange(0, 100)
+        self.pull_bar.setValue(100)
+        self.pull_status.setText(f"Pulled {name}.")
+        self.pull_input.clear()
+        self.refresh_models()
+
+    def on_pull_failed(self, message):
+        self.pull_worker = None
+        self.pull_button.setEnabled(True)
+        self.pull_bar.setRange(0, 100)
+        self.pull_bar.setValue(0)
+        self.pull_status.setText(f"Pull failed: {message}")
 
     def on_progress(self, text, percent):
         self.status_label.setText(text)
@@ -1395,7 +1893,7 @@ class MainWindow(QMainWindow):
         )
         self.table.setItem(row, 3, QTableWidgetItem(result["status"]))
 
-    def on_run_finished(self, completed):
+    def on_run_finished(self, reason):
         self.run_button.setEnabled(True)
         self.refresh_button.setEnabled(True)
         self.select_all_button.setEnabled(True)
@@ -1405,8 +1903,16 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.save_button.setEnabled(bool(self.results))
         self.table.setSortingEnabled(True)
-        if completed:
+        if reason == "done":
             self.status_label.setText("Done. Press Save report to keep the results.")
+            self.table.sortItems(1, Qt.DescendingOrder)
+            if self.table.rowCount():
+                self.table.selectRow(0)
+                first = self.table.item(0, 0)
+                if first is not None:
+                    self.show_detail(first.text())
+        elif reason == "ollama_down":
+            self.status_label.setText(OLLAMA_DIED_MESSAGE)
             self.table.sortItems(1, Qt.DescendingOrder)
             if self.table.rowCount():
                 self.table.selectRow(0)
@@ -1417,6 +1923,14 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Cancelled. Results so far are still in the table.")
         self.worker = None
         self.refresh_history()
+        self.refresh_profiles_for_run()
+
+    def refresh_profiles_for_run(self):
+        """Rebuild the profiles of every model this run touched."""
+        results_dir = get_results_dir()
+        for name in self.result_order:
+            write_profile(results_dir, slugify_model(name))
+        self.refresh_profiles()
 
     def on_table_clicked(self, row, _column):
         item = self.table.item(row, 0)
@@ -1463,6 +1977,8 @@ class MainWindow(QMainWindow):
     def on_tab_changed(self, index):
         if self.tabs.tabText(index) == "Past runs":
             self.refresh_history()
+        elif self.tabs.tabText(index) == "Profiles":
+            self.refresh_profiles()
 
     def refresh_history(self):
         results_dir = get_results_dir()
@@ -1514,6 +2030,55 @@ class MainWindow(QMainWindow):
             self.history_view.setPlainText("That run file could not be read.")
             return
         self.history_view.setPlainText(render_run_summary(data))
+
+    # -- profiles --------------------------------------------------------
+
+    def refresh_profiles(self):
+        results_dir = get_results_dir()
+        current = None
+        if self.profile_model_combo.count():
+            current = self.profile_model_combo.currentData()
+        self.profile_model_combo.blockSignals(True)
+        self.profile_model_combo.clear()
+        models = list_history_models(results_dir)
+        for slug in models:
+            runs = list_history_runs(results_dir, slug)
+            name = slug
+            if runs:
+                data = load_run_file(runs[0]["path"])
+                if data and data.get("model"):
+                    name = data["model"]
+            self.profile_model_combo.addItem(name, slug)
+        self.profile_model_combo.blockSignals(False)
+        if current in models:
+            self.profile_model_combo.setCurrentIndex(models.index(current))
+        elif models:
+            self.profile_model_combo.setCurrentIndex(0)
+        self.on_profile_model_changed()
+
+    def on_profile_model_changed(self, _index=None):
+        slug = self.profile_model_combo.currentData()
+        if not slug:
+            self.profile_view.setPlainText("No profiles yet. Run a test first.")
+            return
+        path = os.path.join(get_results_dir(), slug, "PROFILE.md")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                self.profile_view.setPlainText(handle.read())
+        except OSError:
+            self.profile_view.setPlainText(
+                "No profile yet for this model. Press Regenerate to build one."
+            )
+
+    def regenerate_profile(self):
+        slug = self.profile_model_combo.currentData()
+        if not slug:
+            return
+        path = write_profile(get_results_dir(), slug)
+        if path is None:
+            self.profile_view.setPlainText("No runs yet for this model.")
+            return
+        self.on_profile_model_changed()
 
     # -- report ----------------------------------------------------------
 
