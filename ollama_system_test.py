@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""OLLAMA SYSTEM TEST v3 - benchmark the Ollama models on this PC.
+"""OLLAMA SYSTEM TEST v4 - benchmark the Ollama models on this PC,
+and cloud providers' models too.
 
 Native Qt desktop window. Talks to Ollama on localhost:11434
-(or the OLLAMA_HOST environment variable). No web server, no browser.
-HTTP is stdlib urllib only; the only third-party package is PySide6.
+(or the OLLAMA_HOST environment variable), and to any OpenAI-compatible
+provider (OpenAI, OpenRouter, Groq, Together, DeepSeek, xAI, Mistral,
+or a local OpenAI-compatible server) through /v1/chat/completions.
+No web server, no browser. HTTP is stdlib urllib only; the only
+third-party package is PySide6.
 
 v2 added test templates (JSON files in templates/), per-task scoring,
 and immutable per-model result folders organised per system:
@@ -14,8 +18,20 @@ run checks Ollama is answering before it starts, a Start Ollama button,
 retry once, and the run stops instead of marching on when Ollama goes
 away) and adds per-model profiles and pulling models from the app.
 
+v4 adds PROVIDERS: provider accounts live in providers.json next to
+the app (name, base URL, API key, models with optional prices per
+1M tokens). Provider models appear in the model list as
+"provider / model-id", run the same templates with the same scoring,
+and get the same profiles and immutable run files. Run files record
+tokens used; when a price is set, the details view shows the estimated
+cost. A provider failing never stops local Ollama tests.
+
 DURABLE RULE: nothing is ever ticked by default. Every model and every
 template starts unchecked; the user ticks what they want to test.
+
+KEY RULE: an API key lives only in providers.json and in memory while
+a request is made. It is never written to a run file, a report, a
+profile, or the status line, and it is never shown on screen.
 """
 
 import ast
@@ -74,6 +90,10 @@ NO_TEMPLATES_MESSAGE = "No test templates found in the templates folder."
 RETRY_DELAY = 3.0            # seconds before retrying a failed generate once
 START_OLLAMA_TIMEOUT = 30.0  # seconds to wait for `ollama serve` to answer
 START_OLLAMA_POLL = 1.0      # seconds between checks while waiting
+PROVIDER_READ_TIMEOUT = 120.0   # seconds between provider chunks (providers are slow)
+PROVIDER_STALL_TIMEOUT = 300.0  # seconds with no provider chunk at all before giving up
+PROVIDER_TEST_TIMEOUT = 15.0    # seconds for the Test connection call
+PROVIDER_LABEL_SEP = " / "      # "provider / model-id", used everywhere
 KNOWN_RULES = ("contains", "numeric", "json", "code", "count_lines", "max_words")
 
 
@@ -89,9 +109,22 @@ class OllamaUnreachable(Exception):
     """Ollama stopped answering mid-run; the whole run must stop."""
 
 
+class ProviderError(Exception):
+    """A provider call failed, in plain words. Never stops the run."""
+
+
+class ProviderUnreachable(ProviderError):
+    """A provider did not answer at all; the call may be retried once."""
+
+
 def is_unreachable(exc):
     """True when an error means Ollama itself went away (not one bad model)."""
     return str(exc).startswith(UNREACHABLE)
+
+
+def is_provider_unreachable(exc):
+    """True when an error means the provider itself did not answer."""
+    return isinstance(exc, ProviderUnreachable)
 
 
 def describe_error(exc):
@@ -114,6 +147,12 @@ def get_templates_dir():
 def get_results_dir():
     return os.environ.get(
         "OST_RESULTS_DIR", os.path.join(APP_DIR, "results")
+    )
+
+
+def get_providers_file():
+    return os.environ.get(
+        "OST_PROVIDERS_FILE", os.path.join(APP_DIR, "providers.json")
     )
 
 
@@ -160,6 +199,45 @@ def fmt_score(value):
     if value is None:
         return "—"
     return f"{value:.0f}%"
+
+
+def fmt_tokens(count):
+    if count is None:
+        return "—"
+    return f"{count:,}"
+
+
+def estimate_cost(prompt_tokens, completion_tokens,
+                  price_input_per_1m, price_output_per_1m):
+    """Cost in dollars, or None when tokens or prices are missing.
+
+    Never invents a cost: both prices must be set and both token counts
+    known, or there is no number.
+    """
+    if prompt_tokens is None or completion_tokens is None:
+        return None
+    if price_input_per_1m is None or price_output_per_1m is None:
+        return None
+    return (
+        prompt_tokens * price_input_per_1m / 1_000_000
+        + completion_tokens * price_output_per_1m / 1_000_000
+    )
+
+
+def fmt_cost(value):
+    """Dollars: 2 places for real money, 4 for fractions of a cent."""
+    if value is None:
+        return "—"
+    if value == 0:
+        return "$0.00"
+    if value < 0.01:
+        return f"${value:.4f}"
+    return f"${value:.2f}"
+
+
+def provider_label(provider_name, model_id):
+    """One label format for provider models, used everywhere."""
+    return f"{provider_name}{PROVIDER_LABEL_SEP}{model_id}"
 
 
 def _http_error_reason(exc):
@@ -322,6 +400,292 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
         "prompt_eval_count": done.get("prompt_eval_count"),
         "prompt_eval_duration_ns": done.get("prompt_eval_duration"),
         "wall_s": time.monotonic() - t_start,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Providers (OpenAI-compatible: OpenAI, OpenRouter, Groq, Together,
+# DeepSeek, xAI, Mistral, or a local OpenAI-compatible server)
+# ---------------------------------------------------------------------------
+# Provider accounts live in providers.json next to the app. That file
+# holds API keys: it is never written anywhere else, and no key is ever
+# written to a run file, a report, a profile, or the status line.
+
+def load_providers(path=None):
+    """Load providers.json. Returns (providers, warnings).
+
+    A missing file means no providers yet, not an error. A broken file
+    or a broken entry is skipped with a plain warning, never a crash.
+    """
+    if path is None:
+        path = get_providers_file()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return [], []
+    except (ValueError, OSError) as exc:
+        return [], [f"providers.json: skipped, {exc}"]
+    if not isinstance(data, dict) or not isinstance(data.get("providers"), list):
+        return [], ["providers.json: skipped, expected an object with a providers list"]
+    providers = []
+    warnings = []
+    seen_names = set()
+    for entry in data["providers"]:
+        if not isinstance(entry, dict):
+            warnings.append("providers.json: a provider is not an object, skipped")
+            continue
+        name = entry.get("name")
+        base_url = entry.get("base_url")
+        if not name or not isinstance(name, str):
+            warnings.append("providers.json: a provider has no name, skipped")
+            continue
+        if name in seen_names:
+            warnings.append(f"providers.json: duplicate provider {name!r}, skipped")
+            continue
+        if not base_url or not isinstance(base_url, str):
+            warnings.append(f"providers.json: provider {name!r} has no base URL, skipped")
+            continue
+        api_key = entry.get("api_key", "")
+        if not isinstance(api_key, str):
+            warnings.append(f"providers.json: provider {name!r} has a bad API key, skipped")
+            continue
+        models = []
+        raw_models = entry.get("models", [])
+        if not isinstance(raw_models, list):
+            warnings.append(f"providers.json: provider {name!r} has no models list, skipped")
+            continue
+        for raw_model in raw_models:
+            if not isinstance(raw_model, dict):
+                warnings.append(f"providers.json: a model on {name!r} is not an object, skipped")
+                continue
+            model_id = raw_model.get("id")
+            if not model_id or not isinstance(model_id, str):
+                warnings.append(f"providers.json: a model on {name!r} has no id, skipped")
+                continue
+            display_name = raw_model.get("display_name", "")
+            if not isinstance(display_name, str):
+                display_name = ""
+            price_in = raw_model.get("price_input_per_1m")
+            price_out = raw_model.get("price_output_per_1m")
+            if isinstance(price_in, bool) or not isinstance(price_in, (int, float, type(None))):
+                warnings.append(f"providers.json: model {model_id!r} has a bad input price, skipped")
+                continue
+            if isinstance(price_out, bool) or not isinstance(price_out, (int, float, type(None))):
+                warnings.append(f"providers.json: model {model_id!r} has a bad output price, skipped")
+                continue
+            models.append({
+                "id": model_id,
+                "display_name": display_name,
+                "price_input_per_1m": price_in,
+                "price_output_per_1m": price_out,
+            })
+        seen_names.add(name)
+        providers.append({
+            "name": name,
+            "base_url": base_url.rstrip("/"),
+            "api_key": api_key,
+            "models": models,
+        })
+    return providers, warnings
+
+
+def save_providers(providers, path=None):
+    """Write providers.json. The file holds API keys, so it is written
+    readable only by its owner (best effort on systems that allow it)."""
+    if path is None:
+        path = get_providers_file()
+    data = {"providers": providers}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _provider_error_reason(exc):
+    """Pull a provider's plain error message out of an HTTP error.
+
+    Handles both shapes: {"error": "text"} and the OpenAI shape
+    {"error": {"message": "text", ...}}. Never includes any key.
+    """
+    try:
+        body = exc.read().decode("utf-8", "replace")
+        data = json.loads(body)
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, str) and error.strip():
+                return error.strip().splitlines()[0]
+            if isinstance(error, dict) and error.get("message"):
+                return str(error["message"]).strip().splitlines()[0]
+    except Exception:
+        pass
+    return f"HTTP {exc.code}"
+
+
+def _provider_headers(provider):
+    headers = {"Content-Type": "application/json"}
+    key = provider.get("api_key") or ""
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+def provider_test_connection(provider):
+    """GET {base}/models. Returns (ok, plain message). Spends no tokens."""
+    name = provider.get("name") or "provider"
+    base_url = (provider.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return False, "No base URL set."
+    req = urllib.request.Request(
+        base_url + "/models", headers=_provider_headers(provider)
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=PROVIDER_TEST_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            reason = _provider_error_reason(exc)
+            if reason.startswith("HTTP "):
+                return False, f"provider {name} rejected the key."
+            return False, f"provider {name} rejected the key: {reason}"
+        return False, f"provider {name}: {_provider_error_reason(exc)}"
+    except (urllib.error.URLError, socket.timeout, OSError):
+        return False, f"provider {name} did not answer. Check the base URL."
+    except ValueError:
+        return False, f"provider {name} answered, but not with JSON."
+    models = data.get("data") if isinstance(data, dict) else None
+    if isinstance(models, list):
+        return True, f"Connected — {name} answered, {len(models)} models listed."
+    return True, f"Connected — {name} answered."
+
+
+def provider_generate_once(provider, model_id, prompt, num_predict,
+                           temperature=0, should_stop=None):
+    """One streaming /v1/chat/completions call. Returns the same metrics
+    shape as generate_once, plus prompt/completion/total tokens when the
+    provider reports usage.
+
+    Raises ProviderUnreachable when the provider did not answer at all
+    (retriable), ProviderError for anything else (a bad key, a bad
+    model, a provider error message), Cancelled if should_stop() fires.
+    """
+    name = provider.get("name") or "provider"
+    base_url = (provider.get("base_url") or "").rstrip("/")
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": num_predict,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    req = urllib.request.Request(
+        base_url + "/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=_provider_headers(provider),
+    )
+    t_start = time.monotonic()
+    try:
+        resp = urllib.request.urlopen(req, timeout=PROVIDER_READ_TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            reason = _provider_error_reason(exc)
+            if reason.startswith("HTTP "):
+                raise ProviderError(f"provider {name} rejected the key")
+            raise ProviderError(f"provider {name} rejected the key: {reason}")
+        raise ProviderError(f"provider {name}: {_provider_error_reason(exc)}")
+    except (urllib.error.URLError, socket.timeout, OSError):
+        raise ProviderUnreachable(f"provider {name} did not answer")
+    t_first = None
+    t_last = None
+    answer_parts = []
+    prompt_tokens = None
+    completion_tokens = None
+    last_chunk = time.monotonic()
+    try:
+        while True:
+            if should_stop is not None and should_stop():
+                raise Cancelled()
+            try:
+                line = resp.readline()
+            except socket.timeout:
+                if time.monotonic() - last_chunk > PROVIDER_STALL_TIMEOUT:
+                    raise ProviderError(f"provider {name} stopped responding")
+                continue
+            except OSError:
+                # Timeout is an OSError subclass, so this branch comes
+                # AFTER it: a reset or dropped connection mid-stream
+                # means the provider went away.
+                raise ProviderUnreachable(f"provider {name} did not answer")
+            if not line:
+                break
+            last_chunk = time.monotonic()
+            line = line.strip()
+            if not line or line.startswith(b":"):
+                continue
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                break
+            try:
+                event = json.loads(data.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            usage = event.get("usage") or {}
+            if usage.get("prompt_tokens") is not None:
+                prompt_tokens = usage["prompt_tokens"]
+            if usage.get("completion_tokens") is not None:
+                completion_tokens = usage["completion_tokens"]
+            choices = event.get("choices") or []
+            text = ""
+            if choices and isinstance(choices[0], dict):
+                delta = choices[0].get("delta") or {}
+                text = delta.get("content") or ""
+            if text:
+                now = time.monotonic()
+                if t_first is None:
+                    t_first = now
+                t_last = now
+                answer_parts.append(text)
+    finally:
+        resp.close()
+    if not answer_parts:
+        # The stream ended before the provider sent any answer text:
+        # it went away, so this is unreachable too.
+        raise ProviderUnreachable(f"provider {name} did not answer")
+    decode_tok_s = None
+    if completion_tokens is not None and t_first is not None and t_last is not None:
+        span = t_last - t_first
+        if span >= 0.01:
+            decode_tok_s = completion_tokens / span
+    ttft_s = (t_first - t_start) if t_first is not None else None
+    prompt_tok_s = None
+    if prompt_tokens is not None and ttft_s:
+        # Estimate: the prompt is processed in the wait for the first
+        # token, so prompt tokens over that wait is the prompt rate.
+        prompt_tok_s = prompt_tokens / ttft_s
+    total_tokens = None
+    if prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = prompt_tokens + completion_tokens
+    return {
+        "prompt": prompt,
+        "answer": "".join(answer_parts),
+        "decode_tok_s": decode_tok_s,
+        "prompt_tok_s": prompt_tok_s,
+        "ttft_s": ttft_s,
+        "load_s": None,
+        "total_s": None,
+        "eval_count": completion_tokens,
+        "eval_duration_ns": None,
+        "prompt_eval_count": prompt_tokens,
+        "prompt_eval_duration_ns": None,
+        "wall_s": time.monotonic() - t_start,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
     }
 
 
@@ -838,6 +1202,7 @@ def render_run_summary(run_data):
         f"{run_data.get('model', '?')} — {run_data.get('template_name', run_data.get('template', '?'))}",
         f"Run: {run_data.get('timestamp', '?')}",
         f"System: {run_data.get('system_id', '?')}",
+        f"Provider: {run_data.get('provider', 'ollama')}",
     ]
     score = run_data.get("template_score")
     if score is None:
@@ -848,6 +1213,15 @@ def render_run_summary(run_data):
         )
     avg_toks = run_data.get("avg_decode_tok_s")
     lines.append(f"Avg decode speed: {fmt_toks(avg_toks)} tokens per second")
+    if run_data.get("total_tokens") is not None:
+        lines.append(
+            f"Tokens: {fmt_tokens(run_data.get('prompt_tokens'))} in, "
+            f"{fmt_tokens(run_data.get('completion_tokens'))} out"
+        )
+        if run_data.get("estimated_cost_usd") is not None:
+            lines.append(
+                f"Estimated cost: {fmt_cost(run_data.get('estimated_cost_usd'))}"
+            )
     lines.append("")
     for task in run_data.get("tasks", []):
         passed = task.get("passed")
@@ -916,8 +1290,27 @@ def build_profile(results_dir, model_slug):
     if not runs:
         return None
     model_name = runs[-1].get("model") or model_slug
+    provider = runs[-1].get("provider", "ollama")
     systems = sorted({r.get("system_id", "?") for r in runs})
     last_tested = runs[-1].get("timestamp", "?")
+    # Token totals cover template runs only (the warmup call is not
+    # part of any run file, so it is not counted here).
+    token_prompt = sum(
+        r["prompt_tokens"] for r in runs if r.get("prompt_tokens") is not None
+    )
+    token_completion = sum(
+        r["completion_tokens"] for r in runs
+        if r.get("completion_tokens") is not None
+    )
+    has_tokens = any(
+        r.get("prompt_tokens") is not None or r.get("completion_tokens") is not None
+        for r in runs
+    )
+    total_cost = sum(
+        r["estimated_cost_usd"] for r in runs
+        if r.get("estimated_cost_usd") is not None
+    )
+    has_cost = any(r.get("estimated_cost_usd") is not None for r in runs)
     by_template = {}
     for run in runs:
         by_template.setdefault(run.get("template", "?"), []).append(run)
@@ -961,6 +1354,7 @@ def build_profile(results_dir, model_slug):
         f"Profile updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"Last tested: {last_tested}",
         f"Runs: {len(runs)}",
+        f"Provider: {provider}",
         f"Systems tested on: {', '.join(systems)}",
         "",
         "## Overall",
@@ -973,6 +1367,13 @@ def build_profile(results_dir, model_slug):
         lines.append(f"Latest overall score: {overall_latest:.0f}%")
         lines.append(f"Best overall score: {overall_best:.0f}%")
     lines.append(f"Average decode speed: {fmt_toks(avg_speed)} tokens per second")
+    if has_tokens:
+        lines.append(
+            f"Tokens used in template runs: {fmt_tokens(token_prompt)} in, "
+            f"{fmt_tokens(token_completion)} out"
+        )
+        if has_cost:
+            lines.append(f"Estimated cost in template runs: {fmt_cost(total_cost)}")
     lines.append("")
     lines.append("## Per template")
     lines.append("")
@@ -1072,6 +1473,15 @@ def render_text_report(results):
             f"  Avg decode speed: {fmt_toks(result.get('avg_decode_tok_s'))} tokens per second"
         )
         lines.append(f"  Size in RAM: {fmt_bytes(result.get('size_ram'))}")
+        if result.get("total_tokens") is not None:
+            lines.append(
+                f"  Tokens: {fmt_tokens(result.get('prompt_tokens'))} in, "
+                f"{fmt_tokens(result.get('completion_tokens'))} out"
+            )
+            if result.get("estimated_cost_usd") is not None:
+                lines.append(
+                    f"  Estimated cost: {fmt_cost(result.get('estimated_cost_usd'))}"
+                )
         for template_id, run in result.get("templates", {}).items():
             score = run.get("template_score")
             if score is None:
@@ -1099,6 +1509,36 @@ def _truncate_answer(answer):
     return answer
 
 
+def ollama_target(model_name):
+    """A benchmark target for a local Ollama model."""
+    return {
+        "label": model_name,
+        "kind": "ollama",
+        "model": model_name,
+        "provider": None,
+        "provider_name": "ollama",
+        "price_input_per_1m": None,
+        "price_output_per_1m": None,
+    }
+
+
+def provider_target(provider, model_entry):
+    """A benchmark target for a provider model.
+
+    The label is "provider / model-id" everywhere: the model list, the
+    results table, and the run files.
+    """
+    return {
+        "label": provider_label(provider["name"], model_entry["id"]),
+        "kind": "provider",
+        "model": model_entry["id"],
+        "provider": provider,
+        "provider_name": provider["name"],
+        "price_input_per_1m": model_entry.get("price_input_per_1m"),
+        "price_output_per_1m": model_entry.get("price_output_per_1m"),
+    }
+
+
 class BenchWorker(QThread):
     model_started = Signal(str)
     template_done = Signal(str, dict, str)  # model, run data, file path
@@ -1107,9 +1547,9 @@ class BenchWorker(QThread):
     # "done", "cancelled", or "ollama_down"
     run_finished = Signal(str)
 
-    def __init__(self, models, templates, sys_id, machine, results_dir):
+    def __init__(self, targets, templates, sys_id, machine, results_dir):
         super().__init__()
-        self.models = models
+        self.targets = targets
         self.templates = templates
         self.sys_id = sys_id
         self.machine = machine
@@ -1122,30 +1562,39 @@ class BenchWorker(QThread):
     def _should_stop(self):
         return self._stop
 
-    def _generate(self, model, prompt, num_predict):
-        """One generate call, retried once if Ollama did not answer.
+    def _call_once(self, target, prompt, num_predict):
+        if target["kind"] == "provider":
+            return provider_generate_once(
+                target["provider"], target["model"], prompt, num_predict,
+                TEMPERATURE, self._should_stop,
+            )
+        return generate_once(
+            target["model"], prompt, num_predict, TEMPERATURE,
+            self._should_stop,
+        )
+
+    def _generate(self, target, prompt, num_predict):
+        """One generate call, retried once if the other end did not answer.
 
         A single dropped connection is often transient (Ollama was
-        still starting, or the machine was swapping), so one retry
-        after a short pause is worth it. Anything else fails at once.
+        still starting, the machine was swapping, or a provider hiccuped),
+        so one retry after a short pause is worth it. Anything else
+        fails at once. A bad key is never retried.
         """
         try:
-            return generate_once(
-                model, prompt, num_predict, TEMPERATURE, self._should_stop
-            )
-        except OllamaError as exc:
-            if not is_unreachable(exc) or self._stop:
+            return self._call_once(target, prompt, num_predict)
+        except (OllamaError, ProviderError) as exc:
+            retryable = is_unreachable(exc) or is_provider_unreachable(exc)
+            if not retryable or self._stop:
                 raise
             time.sleep(RETRY_DELAY)
             if self._stop:
                 raise Cancelled()
-            return generate_once(
-                model, prompt, num_predict, TEMPERATURE, self._should_stop
-            )
+            return self._call_once(target, prompt, num_predict)
 
     def _count_steps(self):
         steps = 0
-        for _model in self.models:
+        for _target in self.targets:
             steps += 1  # warmup
             for template in self.templates:
                 if template["scored"]:
@@ -1154,8 +1603,9 @@ class BenchWorker(QThread):
                     steps += len(template["prompts"])
         return max(steps, 1)
 
-    def _run_template(self, model, template):
-        """Run one template for one model. Returns the run data dict."""
+    def _run_template(self, target, template):
+        """Run one template for one target. Returns the run data dict."""
+        label = target["label"]
         num_predict = template["num_predict"]
         task_results = []
         if template["scored"]:
@@ -1171,7 +1621,7 @@ class BenchWorker(QThread):
             if self._stop:
                 raise Cancelled()
             try:
-                metrics = self._generate(model, prompt, num_predict)
+                metrics = self._generate(target, prompt, num_predict)
             except OllamaError as exc:
                 if is_unreachable(exc):
                     # Ollama itself went away: stop the whole run
@@ -1185,9 +1635,29 @@ class BenchWorker(QThread):
                     "decode_tok_s": None,
                     "prompt_tok_s": None,
                     "ttft_s": None,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
                     "detail": str(exc),
                 })
-                self._bump_progress(model, template, job_id)
+                self._bump_progress(label, template, job_id)
+                continue
+            except ProviderError as exc:
+                # A provider failing never stops the run: this task
+                # fails plainly and the rest carry on, including the
+                # local Ollama models still to come.
+                task_results.append({
+                    "id": job_id,
+                    "prompt": prompt,
+                    "answer": "",
+                    "passed": False if task is not None else None,
+                    "decode_tok_s": None,
+                    "prompt_tok_s": None,
+                    "ttft_s": None,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "detail": str(exc),
+                })
+                self._bump_progress(label, template, job_id)
                 continue
             if task is None:
                 passed, detail = None, ""
@@ -1201,9 +1671,11 @@ class BenchWorker(QThread):
                 "decode_tok_s": metrics["decode_tok_s"],
                 "prompt_tok_s": metrics["prompt_tok_s"],
                 "ttft_s": metrics["ttft_s"],
+                "prompt_tokens": metrics.get("prompt_tokens"),
+                "completion_tokens": metrics.get("completion_tokens"),
                 "detail": detail,
             })
-            self._bump_progress(model, template, job_id)
+            self._bump_progress(label, template, job_id)
         if template["scored"]:
             passed_count = sum(1 for t in task_results if t["passed"] is True)
             total = len(task_results)
@@ -1213,6 +1685,15 @@ class BenchWorker(QThread):
             total = len(task_results)
             score = None
         speeds = [t["decode_tok_s"] for t in task_results if t["decode_tok_s"] is not None]
+        prompt_tokens = [t["prompt_tokens"] for t in task_results
+                         if t["prompt_tokens"] is not None]
+        completion_tokens = [t["completion_tokens"] for t in task_results
+                             if t["completion_tokens"] is not None]
+        run_prompt_tokens = sum(prompt_tokens) if prompt_tokens else None
+        run_completion_tokens = sum(completion_tokens) if completion_tokens else None
+        run_total_tokens = None
+        if run_prompt_tokens is not None and run_completion_tokens is not None:
+            run_total_tokens = run_prompt_tokens + run_completion_tokens
         run_data = {
             "template": template["id"],
             "template_name": template["name"],
@@ -1220,44 +1701,68 @@ class BenchWorker(QThread):
             "warmup_prompt": WARMUP_PROMPT,
             "num_predict": num_predict,
             "temperature": TEMPERATURE,
+            "provider": target["provider_name"],
+            "provider_model": target["model"],
             "tasks": task_results,
             "template_score": score,
             "passed": passed_count,
             "total": total,
             "avg_decode_tok_s": sum(speeds) / len(speeds) if speeds else None,
+            "prompt_tokens": run_prompt_tokens,
+            "completion_tokens": run_completion_tokens,
+            "total_tokens": run_total_tokens,
+            "price_input_per_1m": target["price_input_per_1m"],
+            "price_output_per_1m": target["price_output_per_1m"],
+            "estimated_cost_usd": estimate_cost(
+                run_prompt_tokens, run_completion_tokens,
+                target["price_input_per_1m"], target["price_output_per_1m"],
+            ),
         }
-        path = save_run_file(self.results_dir, model, self.sys_id, run_data)
+        path = save_run_file(self.results_dir, label, self.sys_id, run_data)
         return run_data, path
 
-    def _bump_progress(self, model, template, job_id):
+    def _bump_progress(self, label, template, job_id):
         self._done_steps += 1
         percent = int(100 * self._done_steps / self._total_steps)
         self.progress.emit(
-            f"{model}: {template['name']} - {job_id}", min(percent, 100)
+            f"{label}: {template['name']} - {job_id}", min(percent, 100)
         )
 
     def run(self):
         self._total_steps = self._count_steps()
         self._done_steps = 0
-        for model in self.models:
+        for target in self.targets:
+            label = target["label"]
             if self._stop:
                 self.run_finished.emit("cancelled")
                 return
-            self.model_started.emit(model)
+            self.model_started.emit(label)
             result = {
-                "name": model,
+                "name": label,
                 "status": "done",
+                "provider": target["provider_name"],
+                "provider_model": target["model"],
                 "templates": {},
                 "overall_score": None,
                 "avg_decode_tok_s": None,
                 "size_ram": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "estimated_cost_usd": None,
+                "price_input_per_1m": target["price_input_per_1m"],
+                "price_output_per_1m": target["price_output_per_1m"],
             }
+            warmup_prompt_tokens = None
+            warmup_completion_tokens = None
             try:
                 self.progress.emit(
-                    f"{model}: warming up",
+                    f"{label}: warming up",
                     int(100 * self._done_steps / self._total_steps),
                 )
-                self._generate(model, WARMUP_PROMPT, WARMUP_PREDICT)
+                warmup = self._generate(target, WARMUP_PROMPT, WARMUP_PREDICT)
+                warmup_prompt_tokens = warmup.get("prompt_tokens")
+                warmup_completion_tokens = warmup.get("completion_tokens")
                 self._done_steps += 1
             except Cancelled:
                 self.run_finished.emit("cancelled")
@@ -1266,26 +1771,33 @@ class BenchWorker(QThread):
                 if is_unreachable(exc):
                     # The warmup retry already failed: Ollama is gone.
                     result["status"] = f"failed: {describe_error(exc)}"
-                    self.model_done.emit(model, result)
+                    self.model_done.emit(label, result)
                     self.run_finished.emit("ollama_down")
                     return
                 result["status"] = f"failed: {exc}"
-                self.model_done.emit(model, result)
+                self.model_done.emit(label, result)
+                continue
+            except ProviderError as exc:
+                # The provider did not answer or rejected the key: this
+                # model fails plainly and the run carries on with the
+                # rest, including the local Ollama models.
+                result["status"] = f"failed: {exc}"
+                self.model_done.emit(label, result)
                 continue
             try:
                 for template in self.templates:
                     if self._stop:
                         raise Cancelled()
-                    run_data, path = self._run_template(model, template)
+                    run_data, path = self._run_template(target, template)
                     result["templates"][template["id"]] = run_data
                     result["templates"][template["id"]]["run_file"] = path
-                    self.template_done.emit(model, run_data, path)
+                    self.template_done.emit(label, run_data, path)
             except Cancelled:
                 self.run_finished.emit("cancelled")
                 return
             except OllamaUnreachable as exc:
                 result["status"] = f"failed: {exc}"
-                self.model_done.emit(model, result)
+                self.model_done.emit(label, result)
                 self.run_finished.emit("ollama_down")
                 return
             scores = [
@@ -1303,8 +1815,34 @@ class BenchWorker(QThread):
             ]
             if speeds:
                 result["avg_decode_tok_s"] = sum(speeds) / len(speeds)
-            result["size_ram"] = ps_sizes().get(model)
-            self.model_done.emit(model, result)
+            # Token totals cover the whole model: every template run
+            # plus the warmup call (the provider charged for that too).
+            prompt_total = 0
+            completion_total = 0
+            saw_tokens = False
+            if warmup_prompt_tokens is not None and warmup_completion_tokens is not None:
+                prompt_total += warmup_prompt_tokens
+                completion_total += warmup_completion_tokens
+                saw_tokens = True
+            for run_data in result["templates"].values():
+                if run_data.get("prompt_tokens") is not None:
+                    prompt_total += run_data["prompt_tokens"]
+                    saw_tokens = True
+                if run_data.get("completion_tokens") is not None:
+                    completion_total += run_data["completion_tokens"]
+                    saw_tokens = True
+            if saw_tokens:
+                result["prompt_tokens"] = prompt_total
+                result["completion_tokens"] = completion_total
+                result["total_tokens"] = prompt_total + completion_total
+                result["estimated_cost_usd"] = estimate_cost(
+                    prompt_total, completion_total,
+                    target["price_input_per_1m"],
+                    target["price_output_per_1m"],
+                )
+            if target["kind"] == "ollama":
+                result["size_ram"] = ps_sizes().get(label)
+            self.model_done.emit(label, result)
         self.progress.emit("Done.", 100)
         self.run_finished.emit("done")
 
@@ -1341,6 +1879,22 @@ class OllamaStarter(QThread):
                 return
             time.sleep(START_OLLAMA_POLL)
         self.failed.emit(START_OLLAMA_TIMEOUT_MSG)
+
+
+# ---------------------------------------------------------------------------
+# Provider connection tester (GET /v1/models in its own thread)
+# ---------------------------------------------------------------------------
+
+class ProviderTestWorker(QThread):
+    tested = Signal(bool, str)  # ok, plain message
+
+    def __init__(self, provider):
+        super().__init__()
+        self.provider = provider
+
+    def run(self):
+        ok, message = provider_test_connection(self.provider)
+        self.tested.emit(ok, message)
 
 
 # ---------------------------------------------------------------------------
@@ -1451,9 +2005,22 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.pull_worker = None
         self.starter = None
+        self.provider_test_worker = None
         self.results = {}
         self.result_order = []
         self.templates = []
+        self.providers = []
+        # The provider being edited on the Providers tab: a working copy
+        # of one saved provider (or a fresh one), plus whether it is new
+        # and the stored key it keeps when the key field is left empty.
+        self.editing_provider = None
+        self.editing_is_new = False
+        self.editing_original_name = ""
+        self.editing_kept_key = ""
+        # Raw bytes of providers.json as last seen by the Providers tab,
+        # so the tab can pick up outside edits without wiping an edit
+        # in progress when nothing changed.
+        self._providers_snapshot = None
         self.machine = machine_info()
         self.sys_id = system_id(self.machine)
 
@@ -1477,7 +2044,7 @@ class MainWindow(QMainWindow):
 
         pick_row = QHBoxLayout()
         model_box = QVBoxLayout()
-        model_box.addWidget(QLabel("Models installed on this PC:"))
+        model_box.addWidget(QLabel("Models (local and provider):"))
         self.model_list = QListWidget()
         self.model_list.setMaximumHeight(180)
         model_box.addWidget(self.model_list)
@@ -1631,12 +2198,119 @@ class MainWindow(QMainWindow):
         self.profile_view.setReadOnly(True)
         self.profile_view.setPlainText("Pick a model to see its profile.")
         profiles_layout.addWidget(self.profile_view)
+
+        # ---- Providers tab ----
+        providers_tab = QWidget()
+        tabs.addTab(providers_tab, "Providers")
+        providers_layout = QVBoxLayout(providers_tab)
+        providers_intro = QLabel(
+            "Cloud providers, tested with the same templates as your local "
+            "models. Providers and their API keys live in providers.json "
+            "next to the app — that file holds your keys, never share it "
+            "or upload it anywhere. Provider tests cost real API money; "
+            "the details view shows the tokens and the cost."
+        )
+        providers_intro.setWordWrap(True)
+        providers_layout.addWidget(providers_intro)
+        provider_columns = QHBoxLayout()
+
+        provider_left = QVBoxLayout()
+        provider_left.addWidget(QLabel("Providers:"))
+        self.provider_list = QListWidget()
+        self.provider_list.itemClicked.connect(self.on_provider_selected)
+        provider_left.addWidget(self.provider_list)
+        provider_list_buttons = QHBoxLayout()
+        self.provider_new_button = QPushButton("New provider")
+        self.provider_new_button.clicked.connect(self.new_provider)
+        self.provider_remove_button = QPushButton("Remove provider")
+        self.provider_remove_button.clicked.connect(self.remove_provider)
+        provider_list_buttons.addWidget(self.provider_new_button)
+        provider_list_buttons.addWidget(self.provider_remove_button)
+        provider_list_buttons.addStretch()
+        provider_left.addLayout(provider_list_buttons)
+        provider_columns.addLayout(provider_left)
+
+        provider_right = QVBoxLayout()
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.provider_name_input = QLineEdit()
+        self.provider_name_input.setPlaceholderText("e.g. openai")
+        name_row.addWidget(self.provider_name_input)
+        provider_right.addLayout(name_row)
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel("Base URL:"))
+        self.provider_url_input = QLineEdit()
+        self.provider_url_input.setPlaceholderText("e.g. https://api.openai.com/v1")
+        url_row.addWidget(self.provider_url_input)
+        provider_right.addLayout(url_row)
+        key_row = QHBoxLayout()
+        key_row.addWidget(QLabel("API key:"))
+        self.provider_key_input = QLineEdit()
+        self.provider_key_input.setEchoMode(QLineEdit.Password)
+        self.provider_key_input.setPlaceholderText("API key")
+        key_row.addWidget(self.provider_key_input)
+        self.provider_key_status = QLabel("No key saved")
+        key_row.addWidget(self.provider_key_status)
+        provider_right.addLayout(key_row)
+        provider_test_row = QHBoxLayout()
+        self.provider_test_button = QPushButton("Test connection")
+        self.provider_test_button.clicked.connect(self.test_provider_connection)
+        self.provider_test_status = QLabel("")
+        self.provider_test_status.setWordWrap(True)
+        provider_test_row.addWidget(self.provider_test_button)
+        provider_test_row.addWidget(self.provider_test_status)
+        provider_test_row.addStretch()
+        provider_right.addLayout(provider_test_row)
+        provider_right.addWidget(QLabel("Models on this provider:"))
+        self.provider_models_list = QListWidget()
+        provider_right.addWidget(self.provider_models_list)
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model id:"))
+        self.provider_model_id_input = QLineEdit()
+        self.provider_model_id_input.setPlaceholderText("e.g. gpt-4o-mini")
+        model_row.addWidget(self.provider_model_id_input)
+        model_row.addWidget(QLabel("Display name:"))
+        self.provider_model_name_input = QLineEdit()
+        self.provider_model_name_input.setPlaceholderText("optional")
+        model_row.addWidget(self.provider_model_name_input)
+        provider_right.addLayout(model_row)
+        price_row = QHBoxLayout()
+        price_row.addWidget(QLabel("Price in per 1M:"))
+        self.provider_price_in_input = QLineEdit()
+        self.provider_price_in_input.setPlaceholderText("$ optional")
+        price_row.addWidget(self.provider_price_in_input)
+        price_row.addWidget(QLabel("Price out per 1M:"))
+        self.provider_price_out_input = QLineEdit()
+        self.provider_price_out_input.setPlaceholderText("$ optional")
+        price_row.addWidget(self.provider_price_out_input)
+        provider_right.addLayout(price_row)
+        model_buttons = QHBoxLayout()
+        self.provider_add_model_button = QPushButton("Add model")
+        self.provider_add_model_button.clicked.connect(self.add_provider_model)
+        self.provider_remove_model_button = QPushButton("Remove model")
+        self.provider_remove_model_button.clicked.connect(self.remove_provider_model)
+        model_buttons.addWidget(self.provider_add_model_button)
+        model_buttons.addWidget(self.provider_remove_model_button)
+        model_buttons.addStretch()
+        provider_right.addLayout(model_buttons)
+        provider_save_row = QHBoxLayout()
+        self.provider_save_button = QPushButton("Save provider")
+        self.provider_save_button.clicked.connect(self.save_provider)
+        self.provider_status = QLabel("")
+        self.provider_status.setWordWrap(True)
+        provider_save_row.addWidget(self.provider_save_button)
+        provider_save_row.addWidget(self.provider_status)
+        provider_save_row.addStretch()
+        provider_right.addLayout(provider_save_row)
+        provider_columns.addLayout(provider_right)
+        providers_layout.addLayout(provider_columns)
         tabs.currentChanged.connect(self.on_tab_changed)
 
         self.refresh_templates()
         self.refresh_models()
         self.refresh_history()
         self.refresh_profiles()
+        self.refresh_providers()
 
     # -- models and templates --------------------------------------------
 
@@ -1675,33 +2349,53 @@ class MainWindow(QMainWindow):
         }
         self.refresh_templates()
         self.model_list.clear()
+        ollama_error = None
+        ollama_names = []
         try:
-            names, _source = list_models()
+            ollama_names, _source = list_models()
         except OllamaError as exc:
-            self.status_label.setText(str(exc))
+            ollama_error = exc
+        providers, provider_warnings = load_providers()
+        self.providers = providers
+        self.provider_warnings = provider_warnings
+        targets = [ollama_target(name) for name in ollama_names]
+        for provider in providers:
+            for model_entry in provider["models"]:
+                targets.append(provider_target(provider, model_entry))
+        if not targets:
+            if ollama_error is not None:
+                self.status_label.setText(str(ollama_error))
+            else:
+                self.status_label.setText(NO_MODELS_MESSAGE)
             self.run_button.setEnabled(False)
             return
-        if not names:
-            self.status_label.setText(NO_MODELS_MESSAGE)
-            self.run_button.setEnabled(False)
-            return
-        for name in names:
-            item = QListWidgetItem(name)
+        for target in targets:
+            item = QListWidgetItem(target["label"])
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(
-                Qt.Checked if name in checked else Qt.Unchecked
+                Qt.Checked if target["label"] in checked else Qt.Unchecked
             )
+            item.setData(Qt.UserRole, target)
             self.model_list.addItem(item)
         if not self.templates:
             self.status_label.setText(NO_TEMPLATES_MESSAGE)
             self.run_button.setEnabled(False)
             return
         self.run_button.setEnabled(True)
-        status = f"{len(names)} models found, {len(self.templates)} templates loaded. Ready."
-        if self.template_warnings:
-            status += " " + "; ".join(self.template_warnings[:2])
-            if len(self.template_warnings) > 2:
-                status += f" (+{len(self.template_warnings) - 2} more)"
+        if ollama_error is not None:
+            # Ollama is down, but provider models do not need it:
+            # they can still be tested.
+            status = (
+                f"Ollama is not running, but {len(targets)} provider "
+                f"model(s) are ready to test."
+            )
+        else:
+            status = f"{len(targets)} models found, {len(self.templates)} templates loaded. Ready."
+        warnings = list(self.template_warnings) + list(provider_warnings)
+        if warnings:
+            status += " " + "; ".join(warnings[:2])
+            if len(warnings) > 2:
+                status += f" (+{len(warnings) - 2} more)"
         self.status_label.setText(status)
 
     def _set_all_checked(self, widget, state):
@@ -1720,13 +2414,16 @@ class MainWindow(QMainWindow):
     def clear_templates(self):
         self._set_all_checked(self.template_list, Qt.Unchecked)
 
-    def selected_models(self):
-        names = []
+    def selected_targets(self):
+        """Ticked models as benchmark targets (Ollama and provider)."""
+        targets = []
         for row in range(self.model_list.count()):
             item = self.model_list.item(row)
             if item.checkState() == Qt.Checked:
-                names.append(item.text())
-        return names
+                target = item.data(Qt.UserRole)
+                if target is not None:
+                    targets.append(target)
+        return targets
 
     def selected_templates(self):
         by_id = {t["id"]: t for t in self.templates}
@@ -1742,9 +2439,9 @@ class MainWindow(QMainWindow):
     # -- benchmark run ---------------------------------------------------
 
     def start_run(self):
-        models = self.selected_models()
+        targets = self.selected_targets()
         templates = self.selected_templates()
-        if not models:
+        if not targets:
             self.status_label.setText("Tick at least one model first.")
             return
         if not templates:
@@ -1752,8 +2449,11 @@ class MainWindow(QMainWindow):
             return
         # The list may have come from the CLI fallback while the API was
         # down, or Ollama may have stopped since the window opened: check
-        # it answers before starting, or every model fails one by one.
-        if not ollama_reachable():
+        # it answers before starting, or every local model fails one by
+        # one. Provider-only runs skip this check — they do not need
+        # Ollama at all.
+        needs_ollama = any(t["kind"] == "ollama" for t in targets)
+        if needs_ollama and not ollama_reachable():
             self.status_label.setText(OLLAMA_DOWN_RUN_MESSAGE)
             return
         # Sorting stays OFF while the run builds the table: a live sort
@@ -1774,7 +2474,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(True)
         self.progress_bar.setValue(0)
         self.worker = BenchWorker(
-            models, templates, self.sys_id, self.machine, get_results_dir()
+            targets, templates, self.sys_id, self.machine, get_results_dir()
         )
         self.worker.model_started.connect(self.on_model_started)
         self.worker.template_done.connect(self.on_template_done)
@@ -1947,19 +2647,37 @@ class MainWindow(QMainWindow):
             lines.append(result["status"])
             self.detail_view.setPlainText("\n".join(lines))
             return
+        if result.get("total_tokens") is not None:
+            lines.append(
+                f"Tokens: {fmt_tokens(result.get('prompt_tokens'))} in, "
+                f"{fmt_tokens(result.get('completion_tokens'))} out "
+                f"(includes warmup)"
+            )
+            if result.get("estimated_cost_usd") is not None:
+                lines.append(
+                    f"Estimated cost: {fmt_cost(result.get('estimated_cost_usd'))}"
+                )
         for template_id, run in result.get("templates", {}).items():
             score = run.get("template_score")
             if score is None:
-                lines.append(
+                header = (
                     f"\n{run.get('template_name', template_id)}: no scoring, "
                     f"{fmt_toks(run.get('avg_decode_tok_s'))} tok/s"
                 )
             else:
-                lines.append(
+                header = (
                     f"\n{run.get('template_name', template_id)}: {score:.0f}% "
                     f"({run.get('passed')}/{run.get('total')}), "
                     f"{fmt_toks(run.get('avg_decode_tok_s'))} tok/s"
                 )
+            if run.get("total_tokens") is not None:
+                header += (
+                    f", {fmt_tokens(run.get('prompt_tokens'))} in / "
+                    f"{fmt_tokens(run.get('completion_tokens'))} out"
+                )
+                if run.get("estimated_cost_usd") is not None:
+                    header += f", {fmt_cost(run.get('estimated_cost_usd'))}"
+            lines.append(header)
             for task in run.get("tasks", []):
                 passed = task.get("passed")
                 mark = "pass" if passed is True else ("fail" if passed is False else "run")
@@ -1979,6 +2697,12 @@ class MainWindow(QMainWindow):
             self.refresh_history()
         elif self.tabs.tabText(index) == "Profiles":
             self.refresh_profiles()
+        elif self.tabs.tabText(index) == "Providers":
+            # Pick up outside edits to providers.json (a hand edit, or
+            # another copy of the app), but only when the file actually
+            # changed — otherwise an edit in progress would be wiped.
+            if self._providers_file_bytes() != self._providers_snapshot:
+                self.refresh_providers()
 
     def refresh_history(self):
         results_dir = get_results_dir()
@@ -2079,6 +2803,268 @@ class MainWindow(QMainWindow):
             self.profile_view.setPlainText("No runs yet for this model.")
             return
         self.on_profile_model_changed()
+
+    # -- providers -------------------------------------------------------
+
+    def _providers_file_bytes(self):
+        """Raw bytes of providers.json, or None when it cannot be read."""
+        try:
+            with open(get_providers_file(), "rb") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
+    def refresh_providers(self):
+        """Reload providers.json and rebuild the Providers tab list.
+
+        Keeps the provider currently being edited selected when it
+        still exists; otherwise shows the first provider, or a blank
+        form when there are no providers yet.
+        """
+        providers, _warnings = load_providers()
+        self.providers = providers
+        self._providers_snapshot = self._providers_file_bytes()
+        current_name = None
+        if self.editing_provider is not None:
+            current_name = self.editing_provider.get("name")
+        self.provider_list.clear()
+        for provider in providers:
+            item = QListWidgetItem(provider["name"])
+            item.setData(Qt.UserRole, provider["name"])
+            self.provider_list.addItem(item)
+        keep = None
+        for provider in providers:
+            if provider["name"] == current_name:
+                keep = provider
+                break
+        if keep is not None:
+            self._load_provider_into_form(keep, is_new=False)
+            for row in range(self.provider_list.count()):
+                if self.provider_list.item(row).text() == keep["name"]:
+                    self.provider_list.setCurrentRow(row)
+                    break
+        elif providers:
+            self._load_provider_into_form(providers[0], is_new=False)
+            self.provider_list.setCurrentRow(0)
+        else:
+            self._load_provider_into_form(
+                {"name": "", "base_url": "", "api_key": "", "models": []},
+                is_new=True,
+            )
+
+    def _load_provider_into_form(self, provider, is_new):
+        """Fill the edit form from a provider dict.
+
+        The key field is always left EMPTY: the stored key is kept in
+        editing_kept_key and reused on save unless he types a new one.
+        The key is never shown on screen.
+        """
+        self.editing_provider = {
+            "name": provider.get("name", ""),
+            "base_url": provider.get("base_url", ""),
+            "api_key": provider.get("api_key", ""),
+            "models": [dict(m) for m in provider.get("models", [])],
+        }
+        self.editing_is_new = is_new
+        self.editing_original_name = provider.get("name", "")
+        self.editing_kept_key = provider.get("api_key", "")
+        self.provider_name_input.setText(self.editing_provider["name"])
+        self.provider_url_input.setText(self.editing_provider["base_url"])
+        self.provider_key_input.setText("")
+        if self.editing_kept_key:
+            self.provider_key_status.setText("Key saved")
+            self.provider_key_input.setPlaceholderText(
+                "Leave empty to keep the saved key"
+            )
+        else:
+            self.provider_key_status.setText("No key saved")
+            self.provider_key_input.setPlaceholderText(
+                "API key (leave empty if the server needs none)"
+            )
+        self.provider_model_id_input.setText("")
+        self.provider_model_name_input.setText("")
+        self.provider_price_in_input.setText("")
+        self.provider_price_out_input.setText("")
+        self._refresh_provider_models_list()
+
+    def _refresh_provider_models_list(self):
+        self.provider_models_list.clear()
+        if self.editing_provider is None:
+            return
+        for index, model in enumerate(self.editing_provider["models"]):
+            text = model["id"]
+            if model.get("display_name"):
+                text += f" — {model['display_name']}"
+            price_in = model.get("price_input_per_1m")
+            price_out = model.get("price_output_per_1m")
+            if price_in is not None or price_out is not None:
+                in_text = f"${price_in}" if price_in is not None else "?"
+                out_text = f"${price_out}" if price_out is not None else "?"
+                text += f" ({in_text} in / {out_text} out per 1M)"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, index)
+            self.provider_models_list.addItem(item)
+
+    def _provider_from_form(self):
+        """Provider dict from the form fields, keeping the stored key
+        when the key field was left empty."""
+        key = self.provider_key_input.text()
+        if not key:
+            key = self.editing_kept_key
+        models = []
+        if self.editing_provider is not None:
+            models = [dict(m) for m in self.editing_provider["models"]]
+        return {
+            "name": self.provider_name_input.text().strip(),
+            "base_url": self.provider_url_input.text().strip().rstrip("/"),
+            "api_key": key,
+            "models": models,
+        }
+
+    def on_provider_selected(self, item):
+        name = item.data(Qt.UserRole)
+        for provider in self.providers:
+            if provider["name"] == name:
+                self._load_provider_into_form(provider, is_new=False)
+                return
+
+    def new_provider(self):
+        self.provider_list.clearSelection()
+        self._load_provider_into_form(
+            {"name": "", "base_url": "", "api_key": "", "models": []},
+            is_new=True,
+        )
+        self.provider_status.setText("New provider. Fill in the details and press Save provider.")
+
+    def remove_provider(self):
+        item = self.provider_list.currentItem()
+        if item is None:
+            self.provider_status.setText("Pick a provider to remove first.")
+            return
+        name = item.data(Qt.UserRole)
+        providers, _warnings = load_providers()
+        providers = [p for p in providers if p["name"] != name]
+        save_providers(providers)
+        self.provider_status.setText(f"Removed {name}.")
+        self.refresh_providers()
+        self.refresh_models()
+
+    def save_provider(self):
+        if self.editing_provider is None:
+            return
+        provider = self._provider_from_form()
+        if not provider["name"]:
+            self.provider_status.setText("Give the provider a name first.")
+            return
+        if not provider["base_url"]:
+            self.provider_status.setText("Give the provider a base URL first.")
+            return
+        if not provider["base_url"].startswith(("http://", "https://")):
+            self.provider_status.setText("The base URL must start with http:// or https://")
+            return
+        providers, _warnings = load_providers()
+        if self.editing_is_new:
+            if any(p["name"] == provider["name"] for p in providers):
+                self.provider_status.setText(
+                    f"A provider named {provider['name']} already exists."
+                )
+                return
+        else:
+            providers = [
+                p for p in providers
+                if p["name"] != self.editing_original_name
+            ]
+            if any(p["name"] == provider["name"] for p in providers):
+                self.provider_status.setText(
+                    f"A provider named {provider['name']} already exists."
+                )
+                return
+        providers.append(provider)
+        providers.sort(key=lambda p: p["name"])
+        save_providers(providers)
+        self.provider_status.setText(f"Saved {provider['name']}.")
+        self.refresh_providers()
+        self.refresh_models()
+
+    def test_provider_connection(self):
+        if self.provider_test_worker is not None:
+            return
+        provider = self._provider_from_form()
+        if not provider["base_url"]:
+            self.provider_test_status.setText("Type a base URL first.")
+            return
+        if not provider["name"]:
+            provider["name"] = "provider"
+        self.provider_test_button.setEnabled(False)
+        self.provider_test_status.setText("Testing...")
+        self.provider_test_worker = ProviderTestWorker(provider)
+        self.provider_test_worker.tested.connect(self.on_provider_tested)
+        self.provider_test_worker.start()
+
+    def on_provider_tested(self, ok, message):
+        self.provider_test_worker = None
+        self.provider_test_button.setEnabled(True)
+        self.provider_test_status.setText(message)
+
+    def add_provider_model(self):
+        if self.editing_provider is None:
+            self.provider_status.setText("Pick a provider first.")
+            return
+        model_id = self.provider_model_id_input.text().strip()
+        if not model_id:
+            self.provider_status.setText("Type a model id first.")
+            return
+        if any(m["id"] == model_id for m in self.editing_provider["models"]):
+            self.provider_status.setText("That model is already on this provider.")
+            return
+        price_in = self._parse_price(self.provider_price_in_input.text())
+        price_out = self._parse_price(self.provider_price_out_input.text())
+        if price_in is False or price_out is False:
+            self.provider_status.setText("Price must be a number, e.g. 0.15")
+            return
+        self.editing_provider["models"].append({
+            "id": model_id,
+            "display_name": self.provider_model_name_input.text().strip(),
+            "price_input_per_1m": price_in,
+            "price_output_per_1m": price_out,
+        })
+        self.provider_model_id_input.setText("")
+        self.provider_model_name_input.setText("")
+        self.provider_price_in_input.setText("")
+        self.provider_price_out_input.setText("")
+        self._refresh_provider_models_list()
+        self.provider_status.setText(
+            f"Added {model_id}. Press Save provider to keep it."
+        )
+
+    def _parse_price(self, text):
+        """Price text to float, None when empty, False when not a number."""
+        text = (text or "").strip().lstrip("$").strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return False
+        if value < 0:
+            return False
+        return value
+
+    def remove_provider_model(self):
+        if self.editing_provider is None:
+            return
+        item = self.provider_models_list.currentItem()
+        if item is None:
+            self.provider_status.setText("Pick a model to remove first.")
+            return
+        index = item.data(Qt.UserRole)
+        models = self.editing_provider["models"]
+        if 0 <= index < len(models):
+            removed = models.pop(index)
+            self._refresh_provider_models_list()
+            self.provider_status.setText(
+                f"Removed {removed['id']}. Press Save provider to keep it."
+            )
 
     # -- report ----------------------------------------------------------
 
