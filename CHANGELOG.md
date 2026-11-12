@@ -1,5 +1,69 @@
 # Changelog
 
+## v5 (2026-11-12)
+
+- Capability screening. The app asks Ollama what each model can do
+  (via `/api/show`) and shows it in brackets after the model name,
+  for example `qwen3-vl:2b-instruct [vision]`. The answers are cached
+  in `capabilities.json` next to the app; the Screen models button
+  throws the cache away and re-screens everything. Screening never
+  breaks the model list: a model that cannot be screened shows as
+  text-only.
+- Greyed-out templates. A template is enabled only when at least one
+  ticked model can run it; templates no ticked model can run are
+  greyed out and untickable, and with nothing ticked everything shows
+  enabled. In a run, a model-template pair the model cannot run is
+  recorded as "not eligible", never as a failure, and never counts
+  toward the model's score. No run file is written for a skipped pair.
+- Provider capability ticks. Provider models get capability
+  checkboxes on the Providers tab — Text, Vision, Tools, Image
+  generation, Audio, Long context — defaulting to text-only. Clicking
+  a model in the list loads it into the form; Update model writes
+  changes back. A model with Text unticked skips the text warmup
+  (a connection test is used instead).
+- 13 new templates (19 total): Vision, Image Generation, Tool
+  Calling, Long Context, Multi-turn, Code Repair, Planning, Grounded
+  QA, Refusal, Summarisation, Structured Output, Role Following,
+  Audio. The six v4 templates are unchanged.
+- Vision. Image understanding — describe, count, read text — via
+  Ollama `/api/chat` images and provider `image_url` parts. Two test
+  images with known content are bundled in `images/` (a shapes
+  picture and a shop-sign picture).
+- Image Generation. Provider-only, POST `/v1/images/generations`.
+  A task passes when a valid image comes back, and the image is
+  saved into the run folder for your own eyes — the app never scores
+  image quality.
+- Tool Calling. Ollama `/api/chat` tools and provider tools. Scored
+  on the right tool with the right arguments, including a task where
+  no tool is needed at all.
+- Long Context. Needle-in-a-haystack at 1K, 8K, and 32K tokens.
+  Ollama long-context eligibility comes from the model's reported
+  context length (32K or more); a model that reports none is
+  attempted and the score says whether it coped.
+- Multi-turn and Role Following. A conversation-state runner carries
+  the full message history across turns, so follow-ups can depend on
+  earlier answers; role tasks add a system prompt per task.
+- Code Repair. Fix broken code from its error message; the fixed code
+  is run against test cases, like the Coding template.
+- Planning, Grounded QA, Refusal, Summarisation, Structured Output.
+  New scorer rules: ordered steps, refusal detection (a model passes
+  refusal tasks by answering, not by refusing), and strict schema
+  validation — the whole answer must be valid JSON matching the
+  schema, no fences, no wrapper, no prose.
+- Audio. Provider-only, `/v1/audio/transcriptions` and
+  `/v1/audio/speech`. Transcription tasks score the words; speech
+  tasks pass when audio comes back, and the clip is saved into the
+  run folder so you can listen. The bundled clips in `audio/` are
+  simple tone fixtures that prove the plumbing; for a real
+  transcription test, add a recording of speech.
+- Speed at context lengths. The Speed template now measures tok/s at
+  1K, 8K, and 32K context instead of two plain prompts. The 32K run
+  takes minutes on a CPU by design.
+- Generated media is part of the run record. Images and speech clips
+  are saved next to their run file in a folder named after it
+  (`<time>-image_generation-images/`, `<time>-audio-audio/`), listed
+  in the run file, and never overwritten.
+
 ## v4 (2026-11-12)
 
 - Providers. Cloud providers' models can now be tested with the same

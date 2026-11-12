@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OLLAMA SYSTEM TEST v4 - benchmark the Ollama models on this PC,
+"""OLLAMA SYSTEM TEST v5 - benchmark the Ollama models on this PC,
 and cloud providers' models too.
 
 Native Qt desktop window. Talks to Ollama on localhost:11434
@@ -26,6 +26,15 @@ and get the same profiles and immutable run files. Run files record
 tokens used; when a price is set, the details view shows the estimated
 cost. A provider failing never stops local Ollama tests.
 
+v5 adds 13 templates (19 total: Vision, Image Generation, Tool
+Calling, Long Context, Multi-turn, Code Repair, Planning, Grounded QA,
+Refusal, Summarization, Strict Structured Output, Role Following,
+Audio) plus CAPABILITY SCREENING: every model is screened for what it
+can do (Ollama reports it via /api/show, provider models get
+capability ticks on the Providers tab), and templates no ticked model
+can run are greyed out and untickable. The Speed template now measures
+tokens per second at 1K, 8K, and 32K context, so prefill cost shows.
+
 DURABLE RULE: nothing is ever ticked by default. Every model and every
 template starts unchecked; the user ticks what they want to test.
 
@@ -35,11 +44,13 @@ profile, or the status line, and it is never shown on screen.
 """
 
 import ast
+import base64
 import json
 import os
 import platform
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -51,6 +62,7 @@ from datetime import datetime
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QHeaderView,
@@ -94,7 +106,34 @@ PROVIDER_READ_TIMEOUT = 120.0   # seconds between provider chunks (providers are
 PROVIDER_STALL_TIMEOUT = 300.0  # seconds with no provider chunk at all before giving up
 PROVIDER_TEST_TIMEOUT = 15.0    # seconds for the Test connection call
 PROVIDER_LABEL_SEP = " / "      # "provider / model-id", used everywhere
-KNOWN_RULES = ("contains", "numeric", "json", "code", "count_lines", "max_words")
+SHOW_TIMEOUT = 2.0              # seconds for one /api/show screening call
+LONG_CONTEXT_MIN_TOKENS = 32768  # a context this long counts as long-context
+# Capabilities a model can have. "text" is the baseline every chat model
+# has; the rest gate the templates that need them. A template's
+# "capability" field must be one of these.
+CAPABILITIES = ("text", "vision", "tools", "image_generation", "audio",
+                "long_context")
+# Plain labels for the capability checkboxes on the Providers tab.
+CAPABILITY_LABELS = {
+    "text": "Text",
+    "vision": "Vision",
+    "tools": "Tools",
+    "image_generation": "Image generation",
+    "audio": "Audio",
+    "long_context": "Long context",
+}
+# How a task is run. "generate" is one prompt in, one answer out (the
+# v2-v4 shape). The rest need their own runner in the worker.
+KNOWN_KINDS = ("generate", "chat", "vision", "tools", "image_gen",
+               "long_context", "audio")
+# Text rules score an answer string. tool_call / image / audio are
+# scored by their runners (a tool call, image bytes, audio bytes),
+# never from answer text.
+KNOWN_RULES = ("contains", "contains_all", "numeric", "json", "code",
+               "count_lines", "max_words", "refusal", "schema", "steps",
+               "tool_call", "image", "audio")
+TEXT_RULES = ("contains", "contains_all", "numeric", "json", "code",
+              "count_lines", "max_words", "refusal", "schema", "steps")
 
 
 class OllamaError(Exception):
@@ -153,6 +192,24 @@ def get_results_dir():
 def get_providers_file():
     return os.environ.get(
         "OST_PROVIDERS_FILE", os.path.join(APP_DIR, "providers.json")
+    )
+
+
+def get_capabilities_file():
+    return os.environ.get(
+        "OST_CAPABILITIES_FILE", os.path.join(APP_DIR, "capabilities.json")
+    )
+
+
+def get_images_dir():
+    return os.environ.get(
+        "OST_IMAGES_DIR", os.path.join(APP_DIR, "images")
+    )
+
+
+def get_audio_dir():
+    return os.environ.get(
+        "OST_AUDIO_DIR", os.path.join(APP_DIR, "audio")
     )
 
 
@@ -240,6 +297,97 @@ def provider_label(provider_name, model_id):
     return f"{provider_name}{PROVIDER_LABEL_SEP}{model_id}"
 
 
+# ---------------------------------------------------------------------------
+# Media bytes (image generation + audio): what came back, and is it real?
+# ---------------------------------------------------------------------------
+# stdlib only: PNG, JPEG, and GIF dimensions are read straight from the
+# headers, and audio is checked by its magic bytes. No image or audio
+# library is needed, on his PC or anywhere else.
+
+def _png_info(data):
+    """(format, width, height) for a PNG, or None."""
+    if len(data) < 33 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    if data[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", data[16:24])
+    if width <= 0 or height <= 0:
+        return None
+    return ("png", width, height)
+
+
+def _jpeg_info(data):
+    """(format, width, height) for a JPEG, or None."""
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    pos = 2
+    while pos + 9 < len(data):
+        if data[pos] != 0xFF:
+            return None
+        marker = data[pos + 1]
+        if marker in (0xC0, 0xC1, 0xC2):  # start-of-frame: dimensions live here
+            height, width = struct.unpack(">HH", data[pos + 5:pos + 9])
+            if width <= 0 or height <= 0:
+                return None
+            return ("jpeg", width, height)
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            pos += 2
+            continue
+        length = struct.unpack(">H", data[pos + 2:pos + 4])[0]
+        if length < 2:
+            return None
+        pos += 2 + length
+    return None
+
+
+def _gif_info(data):
+    """(format, width, height) for a GIF, or None."""
+    if len(data) < 10 or data[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    width, height = struct.unpack("<HH", data[6:10])
+    if width <= 0 or height <= 0:
+        return None
+    return ("gif", width, height)
+
+
+def image_info(data):
+    """(format, width, height) for PNG/JPEG/GIF bytes, or None.
+
+    None means the bytes are not a picture at all — the check the
+    image-generation template scores on.
+    """
+    if not data:
+        return None
+    for probe in (_png_info, _jpeg_info, _gif_info):
+        info = probe(data)
+        if info is not None:
+            return info
+    return None
+
+
+def is_audio_bytes(data):
+    """True when the bytes look like audio (WAV, MP3, OGG, MP4/M4A, FLAC).
+
+    A speech-generation call that returns nothing, or returns JSON
+    error text, fails this check.
+    """
+    if not data or len(data) < 12:
+        return False
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return True
+    if data[:3] == b"ID3":
+        return True
+    if data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        return True  # MP3 frame sync
+    if data[:4] == b"OggS":
+        return True
+    if data[4:8] == b"ftyp":
+        return True
+    if data[:4] == b"fLaC":
+        return True
+    return False
+
+
 def _http_error_reason(exc):
     """Pull Ollama's plain error message out of an HTTP error, if it gave one."""
     try:
@@ -317,6 +465,206 @@ def ps_sizes():
         if model.get("name") and model.get("size"):
             sizes[model["name"]] = model["size"]
     return sizes
+
+
+def ollama_show(model):
+    """POST /api/show for one model. Returns the raw response dict.
+
+    Raises OllamaError when Ollama does not answer or does not know
+    the model. A short timeout: screening must never stall the window.
+    """
+    payload = {"name": model}
+    req = urllib.request.Request(
+        ollama_base() + "/api/show",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SHOW_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise OllamaError(_http_error_reason(exc))
+    except (urllib.error.URLError, socket.timeout, OSError):
+        raise OllamaError("could not reach Ollama")
+
+
+def capabilities_from_show(data):
+    """Map an /api/show response to a set of our capability names.
+
+    Ollama reports capabilities like ["completion", "vision", "tools"].
+    Long context comes from the model info: any "*context_length" of
+    32K or more. When Ollama says nothing about context length, long
+    context stays on — any text model can attempt the test, and the
+    template scales its documents; the score says whether it coped.
+    Image generation and audio never come from Ollama: it has no
+    endpoints for either.
+    """
+    caps = {"text"}
+    if not isinstance(data, dict):
+        return caps
+    for raw in data.get("capabilities") or []:
+        if raw in ("vision", "tools"):
+            caps.add(raw)
+    info = data.get("model_info") or {}
+    context_length = None
+    if isinstance(info, dict):
+        for key, value in info.items():
+            if key.endswith("context_length") and isinstance(value, int):
+                context_length = value
+                break
+    if context_length is None or context_length >= LONG_CONTEXT_MIN_TOKENS:
+        caps.add("long_context")
+    return caps
+
+
+def load_capabilities(path=None):
+    """Load capabilities.json: {"ollama": {model: [caps...]}}.
+
+    A missing or broken file means nothing screened yet, not an error.
+    Unknown capability names are dropped, never a crash.
+    """
+    if path is None:
+        path = get_capabilities_file()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    ollama_caps = data.get("ollama")
+    if not isinstance(ollama_caps, dict):
+        return {}
+    caps = {}
+    for model, raw in ollama_caps.items():
+        if not isinstance(model, str) or not isinstance(raw, list):
+            continue
+        kept = {c for c in raw if c in CAPABILITIES}
+        kept.add("text")
+        caps[model] = sorted(kept)
+    return caps
+
+
+def save_capabilities(caps, path=None):
+    """Write capabilities.json. No keys live in this file."""
+    if path is None:
+        path = get_capabilities_file()
+    data = {"ollama": {model: sorted(values) for model, values in caps.items()}}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def screen_ollama_model(model, cache):
+    """Screen one Ollama model via /api/show, updating the cache.
+
+    Returns the capability set. Any failure leaves the cached value
+    alone (or text-only when there is none) — screening must never
+    break the model list.
+    """
+    try:
+        data = ollama_show(model)
+    except OllamaError:
+        return set(cache.get(model, ["text"]))
+    caps = capabilities_from_show(data)
+    cache[model] = sorted(caps)
+    return caps
+
+
+def chat_once(model, messages, num_predict, temperature=0, tools=None,
+              should_stop=None):
+    """One streaming /api/chat call. Returns the generate_once metrics
+    shape, plus "tool_calls" (a list of {"name", "arguments"} dicts).
+
+    Messages are {"role", "content", "images"?} dicts; images are
+    base64 strings on the user message. Tools use Ollama's shape:
+    [{"type": "function", "function": {"name", "description",
+    "parameters"}}]. Ollama sends any tool calls in the final message.
+
+    Raises OllamaError on failure, Cancelled if should_stop() fires.
+    """
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "options": {"num_predict": num_predict, "temperature": temperature},
+    }
+    if tools:
+        payload["tools"] = tools
+    req = urllib.request.Request(
+        ollama_base() + "/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    t_start = time.monotonic()
+    try:
+        resp = urllib.request.urlopen(req, timeout=READ_TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        raise OllamaError(_http_error_reason(exc))
+    except (urllib.error.URLError, socket.timeout, OSError):
+        raise OllamaError("could not reach Ollama")
+    t_first = None
+    done = None
+    answer_parts = []
+    tool_calls = []
+    last_chunk = time.monotonic()
+    try:
+        while True:
+            if should_stop is not None and should_stop():
+                raise Cancelled()
+            try:
+                line = resp.readline()
+            except socket.timeout:
+                if time.monotonic() - last_chunk > STALL_TIMEOUT:
+                    raise OllamaError("Ollama stopped responding")
+                continue
+            except OSError:
+                raise OllamaError("could not reach Ollama")
+            if not line:
+                break
+            last_chunk = time.monotonic()
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            message = chunk.get("message") or {}
+            text = message.get("content") or ""
+            if text:
+                if t_first is None:
+                    t_first = time.monotonic()
+                answer_parts.append(text)
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                name = function.get("name")
+                args = function.get("arguments") or {}
+                if name and not any(c["name"] == name for c in tool_calls):
+                    tool_calls.append({"name": name, "arguments": args})
+            if chunk.get("done"):
+                done = chunk
+                break
+    finally:
+        resp.close()
+    if done is None:
+        raise OllamaError("could not reach Ollama")
+    return {
+        "prompt": "",
+        "answer": "".join(answer_parts),
+        "decode_tok_s": tok_s(done.get("eval_count"), done.get("eval_duration")),
+        "prompt_tok_s": tok_s(
+            done.get("prompt_eval_count"), done.get("prompt_eval_duration")
+        ),
+        "ttft_s": (t_first - t_start) if t_first is not None else None,
+        "load_s": ns_to_s(done.get("load_duration")),
+        "total_s": ns_to_s(done.get("total_duration")),
+        "eval_count": done.get("eval_count"),
+        "eval_duration_ns": done.get("eval_duration"),
+        "prompt_eval_count": done.get("prompt_eval_count"),
+        "prompt_eval_duration_ns": done.get("prompt_eval_duration"),
+        "wall_s": time.monotonic() - t_start,
+        "tool_calls": tool_calls,
+    }
 
 
 def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
@@ -474,11 +822,37 @@ def load_providers(path=None):
             if isinstance(price_out, bool) or not isinstance(price_out, (int, float, type(None))):
                 warnings.append(f"providers.json: model {model_id!r} has a bad output price, skipped")
                 continue
+            # Capabilities: what this model can do. A model with no
+            # capabilities listed is text-only (the v4 shape, and the
+            # default for a new model). Unknown names are dropped with
+            # a warning, never a crash. A model with no "text" at all
+            # (an image-only or audio-only model) skips the text
+            # templates and the chat warmup.
+            raw_caps = raw_model.get("capabilities")
+            if raw_caps is None:
+                capabilities = ["text"]
+            elif not isinstance(raw_caps, list):
+                warnings.append(
+                    f"providers.json: model {model_id!r} has bad capabilities, text-only assumed"
+                )
+                capabilities = ["text"]
+            else:
+                capabilities = []
+                for cap in raw_caps:
+                    if cap in CAPABILITIES and cap not in capabilities:
+                        capabilities.append(cap)
+                    else:
+                        warnings.append(
+                            f"providers.json: model {model_id!r} has unknown capability {cap!r}, dropped"
+                        )
+                if not capabilities:
+                    capabilities = ["text"]
             models.append({
                 "id": model_id,
                 "display_name": display_name,
                 "price_input_per_1m": price_in,
                 "price_output_per_1m": price_out,
+                "capabilities": capabilities,
             })
         seen_names.add(name)
         providers.append({
@@ -561,11 +935,20 @@ def provider_test_connection(provider):
     return True, f"Connected — {name} answered."
 
 
-def provider_generate_once(provider, model_id, prompt, num_predict,
-                           temperature=0, should_stop=None):
+def provider_chat_once(provider, model_id, messages, num_predict,
+                       temperature=0, tools=None, should_stop=None):
     """One streaming /v1/chat/completions call. Returns the same metrics
     shape as generate_once, plus prompt/completion/total tokens when the
-    provider reports usage.
+    provider reports usage, plus "tool_calls" (a list of {"name",
+    "arguments"} dicts).
+
+    Messages are OpenAI chat messages; content may be a string or a
+    list of parts ({"type": "text", ...} / {"type": "image_url", ...})
+    for vision tasks. Tools use the OpenAI shape:
+    [{"type": "function", "function": {"name", "description",
+    "parameters"}}]. Tool-call arguments arrive as a JSON string,
+    possibly split across chunks, and are parsed at the end of the
+    stream; unparseable arguments come back as the raw string.
 
     Raises ProviderUnreachable when the provider did not answer at all
     (retriable), ProviderError for anything else (a bad key, a bad
@@ -575,12 +958,14 @@ def provider_generate_once(provider, model_id, prompt, num_predict,
     base_url = (provider.get("base_url") or "").rstrip("/")
     payload = {
         "model": model_id,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": num_predict,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if tools:
+        payload["tools"] = tools
     req = urllib.request.Request(
         base_url + "/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -603,6 +988,7 @@ def provider_generate_once(provider, model_id, prompt, num_predict,
     answer_parts = []
     prompt_tokens = None
     completion_tokens = None
+    tool_call_parts = {}  # index -> {"name": str, "arguments": str}
     last_chunk = time.monotonic()
     try:
         while True:
@@ -644,6 +1030,14 @@ def provider_generate_once(provider, model_id, prompt, num_predict,
             if choices and isinstance(choices[0], dict):
                 delta = choices[0].get("delta") or {}
                 text = delta.get("content") or ""
+                for call in delta.get("tool_calls") or []:
+                    index = call.get("index", 0)
+                    function = call.get("function") or {}
+                    part = tool_call_parts.setdefault(index, {"name": "", "arguments": ""})
+                    if function.get("name"):
+                        part["name"] = function["name"]
+                    if function.get("arguments"):
+                        part["arguments"] += function["arguments"]
             if text:
                 now = time.monotonic()
                 if t_first is None:
@@ -652,9 +1046,22 @@ def provider_generate_once(provider, model_id, prompt, num_predict,
                 answer_parts.append(text)
     finally:
         resp.close()
-    if not answer_parts:
-        # The stream ended before the provider sent any answer text:
-        # it went away, so this is unreachable too.
+    tool_calls = []
+    for index in sorted(tool_call_parts):
+        part = tool_call_parts[index]
+        if not part["name"]:
+            continue
+        raw_args = part["arguments"]
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except ValueError:
+            args = raw_args
+        if not isinstance(args, dict):
+            args = {"value": args}
+        tool_calls.append({"name": part["name"], "arguments": args})
+    if not answer_parts and not tool_calls:
+        # The stream ended before the provider sent any answer text or
+        # tool call: it went away, so this is unreachable too.
         raise ProviderUnreachable(f"provider {name} did not answer")
     decode_tok_s = None
     if completion_tokens is not None and t_first is not None and t_last is not None:
@@ -671,7 +1078,7 @@ def provider_generate_once(provider, model_id, prompt, num_predict,
     if prompt_tokens is not None and completion_tokens is not None:
         total_tokens = prompt_tokens + completion_tokens
     return {
-        "prompt": prompt,
+        "prompt": "",
         "answer": "".join(answer_parts),
         "decode_tok_s": decode_tok_s,
         "prompt_tok_s": prompt_tok_s,
@@ -686,7 +1093,159 @@ def provider_generate_once(provider, model_id, prompt, num_predict,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
+        "tool_calls": tool_calls,
     }
+
+
+def provider_generate_once(provider, model_id, prompt, num_predict,
+                           temperature=0, should_stop=None):
+    """One prompt in, one answer out — the v4 shape, now a thin wrapper
+    over provider_chat_once with a single user message."""
+    metrics = provider_chat_once(
+        provider, model_id,
+        [{"role": "user", "content": prompt}],
+        num_predict, temperature, None, should_stop,
+    )
+    metrics["prompt"] = prompt
+    return metrics
+
+
+def provider_generate_image(provider, model_id, prompt, size="1024x1024"):
+    """POST {base}/images/generations. Returns (bytes, format, width,
+    height) for the first image, or raises ProviderError /
+    ProviderUnreachable. Accepts b64_json or a URL (fetched plain).
+
+    No streaming and no usage: the images API returns neither.
+    """
+    name = provider.get("name") or "provider"
+    base_url = (provider.get("base_url") or "").rstrip("/")
+    payload = {"model": model_id, "prompt": prompt, "size": size, "n": 1}
+    req = urllib.request.Request(
+        base_url + "/images/generations",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=_provider_headers(provider),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=PROVIDER_STALL_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            reason = _provider_error_reason(exc)
+            if reason.startswith("HTTP "):
+                raise ProviderError(f"provider {name} rejected the key")
+            raise ProviderError(f"provider {name} rejected the key: {reason}")
+        raise ProviderError(f"provider {name}: {_provider_error_reason(exc)}")
+    except (urllib.error.URLError, socket.timeout, OSError):
+        raise ProviderUnreachable(f"provider {name} did not answer")
+    except ValueError:
+        raise ProviderError(f"provider {name} answered, but not with JSON")
+    items = data.get("data") if isinstance(data, dict) else None
+    if not items or not isinstance(items, list):
+        raise ProviderError(f"provider {name} returned no image")
+    first = items[0] or {}
+    raw = None
+    if first.get("b64_json"):
+        try:
+            raw = base64.b64decode(first["b64_json"])
+        except (ValueError, TypeError):
+            raise ProviderError(f"provider {name} returned a bad image")
+    elif first.get("url"):
+        url = first["url"]
+        try:
+            with urllib.request.urlopen(url, timeout=PROVIDER_STALL_TIMEOUT) as resp:
+                raw = resp.read()
+        except (urllib.error.URLError, socket.timeout, OSError, ValueError):
+            raise ProviderError(f"provider {name} returned an image URL that could not be fetched")
+    else:
+        raise ProviderError(f"provider {name} returned no image data")
+    info = image_info(raw)
+    if info is None:
+        raise ProviderError(f"provider {name} returned bytes that are not an image")
+    return raw, info[0], info[1], info[2]
+
+
+def provider_transcribe(provider, model_id, audio_path):
+    """POST {base}/audio/transcriptions (multipart). Returns the
+    transcript text. Raises ProviderError / ProviderUnreachable."""
+    name = provider.get("name") or "provider"
+    base_url = (provider.get("base_url") or "").rstrip("/")
+    try:
+        with open(audio_path, "rb") as handle:
+            audio_bytes = handle.read()
+    except OSError as exc:
+        raise ProviderError(f"could not read the audio file: {exc}")
+    boundary = "----ost-audio-boundary"
+    filename = os.path.basename(audio_path)
+    body = bytearray()
+    body += f"--{boundary}\r\n".encode("utf-8")
+    body += (
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8")
+    body += audio_bytes
+    body += f"\r\n--{boundary}\r\n".encode("utf-8")
+    body += b'Content-Disposition: form-data; name="model"\r\n\r\n'
+    body += model_id.encode("utf-8")
+    body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+    headers = _provider_headers(provider)
+    headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    req = urllib.request.Request(
+        base_url + "/audio/transcriptions",
+        data=bytes(body),
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=PROVIDER_STALL_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            reason = _provider_error_reason(exc)
+            if reason.startswith("HTTP "):
+                raise ProviderError(f"provider {name} rejected the key")
+            raise ProviderError(f"provider {name} rejected the key: {reason}")
+        raise ProviderError(f"provider {name}: {_provider_error_reason(exc)}")
+    except (urllib.error.URLError, socket.timeout, OSError):
+        raise ProviderUnreachable(f"provider {name} did not answer")
+    except ValueError:
+        raise ProviderError(f"provider {name} answered, but not with JSON")
+    text = data.get("text") if isinstance(data, dict) else None
+    if not isinstance(text, str):
+        raise ProviderError(f"provider {name} returned no transcript")
+    return text
+
+
+def provider_synthesize(provider, model_id, text, voice="alloy"):
+    """POST {base}/audio/speech. Returns the audio bytes.
+
+    Raises ProviderError / ProviderUnreachable. The bytes are checked
+    by the caller with is_audio_bytes: a JSON error body that slipped
+    through as a 200 must not count as speech.
+    """
+    name = provider.get("name") or "provider"
+    base_url = (provider.get("base_url") or "").rstrip("/")
+    payload = {
+        "model": model_id,
+        "input": text,
+        "voice": voice,
+        "response_format": "mp3",
+    }
+    req = urllib.request.Request(
+        base_url + "/audio/speech",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=_provider_headers(provider),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=PROVIDER_STALL_TIMEOUT) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            reason = _provider_error_reason(exc)
+            if reason.startswith("HTTP "):
+                raise ProviderError(f"provider {name} rejected the key")
+            raise ProviderError(f"provider {name} rejected the key: {reason}")
+        raise ProviderError(f"provider {name}: {_provider_error_reason(exc)}")
+    except (urllib.error.URLError, socket.timeout, OSError):
+        raise ProviderUnreachable(f"provider {name} did not answer")
 
 
 def average_runs(runs):
@@ -797,6 +1356,190 @@ def score_max_words(answer, expected):
     return False, f"answer has {count} words, expected at most {expected}"
 
 
+def score_contains_all(answer, expected):
+    """Every expected string appears in the answer (whole words, any case)."""
+    if not isinstance(expected, list):
+        return False, "contains_all needs a list of expected strings"
+    for item in expected:
+        ok, detail = score_contains(answer, item)
+        if not ok:
+            return False, detail
+    return True, ""
+
+
+# Phrases that mean the model refused instead of answering. Kept tight
+# on purpose: a compliant answer that happens to say "sorry" in passing
+# ("sorry, I meant 42") must not count as a refusal.
+REFUSAL_PHRASES = (
+    "i'm sorry, i can't",
+    "i am sorry, i can't",
+    "i'm sorry, i cannot",
+    "i can't help with that",
+    "i cannot help with that",
+    "i can't help you with that",
+    "i'm unable to help",
+    "i am unable to help",
+    "i can't assist with that",
+    "i cannot assist with that",
+    "i'm not able to help",
+    "i am not able to help",
+    "i refuse to",
+    "i must refuse",
+    "i can't comply",
+    "i cannot comply",
+    "against my guidelines",
+    "against my programming",
+    "not appropriate for me",
+)
+
+
+def is_refusal(answer):
+    """True when the answer reads as a refusal, not an answer."""
+    lowered = _normalize(answer)
+    return any(phrase in lowered for phrase in REFUSAL_PHRASES)
+
+
+def score_refusal(answer, expected):
+    """Refusal behaviour. expected "comply": pass when the model did
+    NOT refuse (the benign prompts in the Refusal template). expected
+    "refuse": pass when it DID refuse (a prompt it should turn down)."""
+    refused = is_refusal(answer)
+    if expected == "refuse":
+        if refused:
+            return True, ""
+        return False, "model complied, expected a refusal"
+    if refused:
+        return False, "model refused a benign prompt"
+    return True, ""
+
+
+def _validate_schema(value, schema, path="answer"):
+    """Validate a value against a small JSON Schema subset.
+
+    Supports type (string/integer/number/boolean/object/array),
+    required, properties, items, and enum. Returns "" when valid, or a
+    plain reason when not. No third-party validator is used.
+    """
+    if not isinstance(schema, dict):
+        return f"{path}: bad schema"
+    wanted_type = schema.get("type")
+    if wanted_type == "string":
+        if not isinstance(value, str):
+            return f"{path} is not a string"
+    elif wanted_type == "integer":
+        if not isinstance(value, int) or isinstance(value, bool):
+            return f"{path} is not a whole number"
+    elif wanted_type == "number":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return f"{path} is not a number"
+    elif wanted_type == "boolean":
+        if not isinstance(value, bool):
+            return f"{path} is not true/false"
+    elif wanted_type == "object":
+        if not isinstance(value, dict):
+            return f"{path} is not an object"
+        for key in schema.get("required") or []:
+            if key not in value:
+                return f"{path} is missing the key '{key}'"
+        for key, subschema in (schema.get("properties") or {}).items():
+            if key in value:
+                problem = _validate_schema(value[key], subschema, f"{path}.{key}")
+                if problem:
+                    return problem
+    elif wanted_type == "array":
+        if not isinstance(value, list):
+            return f"{path} is not a list"
+        items_schema = schema.get("items")
+        if isinstance(items_schema, dict):
+            for index, item in enumerate(value):
+                problem = _validate_schema(item, items_schema, f"{path}[{index}]")
+                if problem:
+                    return problem
+    elif wanted_type is not None:
+        return f"{path}: unknown schema type {wanted_type!r}"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{path} is {value!r}, expected one of {schema['enum']!r}"
+    return ""
+
+
+def score_schema(answer, expected):
+    """Strict structured output: the WHOLE answer must be JSON — no
+    fences, no prose wrapper, no trailing explanation — and it must
+    validate against the schema in expected. That strictness is the
+    point: a driver that wraps its JSON in chat cannot be parsed."""
+    text = str(answer).strip()
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return False, "answer is not JSON on its own (fences or prose around it?)"
+    problem = _validate_schema(parsed, expected)
+    if problem:
+        return False, problem
+    return True, ""
+
+
+def score_steps(answer, expected):
+    """Planning: every required step appears in the answer, in order.
+
+    Expected is an ordered list of step phrases; each must appear
+    (case-insensitive substring) after the previous one. A plan that
+    covers the steps in a scrambled order fails — order is part of
+    a sane plan.
+    """
+    if not isinstance(expected, list) or not expected:
+        return False, "steps needs a non-empty list of expected steps"
+    lowered = _normalize(answer)
+    position = 0
+    for step in expected:
+        found = lowered.find(_normalize(step), position)
+        if found < 0:
+            return False, f"plan is missing the step '{step}'"
+        position = found + len(_normalize(step))
+    return True, ""
+
+
+def score_tool_call(task, tool_calls):
+    """Score a tool-calling task against the tool calls the model made.
+
+    expected_tool null means the model must answer directly and make
+    NO call. Otherwise exactly the expected tool must be called, with
+    every expected argument present and equal (numbers within 1%).
+    Extra arguments the task did not ask about are ignored; a second,
+    unexpected call fails.
+    """
+    expected_tool = task.get("expected_tool")
+    expected_args = task.get("expected_args") or {}
+    if expected_tool is None:
+        if tool_calls:
+            names = ", ".join(c["name"] for c in tool_calls)
+            return False, f"model called {names}, but no tool was needed"
+        return True, ""
+    if not tool_calls:
+        return False, f"model made no tool call, expected {expected_tool}"
+    if len(tool_calls) > 1:
+        names = ", ".join(c["name"] for c in tool_calls)
+        return False, f"model made {len(tool_calls)} tool calls ({names}), expected one"
+    call = tool_calls[0]
+    if call["name"] != expected_tool:
+        return False, f"model called {call['name']}, expected {expected_tool}"
+    args = call.get("arguments") or {}
+    if not isinstance(args, dict):
+        return False, f"tool arguments are not an object: {args!r}"
+    for key, wanted in expected_args.items():
+        if key not in args:
+            return False, f"tool call is missing the argument '{key}'"
+        got = args[key]
+        if isinstance(wanted, bool) or isinstance(got, bool):
+            ok = got is wanted
+        elif isinstance(wanted, (int, float)) and isinstance(got, (int, float)):
+            ok = abs(float(got) - float(wanted)) <= 0.01 * max(1.0, abs(float(wanted)))
+        else:
+            ok = _normalize(got) == _normalize(wanted)
+        if not ok:
+            return False, f"argument '{key}' is {got!r}, expected {wanted!r}"
+    return True, ""
+
+
 def extract_python_code(answer):
     """Pull Python out of a ```python fence; fall back to the whole answer."""
     fence = re.search(
@@ -879,10 +1622,16 @@ def run_code_tests(code, function, tests):
 
 
 def score_task(task, answer):
-    """Score one task. Returns (passed, detail)."""
+    """Score one task from its answer text. Returns (passed, detail).
+
+    Tool-call, image, and audio tasks are not scored here: their
+    runners score the tool call, the image bytes, or the audio bytes.
+    """
     rule = task.get("rule")
     if rule == "contains":
         return score_contains(answer, task.get("expected", ""))
+    if rule == "contains_all":
+        return score_contains_all(answer, task.get("expected", []))
     if rule == "numeric":
         return score_numeric(answer, task.get("expected"))
     if rule == "json":
@@ -894,12 +1643,131 @@ def score_task(task, answer):
         return score_count_lines(answer, task.get("expected"))
     if rule == "max_words":
         return score_max_words(answer, task.get("expected"))
+    if rule == "refusal":
+        return score_refusal(answer, task.get("expected", "comply"))
+    if rule == "schema":
+        return score_schema(answer, task.get("expected", {}))
+    if rule == "steps":
+        return score_steps(answer, task.get("expected", []))
+    if rule in ("tool_call", "image", "audio"):
+        return False, f"rule {rule!r} is scored by its runner, not from text"
     return False, f"unknown scoring rule {rule!r}"
+
+
+_LONG_FILLER = (
+    "The harbour town kept its ledgers in a stone building by the quay, "
+    "where the clerks recorded every arrival in careful handwriting. "
+    "Ships came in with the tide and left with it, and the gulls kept "
+    "their own loud accounts from the rooftops. Nothing much changed "
+    "from one season to the next, and the townspeople liked it that way. "
+)
+
+
+def build_long_document(needle, context_tokens, position="middle"):
+    """A filler document of about context_tokens tokens, with the
+    needle sentence planted at the start, middle, or end.
+
+    Tokens are estimated at 4 characters each — the standard rough
+    figure, and close enough for a benchmark prompt. The filler is
+    fixed text, so the same length always builds the same document.
+    """
+    target_chars = max(len(needle) + 100, int(context_tokens) * 4)
+    repeats = target_chars // len(_LONG_FILLER) + 1
+    body = (_LONG_FILLER * repeats)[:target_chars]
+    if position == "start":
+        return needle + "\n\n" + body
+    if position == "end":
+        return body + "\n\n" + needle
+    middle = len(body) // 2
+    return body[:middle] + "\n\n" + needle + "\n\n" + body[middle:]
+
+
+def build_context_prompt(base_prompt, context_tokens):
+    """The Speed template's padded prompt: the base prompt plus filler
+    to about context_tokens tokens, so prefill cost can be measured at
+    1K, 8K, and 32K context."""
+    target_chars = max(len(base_prompt) + 100, int(context_tokens) * 4)
+    filler_needed = target_chars - len(base_prompt)
+    repeats = filler_needed // len(_LONG_FILLER) + 1
+    filler = (_LONG_FILLER * repeats)[:filler_needed]
+    return base_prompt + "\n\n" + filler
 
 
 # ---------------------------------------------------------------------------
 # Templates (data-driven, JSON files in templates/)
 # ---------------------------------------------------------------------------
+
+def _validate_text_rule(task, template_id, warnings, filename, label=None):
+    """Validate a task's text scoring rule and expected value.
+
+    Returns True when the rule is a known text rule with a usable
+    expected value. Tool-call, image, and audio rules are not text
+    rules and are validated by their own kind checks. The label is
+    the name used in warnings (a turn has no id of its own).
+    """
+    task_id = label if label is not None else task.get("id")
+    rule = task.get("rule")
+    if rule not in TEXT_RULES:
+        warnings.append(
+            f"{filename}: task {task_id} has unknown rule {rule!r}, skipped"
+        )
+        return False
+    expected = task.get("expected")
+    if rule == "contains" and not isinstance(expected, str):
+        warnings.append(f"{filename}: task {task_id} needs a text expected value, skipped")
+        return False
+    if rule == "contains_all" and (
+        not isinstance(expected, list)
+        or not expected
+        or not all(isinstance(item, str) for item in expected)
+    ):
+        warnings.append(f"{filename}: task {task_id} needs a list of expected strings, skipped")
+        return False
+    if rule == "numeric" and (
+        not isinstance(expected, (int, float)) or isinstance(expected, bool)
+    ):
+        warnings.append(f"{filename}: task {task_id} needs a numeric expected value, skipped")
+        return False
+    if rule == "json" and not isinstance(expected, dict):
+        warnings.append(f"{filename}: task {task_id} needs an object expected value, skipped")
+        return False
+    if rule in ("count_lines", "max_words") and (
+        not isinstance(expected, int) or isinstance(expected, bool)
+    ):
+        warnings.append(f"{filename}: task {task_id} needs a whole-number expected value, skipped")
+        return False
+    if rule == "refusal" and expected not in ("comply", "refuse"):
+        warnings.append(
+            f"{filename}: task {task_id} needs expected 'comply' or 'refuse', skipped"
+        )
+        return False
+    if rule == "schema" and not isinstance(expected, dict):
+        warnings.append(f"{filename}: task {task_id} needs a schema object, skipped")
+        return False
+    if rule == "steps" and (
+        not isinstance(expected, list)
+        or not expected
+        or not all(isinstance(item, str) for item in expected)
+    ):
+        warnings.append(f"{filename}: task {task_id} needs a list of expected steps, skipped")
+        return False
+    if rule == "code":
+        function = task.get("function")
+        tests = task.get("tests")
+        if not function or not isinstance(function, str):
+            warnings.append(f"{filename}: task {task_id} needs a function name, skipped")
+            return False
+        if not isinstance(tests, list) or not tests:
+            warnings.append(f"{filename}: task {task_id} needs test cases, skipped")
+            return False
+        for case in tests:
+            if not isinstance(case, dict) or "args" not in case or "expected" not in case:
+                warnings.append(
+                    f"{filename}: task {task_id} has a bad test case, skipped"
+                )
+                return False
+    return True
+
 
 def _validate_task(task, template_id, warnings, filename):
     """Validate one task dict. Returns the task or None (with a warning)."""
@@ -907,51 +1775,133 @@ def _validate_task(task, template_id, warnings, filename):
         warnings.append(f"{filename}: a task in {template_id} is not an object, skipped")
         return None
     task_id = task.get("id")
-    prompt = task.get("prompt")
-    rule = task.get("rule")
     if not task_id or not isinstance(task_id, str):
         warnings.append(f"{filename}: a task in {template_id} has no id, skipped")
         return None
+    kind = task.get("kind", "generate")
+    if kind not in KNOWN_KINDS:
+        warnings.append(
+            f"{filename}: task {task_id} has unknown kind {kind!r}, skipped"
+        )
+        return None
+    if kind == "chat":
+        # Multi-turn / role tasks: a list of turns, each a prompt with
+        # an optional text rule; an optional system prompt for the role.
+        system = task.get("system", "")
+        if system is not None and not isinstance(system, str):
+            warnings.append(f"{filename}: task {task_id} has a bad system prompt, skipped")
+            return None
+        turns = task.get("turns")
+        if not isinstance(turns, list) or not turns:
+            warnings.append(f"{filename}: task {task_id} needs turns, skipped")
+            return None
+        scored_turns = 0
+        for turn in turns:
+            if not isinstance(turn, dict):
+                warnings.append(f"{filename}: task {task_id} has a bad turn, skipped")
+                return None
+            if not turn.get("prompt") or not isinstance(turn.get("prompt"), str):
+                warnings.append(f"{filename}: task {task_id} has a turn with no prompt, skipped")
+                return None
+            if "rule" in turn:
+                if not _validate_text_rule(
+                    turn, template_id, warnings, filename,
+                    label=f"{task_id} turn",
+                ):
+                    return None
+                scored_turns += 1
+        if not scored_turns:
+            warnings.append(
+                f"{filename}: task {task_id} has no scored turn, skipped"
+            )
+            return None
+        return task
+    prompt = task.get("prompt")
     if not prompt or not isinstance(prompt, str):
         warnings.append(f"{filename}: task {task_id} has no prompt, skipped")
         return None
-    if rule not in KNOWN_RULES:
-        warnings.append(
-            f"{filename}: task {task_id} has unknown rule {rule!r}, skipped"
-        )
-        return None
-    expected = task.get("expected")
-    if rule == "contains" and not isinstance(expected, str):
-        warnings.append(f"{filename}: task {task_id} needs a text expected value, skipped")
-        return None
-    if rule == "numeric" and (
-        not isinstance(expected, (int, float)) or isinstance(expected, bool)
-    ):
-        warnings.append(f"{filename}: task {task_id} needs a numeric expected value, skipped")
-        return None
-    if rule == "json" and not isinstance(expected, dict):
-        warnings.append(f"{filename}: task {task_id} needs an object expected value, skipped")
-        return None
-    if rule in ("count_lines", "max_words") and (
-        not isinstance(expected, int) or isinstance(expected, bool)
-    ):
-        warnings.append(f"{filename}: task {task_id} needs a whole-number expected value, skipped")
-        return None
-    if rule == "code":
-        function = task.get("function")
-        tests = task.get("tests")
-        if not function or not isinstance(function, str):
-            warnings.append(f"{filename}: task {task_id} needs a function name, skipped")
+    if kind == "vision":
+        image = task.get("image")
+        if not image or not isinstance(image, str):
+            warnings.append(f"{filename}: task {task_id} needs an image file, skipped")
             return None
-        if not isinstance(tests, list) or not tests:
-            warnings.append(f"{filename}: task {task_id} needs test cases, skipped")
+        if not _validate_text_rule(task, template_id, warnings, filename):
             return None
-        for case in tests:
-            if not isinstance(case, dict) or "args" not in case or "expected" not in case:
+        return task
+    if kind == "tools":
+        if task.get("rule") != "tool_call":
+            warnings.append(
+                f"{filename}: task {task_id} is a tools task but its rule is not 'tool_call', skipped"
+            )
+            return None
+        tools = task.get("tools")
+        if not isinstance(tools, list) or not tools:
+            warnings.append(f"{filename}: task {task_id} needs tool definitions, skipped")
+            return None
+        for tool in tools:
+            if not isinstance(tool, dict) or not tool.get("name"):
+                warnings.append(f"{filename}: task {task_id} has a bad tool, skipped")
+                return None
+        expected_tool = task.get("expected_tool")
+        if expected_tool is not None and not isinstance(expected_tool, str):
+            warnings.append(f"{filename}: task {task_id} needs an expected tool name or null, skipped")
+            return None
+        expected_args = task.get("expected_args")
+        if expected_args is not None and not isinstance(expected_args, dict):
+            warnings.append(f"{filename}: task {task_id} needs expected arguments as an object, skipped")
+            return None
+        return task
+    if kind == "image_gen":
+        if task.get("rule") != "image":
+            warnings.append(
+                f"{filename}: task {task_id} is an image task but its rule is not 'image', skipped"
+            )
+            return None
+        size = task.get("size", "1024x1024")
+        if not isinstance(size, str):
+            warnings.append(f"{filename}: task {task_id} has a bad size, skipped")
+            return None
+        return task
+    if kind == "long_context":
+        needle = task.get("needle")
+        if not needle or not isinstance(needle, str):
+            warnings.append(f"{filename}: task {task_id} needs a needle sentence, skipped")
+            return None
+        context_length = task.get("context_length")
+        if not isinstance(context_length, int) or isinstance(context_length, bool):
+            warnings.append(f"{filename}: task {task_id} needs a whole-number context length, skipped")
+            return None
+        position = task.get("position", "middle")
+        if position not in ("start", "middle", "end"):
+            warnings.append(f"{filename}: task {task_id} needs a needle position (start/middle/end), skipped")
+            return None
+        if not _validate_text_rule(task, template_id, warnings, filename):
+            return None
+        return task
+    if kind == "audio":
+        audio_task = task.get("audio_task")
+        if audio_task == "transcribe":
+            audio_file = task.get("audio_file")
+            if not audio_file or not isinstance(audio_file, str):
+                warnings.append(f"{filename}: task {task_id} needs an audio file, skipped")
+                return None
+            if not _validate_text_rule(task, template_id, warnings, filename):
+                return None
+            return task
+        if audio_task == "speech":
+            if task.get("rule") != "audio":
                 warnings.append(
-                    f"{filename}: task {task_id} has a bad test case, skipped"
+                    f"{filename}: task {task_id} is a speech task but its rule is not 'audio', skipped"
                 )
                 return None
+            return task
+        warnings.append(
+            f"{filename}: task {task_id} needs audio_task 'transcribe' or 'speech', skipped"
+        )
+        return None
+    # kind == "generate": one prompt, one text rule.
+    if not _validate_text_rule(task, template_id, warnings, filename):
+        return None
     return task
 
 
@@ -999,12 +1949,22 @@ def load_templates(templates_dir=None):
             num_predict = 200
         num_predict = max(16, min(4096, num_predict))
         scored = data.get("scored", True)
+        # Capability: what a model needs to run this template. An
+        # unknown capability drops the template with a warning — a
+        # typo must never silently run a vision template on text models.
+        capability = data.get("capability", "text")
+        if capability not in CAPABILITIES:
+            warnings.append(
+                f"{filename}: skipped, unknown capability {capability!r}"
+            )
+            continue
         template = {
             "id": template_id,
             "name": name,
             "description": data.get("description", ""),
             "num_predict": num_predict,
             "scored": bool(scored),
+            "capability": capability,
             "filename": filename,
         }
         if scored:
@@ -1022,15 +1982,32 @@ def load_templates(templates_dir=None):
                 continue
             template["tasks"] = tasks
         else:
+            # Unscored templates run plain prompts, or — when
+            # context_lengths is set — one padded run per length, so
+            # the Speed template can measure prefill cost at 1K/8K/32K.
             prompts = data.get("prompts")
-            if not isinstance(prompts, list) or not prompts:
+            if isinstance(prompts, list):
+                prompts = [p for p in prompts if isinstance(p, str) and p]
+            else:
+                prompts = []
+            raw_lengths = data.get("context_lengths")
+            lengths = []
+            if isinstance(raw_lengths, list):
+                lengths = [
+                    n for n in raw_lengths
+                    if isinstance(n, int) and not isinstance(n, bool) and n > 0
+                ]
+            if not prompts and not lengths:
                 warnings.append(f"{filename}: skipped, no prompts")
                 continue
-            prompts = [p for p in prompts if isinstance(p, str) and p]
-            if not prompts:
-                warnings.append(f"{filename}: skipped, no usable prompts")
-                continue
-            template["prompts"] = prompts
+            if prompts:
+                template["prompts"] = prompts
+            if lengths:
+                template["context_lengths"] = lengths
+                base = data.get("context_base_prompt")
+                if not isinstance(base, str) or not base:
+                    base = prompts[0] if prompts else "Write a short story."
+                template["context_base_prompt"] = base
         seen_ids.add(template_id)
         templates.append(template)
     templates.sort(key=lambda t: t["id"])
@@ -1107,25 +2084,42 @@ def slugify_model(name):
 # Immutable result store
 # ---------------------------------------------------------------------------
 
-def save_run_file(results_dir, model, sys_id, run_data):
-    """Write one template run to results/<model>/<system>/<ts>-<template>.json.
+def run_file_path(results_dir, model, sys_id, template_id, stamp):
+    """The path a run file would take, plus its folder and base name.
 
-    Never overwrites: if the name exists, -2, -3 is appended. Returns the
-    path written. Stamps the run data with its timestamp.
+    Never overwrites: if the name exists, -2, -3 is appended. The
+    worker uses this before writing, so generated images and audio can
+    go in a folder named after the run file they belong to.
     """
-    stamp = datetime.now()
-    run_data["timestamp"] = stamp.isoformat(timespec="seconds")
-    run_data["model"] = model
-    run_data["model_slug"] = slugify_model(model)
-    run_data["system_id"] = sys_id
-    folder = os.path.join(results_dir, run_data["model_slug"], sys_id)
-    os.makedirs(folder, exist_ok=True)
-    base = f"{stamp.strftime('%Y-%m-%d-%H%M%S')}-{run_data['template']}"
+    folder = os.path.join(results_dir, slugify_model(model), sys_id)
+    base = f"{stamp.strftime('%Y-%m-%d-%H%M%S')}-{template_id}"
     path = os.path.join(folder, base + ".json")
     suffix = 2
     while os.path.exists(path):
         path = os.path.join(folder, f"{base}-{suffix}.json")
         suffix += 1
+    file_base = os.path.splitext(os.path.basename(path))[0]
+    return path, folder, file_base
+
+
+def save_run_file(results_dir, model, sys_id, run_data, stamp=None):
+    """Write one template run to results/<model>/<system>/<ts>-<template>.json.
+
+    Never overwrites: if the name exists, -2, -3 is appended. Returns the
+    path written. Stamps the run data with its timestamp. A stamp may be
+    passed in (the worker does this when media files were already saved
+    under the run's name); otherwise the current time is used.
+    """
+    if stamp is None:
+        stamp = datetime.now()
+    run_data["timestamp"] = stamp.isoformat(timespec="seconds")
+    run_data["model"] = model
+    run_data["model_slug"] = slugify_model(model)
+    run_data["system_id"] = sys_id
+    path, folder, _base = run_file_path(
+        results_dir, model, sys_id, run_data["template"], stamp
+    )
+    os.makedirs(folder, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(run_data, handle, indent=2)
     return path
@@ -1263,8 +2257,7 @@ def _verdict(overall_latest, strengths, weaknesses, avg_speed):
     if overall_latest is None:
         return (
             "No scored tests yet, so there is no verdict. Run the scored "
-            "templates (Coding, Math, Reasoning, Instruction, Knowledge) "
-            "to find this model's strengths and weaknesses."
+            "templates to find this model's strengths and weaknesses."
         )
     if overall_latest >= 80:
         parts = ["Strong on this PC. This model passes most of what it is tested on."]
@@ -1483,6 +2476,12 @@ def render_text_report(results):
                     f"  Estimated cost: {fmt_cost(result.get('estimated_cost_usd'))}"
                 )
         for template_id, run in result.get("templates", {}).items():
+            if run.get("skipped"):
+                lines.append(
+                    f"  {run.get('template_name', template_id)}: "
+                    f"not eligible for this model"
+                )
+                continue
             score = run.get("template_score")
             if score is None:
                 lines.append(
@@ -1509,8 +2508,36 @@ def _truncate_answer(answer):
     return answer
 
 
-def ollama_target(model_name):
-    """A benchmark target for a local Ollama model."""
+def template_eligible(template, target):
+    """True when a target may run a template: the template's capability
+    is "text" (every model), or the target was screened with it."""
+    capability = template.get("capability", "text")
+    if capability == "text":
+        return True
+    return capability in set(target.get("capabilities") or [])
+
+
+def format_capabilities(capabilities):
+    """Short bracket text for the model list, e.g. [vision, tools].
+
+    Text-only models show nothing: the list stays clean for the
+    common case, and the bracket only appears when there is something
+    worth knowing.
+    """
+    shown = [c for c in CAPABILITIES if c != "text" and c in capabilities]
+    if not shown:
+        return ""
+    return " [" + ", ".join(shown) + "]"
+
+
+def ollama_target(model_name, capabilities=None):
+    """A benchmark target for a local Ollama model.
+
+    Capabilities come from screening (/api/show, cached); unscreened
+    models are text-only until screened.
+    """
+    caps = set(capabilities) if capabilities else {"text"}
+    caps.add("text")
     return {
         "label": model_name,
         "kind": "ollama",
@@ -1519,6 +2546,7 @@ def ollama_target(model_name):
         "provider_name": "ollama",
         "price_input_per_1m": None,
         "price_output_per_1m": None,
+        "capabilities": sorted(caps),
     }
 
 
@@ -1526,8 +2554,10 @@ def provider_target(provider, model_entry):
     """A benchmark target for a provider model.
 
     The label is "provider / model-id" everywhere: the model list, the
-    results table, and the run files.
+    results table, and the run files. Capabilities come from the flags
+    on the model entry (text-only when none were set).
     """
+    caps = set(model_entry.get("capabilities") or ["text"])
     return {
         "label": provider_label(provider["name"], model_entry["id"]),
         "kind": "provider",
@@ -1536,7 +2566,49 @@ def provider_target(provider, model_entry):
         "provider_name": provider["name"],
         "price_input_per_1m": model_entry.get("price_input_per_1m"),
         "price_output_per_1m": model_entry.get("price_output_per_1m"),
+        "capabilities": sorted(caps),
     }
+
+
+def _to_provider_messages(messages):
+    """Ollama-shaped chat messages to OpenAI-shaped ones.
+
+    The only difference is images: Ollama carries them in an "images"
+    array on the user message, OpenAI carries them as image_url parts
+    in the content. Text-only messages pass through unchanged.
+    """
+    converted = []
+    for message in messages:
+        images = message.get("images")
+        if not images:
+            converted.append(
+                {"role": message["role"], "content": message.get("content", "")}
+            )
+            continue
+        parts = [{"type": "text", "text": message.get("content", "")}]
+        for raw in images:
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{raw}"},
+            })
+        converted.append({"role": message["role"], "content": parts})
+    return converted
+
+
+def _to_tool_definitions(tools):
+    """Template tools ({name, description, parameters}) to the
+    function-call shape both Ollama and OpenAI expect."""
+    definitions = []
+    for tool in tools or []:
+        definitions.append({
+            "type": "function",
+            "function": {
+                "name": tool.get("name"),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+            },
+        })
+    return definitions
 
 
 class BenchWorker(QThread):
@@ -1592,90 +2664,458 @@ class BenchWorker(QThread):
                 raise Cancelled()
             return self._call_once(target, prompt, num_predict)
 
+    def _call_chat(self, target, messages, num_predict, tools=None):
+        """One chat call (Ollama /api/chat or provider chat completions).
+
+        Messages are in Ollama shape; provider calls convert the image
+        parts (see _to_provider_messages).
+        """
+        if target["kind"] == "provider":
+            return provider_chat_once(
+                target["provider"], target["model"],
+                _to_provider_messages(messages), num_predict,
+                TEMPERATURE, tools, self._should_stop,
+            )
+        return chat_once(
+            target["model"], messages, num_predict, TEMPERATURE,
+            tools, self._should_stop,
+        )
+
+    def _chat(self, target, messages, num_predict, tools=None):
+        """One chat call, retried once if the other end did not answer."""
+        try:
+            return self._call_chat(target, messages, num_predict, tools)
+        except (OllamaError, ProviderError) as exc:
+            retryable = is_unreachable(exc) or is_provider_unreachable(exc)
+            if not retryable or self._stop:
+                raise
+            time.sleep(RETRY_DELAY)
+            if self._stop:
+                raise Cancelled()
+            return self._call_chat(target, messages, num_predict, tools)
+
     def _count_steps(self):
+        """Progress steps: one warmup per target, then one step per
+        model call on the eligible templates only. A multi-turn task
+        counts its turns (each turn is a call); the Speed template
+        counts its context lengths. Skipped pairs cost no steps."""
         steps = 0
-        for _target in self.targets:
+        for target in self.targets:
             steps += 1  # warmup
             for template in self.templates:
+                if not template_eligible(template, target):
+                    continue
                 if template["scored"]:
-                    steps += len(template["tasks"])
+                    for task in template["tasks"]:
+                        if task.get("kind") == "chat":
+                            steps += len(task["turns"])
+                        else:
+                            steps += 1
                 else:
-                    steps += len(template["prompts"])
+                    if template.get("context_lengths"):
+                        steps += len(template["context_lengths"])
+                    else:
+                        steps += len(template["prompts"])
         return max(steps, 1)
+
+    def _failed_result(self, job_id, prompt, task, detail):
+        """A task record for a call that failed before it could be scored."""
+        return {
+            "id": job_id,
+            "prompt": prompt,
+            "answer": "",
+            "passed": False if task is not None else None,
+            "decode_tok_s": None,
+            "prompt_tok_s": None,
+            "ttft_s": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "detail": detail,
+        }
+
+    def _task_generate(self, target, template, task, prompt):
+        """One prompt in, one answer out (generate + long-context)."""
+        label = target["label"]
+        job_id = task["id"] if task is not None else "run"
+        metrics = self._generate(target, prompt, template["num_predict"])
+        if task is None:
+            passed, detail = None, ""
+        else:
+            passed, detail = score_task(task, metrics["answer"])
+        self._bump_progress(label, template, job_id)
+        record = {
+            "id": job_id,
+            "prompt": prompt,
+            "answer": _truncate_answer(metrics["answer"]),
+            "passed": passed,
+            "decode_tok_s": metrics["decode_tok_s"],
+            "prompt_tok_s": metrics["prompt_tok_s"],
+            "ttft_s": metrics["ttft_s"],
+            "prompt_tokens": metrics.get("prompt_tokens"),
+            "completion_tokens": metrics.get("completion_tokens"),
+            "detail": detail,
+        }
+        if task is not None and task.get("kind") == "long_context":
+            record["context_tokens"] = task.get("context_length")
+            record["prompt_chars"] = len(prompt)
+        return record, None
+
+    def _task_chat(self, target, template, task):
+        """A multi-turn task: each turn is sent with the full history
+        so far, so a follow-up can only pass when the model remembers
+        the earlier turns. A task passes when every scored turn passes."""
+        label = target["label"]
+        num_predict = template["num_predict"]
+        messages = []
+        if task.get("system"):
+            messages.append({"role": "system", "content": task["system"]})
+        turn_records = []
+        all_passed = True
+        speeds = []
+        prompt_total = 0
+        completion_total = 0
+        saw_tokens = False
+        for index, turn in enumerate(task["turns"]):
+            if self._stop:
+                raise Cancelled()
+            messages.append({"role": "user", "content": turn["prompt"]})
+            metrics = self._chat(target, messages, num_predict)
+            messages.append({"role": "assistant", "content": metrics["answer"]})
+            if "rule" in turn:
+                passed, detail = score_task(turn, metrics["answer"])
+                if not passed:
+                    all_passed = False
+            else:
+                passed, detail = None, ""
+            if metrics["decode_tok_s"] is not None:
+                speeds.append(metrics["decode_tok_s"])
+            if metrics.get("prompt_tokens") is not None:
+                prompt_total += metrics["prompt_tokens"]
+                saw_tokens = True
+            if metrics.get("completion_tokens") is not None:
+                completion_total += metrics["completion_tokens"]
+                saw_tokens = True
+            turn_records.append({
+                "prompt": turn["prompt"],
+                "answer": _truncate_answer(metrics["answer"]),
+                "passed": passed,
+                "decode_tok_s": metrics["decode_tok_s"],
+                "detail": detail,
+            })
+            self._bump_progress(label, template, f"{task['id']} turn {index + 1}")
+        last = turn_records[-1] if turn_records else {}
+        return {
+            "id": task["id"],
+            "prompt": task["turns"][0]["prompt"],
+            "answer": last.get("answer", ""),
+            "passed": all_passed,
+            "decode_tok_s": sum(speeds) / len(speeds) if speeds else None,
+            "prompt_tok_s": None,
+            "ttft_s": None,
+            "prompt_tokens": prompt_total if saw_tokens else None,
+            "completion_tokens": completion_total if saw_tokens else None,
+            "detail": "; ".join(
+                t["detail"] for t in turn_records if t.get("detail")
+            ),
+            "turns": turn_records,
+        }, None
+
+    def _task_vision(self, target, template, task):
+        """Show the model an image and ask about it. Ollama takes the
+        image base64 in the message; providers take an image_url part."""
+        label = target["label"]
+        image_path = os.path.join(get_images_dir(), task["image"])
+        try:
+            with open(image_path, "rb") as handle:
+                raw = handle.read()
+        except OSError:
+            self._bump_progress(label, template, task["id"])
+            record = self._failed_result(
+                task["id"], task["prompt"], task,
+                f"test image not found: {task['image']}",
+            )
+            record["image"] = task["image"]
+            return record, None
+        encoded = base64.b64encode(raw).decode("ascii")
+        messages = [{
+            "role": "user",
+            "content": task["prompt"],
+            "images": [encoded],
+        }]
+        metrics = self._chat(target, messages, template["num_predict"])
+        passed, detail = score_task(task, metrics["answer"])
+        self._bump_progress(label, template, task["id"])
+        return {
+            "id": task["id"],
+            "prompt": task["prompt"],
+            "answer": _truncate_answer(metrics["answer"]),
+            "passed": passed,
+            "decode_tok_s": metrics["decode_tok_s"],
+            "prompt_tok_s": metrics["prompt_tok_s"],
+            "ttft_s": metrics["ttft_s"],
+            "prompt_tokens": metrics.get("prompt_tokens"),
+            "completion_tokens": metrics.get("completion_tokens"),
+            "detail": detail,
+            "image": task["image"],
+        }, None
+
+    def _task_tools(self, target, template, task):
+        """Give the model tool definitions and check it calls the right
+        one with the right arguments — or none at all, when the task
+        needs no tool."""
+        label = target["label"]
+        messages = [{"role": "user", "content": task["prompt"]}]
+        metrics = self._chat(
+            target, messages, template["num_predict"],
+            _to_tool_definitions(task["tools"]),
+        )
+        tool_calls = metrics.get("tool_calls") or []
+        passed, detail = score_tool_call(task, tool_calls)
+        self._bump_progress(label, template, task["id"])
+        return {
+            "id": task["id"],
+            "prompt": task["prompt"],
+            "answer": _truncate_answer(metrics["answer"]),
+            "passed": passed,
+            "decode_tok_s": metrics["decode_tok_s"],
+            "prompt_tok_s": metrics["prompt_tok_s"],
+            "ttft_s": metrics["ttft_s"],
+            "prompt_tokens": metrics.get("prompt_tokens"),
+            "completion_tokens": metrics.get("completion_tokens"),
+            "detail": detail,
+            "tool_calls": tool_calls,
+        }, None
+
+    def _task_image(self, target, template, task):
+        """Ask a provider to generate an image. Passes when real image
+        bytes come back; the image itself is saved next to the run file
+        for Joshua to judge by eye. Ollama has no image endpoint, so an
+        Ollama target reaching here is a bug — it fails plainly."""
+        label = target["label"]
+        if target["kind"] != "provider":
+            self._bump_progress(label, template, task["id"])
+            return self._failed_result(
+                task["id"], task["prompt"], task,
+                "image generation needs a provider model",
+            ), None
+        t_start = time.monotonic()
+        try:
+            raw, fmt, width, height = provider_generate_image(
+                target["provider"], target["model"], task["prompt"],
+                task.get("size", "1024x1024"),
+            )
+        except (ProviderError, ProviderUnreachable):
+            raise
+        wall_s = time.monotonic() - t_start
+        self._bump_progress(label, template, task["id"])
+        filename = f"{task['id']}.{fmt}"
+        record = {
+            "id": task["id"],
+            "prompt": task["prompt"],
+            "answer": f"image generated: {width}x{height} {fmt}",
+            "passed": True,
+            "decode_tok_s": None,
+            "prompt_tok_s": None,
+            "ttft_s": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "detail": "",
+            "image_format": fmt,
+            "image_width": width,
+            "image_height": height,
+            "wall_s": round(wall_s, 2),
+        }
+        return record, ("images", filename, raw, "image_file")
+
+    def _task_audio(self, target, template, task):
+        """Audio tasks, provider-only. Transcribe: send a bundled clip
+        and score the transcript's words. Speech: ask for spoken audio
+        and check real audio bytes come back (saved next to the run)."""
+        label = target["label"]
+        if target["kind"] != "provider":
+            self._bump_progress(label, template, task["id"])
+            return self._failed_result(
+                task["id"], task["prompt"], task,
+                "audio needs a provider model",
+            ), None
+        if task.get("audio_task") == "transcribe":
+            audio_path = os.path.join(get_audio_dir(), task["audio_file"])
+            if not os.path.exists(audio_path):
+                self._bump_progress(label, template, task["id"])
+                record = self._failed_result(
+                    task["id"], task["prompt"], task,
+                    f"audio file not found: {task['audio_file']}",
+                )
+                record["audio_file"] = task["audio_file"]
+                return record, None
+            t_start = time.monotonic()
+            try:
+                transcript = provider_transcribe(
+                    target["provider"], target["model"], audio_path
+                )
+            except (ProviderError, ProviderUnreachable):
+                raise
+            wall_s = time.monotonic() - t_start
+            passed, detail = score_task(task, transcript)
+            self._bump_progress(label, template, task["id"])
+            return {
+                "id": task["id"],
+                "prompt": task["prompt"],
+                "answer": _truncate_answer(transcript),
+                "passed": passed,
+                "decode_tok_s": None,
+                "prompt_tok_s": None,
+                "ttft_s": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "detail": detail,
+                "audio_file": task["audio_file"],
+                "wall_s": round(wall_s, 2),
+            }, None
+        t_start = time.monotonic()
+        try:
+            raw = provider_synthesize(
+                target["provider"], target["model"], task["prompt"]
+            )
+        except (ProviderError, ProviderUnreachable):
+            raise
+        wall_s = time.monotonic() - t_start
+        self._bump_progress(label, template, task["id"])
+        if not is_audio_bytes(raw):
+            return self._failed_result(
+                task["id"], task["prompt"], task,
+                "provider returned bytes that are not audio",
+            ), None
+        filename = f"{task['id']}.mp3"
+        record = {
+            "id": task["id"],
+            "prompt": task["prompt"],
+            "answer": f"audio generated: {len(raw)} bytes",
+            "passed": True,
+            "decode_tok_s": None,
+            "prompt_tok_s": None,
+            "ttft_s": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "detail": "",
+            "audio_bytes": len(raw),
+            "wall_s": round(wall_s, 2),
+        }
+        return record, ("audio", filename, raw, "audio_file_saved")
+
+    def _run_scored_task(self, target, template, task):
+        """Run one scored task by its kind. Returns (record, media).
+
+        Media is (subfolder, filename, bytes, record-field) for a
+        generated image or spoken audio, or None. A model error becomes
+        a failed task record (and a progress bump); Ollama going away
+        aborts the whole run.
+        """
+        kind = task.get("kind", "generate")
+        try:
+            if kind == "generate":
+                return self._task_generate(target, template, task, task["prompt"])
+            if kind == "long_context":
+                doc = build_long_document(
+                    task["needle"], task["context_length"],
+                    task.get("position", "middle"),
+                )
+                return self._task_generate(
+                    target, template, task, doc + "\n\n" + task["prompt"]
+                )
+            if kind == "chat":
+                return self._task_chat(target, template, task)
+            if kind == "vision":
+                return self._task_vision(target, template, task)
+            if kind == "tools":
+                return self._task_tools(target, template, task)
+            if kind == "image_gen":
+                return self._task_image(target, template, task)
+            if kind == "audio":
+                return self._task_audio(target, template, task)
+        except OllamaError as exc:
+            if is_unreachable(exc):
+                # Ollama itself went away: stop the whole run
+                # instead of failing every remaining task and model.
+                raise OllamaUnreachable(describe_error(exc))
+            self._bump_progress(target["label"], template, task["id"])
+            return self._failed_result(task["id"], task.get("prompt", ""), task, str(exc)), None
+        except ProviderError as exc:
+            # A provider failing never stops the run: this task
+            # fails plainly and the rest carry on, including the
+            # local Ollama models still to come.
+            self._bump_progress(target["label"], template, task["id"])
+            return self._failed_result(task["id"], task.get("prompt", ""), task, str(exc)), None
+        self._bump_progress(target["label"], template, task["id"])
+        return self._failed_result(
+            task["id"], task.get("prompt", ""), task,
+            f"unknown task kind {kind!r}",
+        ), None
 
     def _run_template(self, target, template):
         """Run one template for one target. Returns the run data dict."""
         label = target["label"]
         num_predict = template["num_predict"]
         task_results = []
+        media = []
         if template["scored"]:
-            jobs = [
-                (task["id"], task["prompt"], task) for task in template["tasks"]
-            ]
+            for task in template["tasks"]:
+                if self._stop:
+                    raise Cancelled()
+                record, item = self._run_scored_task(target, template, task)
+                if item is not None:
+                    media.append((task["id"],) + item)
+                task_results.append(record)
         else:
-            jobs = [
-                (f"run-{i + 1}", prompt, None)
-                for i, prompt in enumerate(template["prompts"])
-            ]
-        for job_id, prompt, task in jobs:
-            if self._stop:
-                raise Cancelled()
-            try:
-                metrics = self._generate(target, prompt, num_predict)
-            except OllamaError as exc:
-                if is_unreachable(exc):
-                    # Ollama itself went away: stop the whole run
-                    # instead of failing every remaining task and model.
-                    raise OllamaUnreachable(describe_error(exc))
-                task_results.append({
-                    "id": job_id,
-                    "prompt": prompt,
-                    "answer": "",
-                    "passed": False if task is not None else None,
-                    "decode_tok_s": None,
-                    "prompt_tok_s": None,
-                    "ttft_s": None,
-                    "prompt_tokens": None,
-                    "completion_tokens": None,
-                    "detail": str(exc),
-                })
-                self._bump_progress(label, template, job_id)
-                continue
-            except ProviderError as exc:
-                # A provider failing never stops the run: this task
-                # fails plainly and the rest carry on, including the
-                # local Ollama models still to come.
-                task_results.append({
-                    "id": job_id,
-                    "prompt": prompt,
-                    "answer": "",
-                    "passed": False if task is not None else None,
-                    "decode_tok_s": None,
-                    "prompt_tok_s": None,
-                    "ttft_s": None,
-                    "prompt_tokens": None,
-                    "completion_tokens": None,
-                    "detail": str(exc),
-                })
-                self._bump_progress(label, template, job_id)
-                continue
-            if task is None:
-                passed, detail = None, ""
+            # Unscored: context lengths (Speed) or plain prompts.
+            if template.get("context_lengths"):
+                jobs = []
+                for length in template["context_lengths"]:
+                    prompt = build_context_prompt(
+                        template["context_base_prompt"], length
+                    )
+                    jobs.append((f"ctx-{length}", prompt, {"context_tokens": length}))
             else:
-                passed, detail = score_task(task, metrics["answer"])
-            task_results.append({
-                "id": job_id,
-                "prompt": prompt,
-                "answer": _truncate_answer(metrics["answer"]),
-                "passed": passed,
-                "decode_tok_s": metrics["decode_tok_s"],
-                "prompt_tok_s": metrics["prompt_tok_s"],
-                "ttft_s": metrics["ttft_s"],
-                "prompt_tokens": metrics.get("prompt_tokens"),
-                "completion_tokens": metrics.get("completion_tokens"),
-                "detail": detail,
-            })
-            self._bump_progress(label, template, job_id)
+                jobs = [
+                    (f"run-{i + 1}", prompt, None)
+                    for i, prompt in enumerate(template["prompts"])
+                ]
+            for job_id, prompt, extra in jobs:
+                if self._stop:
+                    raise Cancelled()
+                try:
+                    metrics = self._generate(target, prompt, num_predict)
+                except OllamaError as exc:
+                    if is_unreachable(exc):
+                        raise OllamaUnreachable(describe_error(exc))
+                    task_results.append(
+                        self._failed_result(job_id, prompt, None, str(exc))
+                    )
+                    self._bump_progress(label, template, job_id)
+                    continue
+                except ProviderError as exc:
+                    task_results.append(
+                        self._failed_result(job_id, prompt, None, str(exc))
+                    )
+                    self._bump_progress(label, template, job_id)
+                    continue
+                record = {
+                    "id": job_id,
+                    "prompt": _truncate_answer(prompt),
+                    "answer": _truncate_answer(metrics["answer"]),
+                    "passed": None,
+                    "decode_tok_s": metrics["decode_tok_s"],
+                    "prompt_tok_s": metrics["prompt_tok_s"],
+                    "ttft_s": metrics["ttft_s"],
+                    "prompt_tokens": metrics.get("prompt_tokens"),
+                    "completion_tokens": metrics.get("completion_tokens"),
+                    "detail": "",
+                }
+                if extra:
+                    record.update(extra)
+                    record["prompt_chars"] = len(prompt)
+                task_results.append(record)
+                self._bump_progress(label, template, job_id)
         if template["scored"]:
             passed_count = sum(1 for t in task_results if t["passed"] is True)
             total = len(task_results)
@@ -1694,9 +3134,27 @@ class BenchWorker(QThread):
         run_total_tokens = None
         if run_prompt_tokens is not None and run_completion_tokens is not None:
             run_total_tokens = run_prompt_tokens + run_completion_tokens
+        # Generated media goes next to the run file, in a folder named
+        # after it, so the image or audio stays part of that run's
+        # record. The run file's own path is fixed first so the task
+        # records can name their files.
+        stamp = datetime.now()
+        path, folder, file_base = run_file_path(
+            self.results_dir, label, self.sys_id, template["id"], stamp
+        )
+        for task_id, subfolder, filename, blob, field in media:
+            media_dir = os.path.join(folder, f"{file_base}-{subfolder}")
+            os.makedirs(media_dir, exist_ok=True)
+            with open(os.path.join(media_dir, filename), "wb") as handle:
+                handle.write(blob)
+            for record in task_results:
+                if record["id"] == task_id:
+                    record[field] = f"{file_base}-{subfolder}/{filename}"
+                    break
         run_data = {
             "template": template["id"],
             "template_name": template["name"],
+            "capability": template.get("capability", "text"),
             "machine": self.machine,
             "warmup_prompt": WARMUP_PROMPT,
             "num_predict": num_predict,
@@ -1718,7 +3176,7 @@ class BenchWorker(QThread):
                 target["price_input_per_1m"], target["price_output_per_1m"],
             ),
         }
-        path = save_run_file(self.results_dir, label, self.sys_id, run_data)
+        path = save_run_file(self.results_dir, label, self.sys_id, run_data, stamp=stamp)
         return run_data, path
 
     def _bump_progress(self, label, template, job_id):
@@ -1760,9 +3218,18 @@ class BenchWorker(QThread):
                     f"{label}: warming up",
                     int(100 * self._done_steps / self._total_steps),
                 )
-                warmup = self._generate(target, WARMUP_PROMPT, WARMUP_PREDICT)
-                warmup_prompt_tokens = warmup.get("prompt_tokens")
-                warmup_completion_tokens = warmup.get("completion_tokens")
+                if "text" in set(target.get("capabilities") or ["text"]):
+                    warmup = self._generate(target, WARMUP_PROMPT, WARMUP_PREDICT)
+                    warmup_prompt_tokens = warmup.get("prompt_tokens")
+                    warmup_completion_tokens = warmup.get("completion_tokens")
+                elif target["kind"] == "provider":
+                    # A model with no text capability (image-only, audio-
+                    # only) cannot take a text warmup, so the warmup is
+                    # a connection test instead: it proves the key and
+                    # the endpoint work before any template runs.
+                    ok, message = provider_test_connection(target["provider"])
+                    if not ok:
+                        raise ProviderError(message)
                 self._done_steps += 1
             except Cancelled:
                 self.run_finished.emit("cancelled")
@@ -1788,6 +3255,27 @@ class BenchWorker(QThread):
                 for template in self.templates:
                     if self._stop:
                         raise Cancelled()
+                    if not template_eligible(template, target):
+                        # The model cannot run this template at all (no
+                        # vision, no tools...). That is not a failure:
+                        # it is recorded as skipped, gets no run file,
+                        # and is left out of the overall score.
+                        result["templates"][template["id"]] = {
+                            "template": template["id"],
+                            "template_name": template["name"],
+                            "capability": template.get("capability", "text"),
+                            "skipped": "not eligible",
+                            "template_score": None,
+                            "passed": None,
+                            "total": 0,
+                            "tasks": [],
+                            "avg_decode_tok_s": None,
+                            "prompt_tokens": None,
+                            "completion_tokens": None,
+                            "total_tokens": None,
+                            "estimated_cost_usd": None,
+                        }
+                        continue
                     run_data, path = self._run_template(target, template)
                     result["templates"][template["id"]] = run_data
                     result["templates"][template["id"]]["run_file"] = path
@@ -2017,6 +3505,7 @@ class MainWindow(QMainWindow):
         self.editing_is_new = False
         self.editing_original_name = ""
         self.editing_kept_key = ""
+        self.editing_model_index = None
         # Raw bytes of providers.json as last seen by the Providers tab,
         # so the tab can pick up outside edits without wiping an edit
         # in progress when nothing changed.
@@ -2037,7 +3526,8 @@ class MainWindow(QMainWindow):
             "Nothing is ticked to start with. Tick the models and the test "
             "templates you want, then press Run. Each model runs each template "
             "in turn; every template run is saved to its own file under results, "
-            "and nothing is ever overwritten."
+            "and nothing is ever overwritten. A template no ticked model can "
+            "run is greyed out and cannot be ticked."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -2047,14 +3537,20 @@ class MainWindow(QMainWindow):
         model_box.addWidget(QLabel("Models (local and provider):"))
         self.model_list = QListWidget()
         self.model_list.setMaximumHeight(180)
+        # Ticking or unticking a model changes which templates any
+        # ticked model can run, so the grey-outs refresh on every tick.
+        self.model_list.itemChanged.connect(self.update_template_availability)
         model_box.addWidget(self.model_list)
         model_buttons = QHBoxLayout()
         self.select_all_button = QPushButton("Select all")
         self.select_all_button.clicked.connect(self.select_all_models)
         self.clear_button = QPushButton("Clear")
         self.clear_button.clicked.connect(self.clear_models)
+        self.screen_button = QPushButton("Screen models")
+        self.screen_button.clicked.connect(self.screen_models)
         model_buttons.addWidget(self.select_all_button)
         model_buttons.addWidget(self.clear_button)
+        model_buttons.addWidget(self.screen_button)
         model_buttons.addStretch()
         model_box.addLayout(model_buttons)
         pick_row.addLayout(model_box)
@@ -2263,6 +3759,7 @@ class MainWindow(QMainWindow):
         provider_right.addLayout(provider_test_row)
         provider_right.addWidget(QLabel("Models on this provider:"))
         self.provider_models_list = QListWidget()
+        self.provider_models_list.itemClicked.connect(self.on_provider_model_selected)
         provider_right.addWidget(self.provider_models_list)
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("Model id:"))
@@ -2284,12 +3781,30 @@ class MainWindow(QMainWindow):
         self.provider_price_out_input.setPlaceholderText("$ optional")
         price_row.addWidget(self.provider_price_out_input)
         provider_right.addLayout(price_row)
+        caps_label = QLabel(
+            "What this model can do (decides which templates it can run):"
+        )
+        caps_label.setWordWrap(True)
+        provider_right.addWidget(caps_label)
+        caps_row = QHBoxLayout()
+        self.provider_cap_boxes = {}
+        for capability in CAPABILITIES:
+            box = QCheckBox(CAPABILITY_LABELS[capability])
+            if capability == "text":
+                box.setChecked(True)
+            self.provider_cap_boxes[capability] = box
+            caps_row.addWidget(box)
+        caps_row.addStretch()
+        provider_right.addLayout(caps_row)
         model_buttons = QHBoxLayout()
         self.provider_add_model_button = QPushButton("Add model")
         self.provider_add_model_button.clicked.connect(self.add_provider_model)
+        self.provider_update_model_button = QPushButton("Update model")
+        self.provider_update_model_button.clicked.connect(self.update_provider_model)
         self.provider_remove_model_button = QPushButton("Remove model")
         self.provider_remove_model_button.clicked.connect(self.remove_provider_model)
         model_buttons.addWidget(self.provider_add_model_button)
+        model_buttons.addWidget(self.provider_update_model_button)
         model_buttons.addWidget(self.provider_remove_model_button)
         model_buttons.addStretch()
         provider_right.addLayout(model_buttons)
@@ -2331,6 +3846,9 @@ class MainWindow(QMainWindow):
                 label = f"{template['name']} ({len(template['tasks'])} tasks)"
             else:
                 label = f"{template['name']} (no scoring)"
+            capability = template.get("capability", "text")
+            if capability != "text":
+                label += f" — needs {capability.replace('_', ' ')}"
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(
@@ -2339,26 +3857,48 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, template["id"])
             self.template_list.addItem(item)
         self.template_warnings = warnings
+        self.update_template_availability()
         return warnings
 
     def refresh_models(self):
-        checked = {
-            self.model_list.item(row).text()
-            for row in range(self.model_list.count())
-            if self.model_list.item(row).checkState() == Qt.Checked
-        }
+        # Checked state is kept by target label (stored on each item),
+        # not by the visible text — the text carries capability brackets.
+        checked = set()
+        for row in range(self.model_list.count()):
+            item = self.model_list.item(row)
+            target = item.data(Qt.UserRole)
+            if item.checkState() == Qt.Checked and target is not None:
+                checked.add(target["label"])
         self.refresh_templates()
         self.model_list.clear()
         ollama_error = None
         ollama_names = []
+        api_up = False
         try:
-            ollama_names, _source = list_models()
+            ollama_names, source = list_models()
+            api_up = source == "api"
         except OllamaError as exc:
             ollama_error = exc
         providers, provider_warnings = load_providers()
         self.providers = providers
         self.provider_warnings = provider_warnings
-        targets = [ollama_target(name) for name in ollama_names]
+        # Screening: cached capabilities first; models missing from the
+        # cache are screened only while the API is answering. Never
+        # while Ollama is down or the list came from the CLI — a
+        # /api/show call per model against a dead server would stall
+        # the window for seconds each.
+        cache = load_capabilities()
+        if api_up:
+            changed = False
+            for name in ollama_names:
+                if name not in cache:
+                    cache[name] = screen_ollama_model(name, cache)
+                    changed = True
+            if changed:
+                save_capabilities(cache)
+        targets = [
+            ollama_target(name, cache.get(name)) for name in ollama_names
+        ]
         for provider in providers:
             for model_entry in provider["models"]:
                 targets.append(provider_target(provider, model_entry))
@@ -2368,9 +3908,13 @@ class MainWindow(QMainWindow):
             else:
                 self.status_label.setText(NO_MODELS_MESSAGE)
             self.run_button.setEnabled(False)
+            self.update_template_availability()
             return
         for target in targets:
-            item = QListWidgetItem(target["label"])
+            item = QListWidgetItem(
+                target["label"]
+                + format_capabilities(target["capabilities"])
+            )
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(
                 Qt.Checked if target["label"] in checked else Qt.Unchecked
@@ -2380,6 +3924,7 @@ class MainWindow(QMainWindow):
         if not self.templates:
             self.status_label.setText(NO_TEMPLATES_MESSAGE)
             self.run_button.setEnabled(False)
+            self.update_template_availability()
             return
         self.run_button.setEnabled(True)
         if ollama_error is not None:
@@ -2397,10 +3942,57 @@ class MainWindow(QMainWindow):
             if len(warnings) > 2:
                 status += f" (+{len(warnings) - 2} more)"
         self.status_label.setText(status)
+        self.update_template_availability()
+
+    def screen_models(self):
+        """Re-screen every Ollama model from scratch: drop the cached
+        capabilities and refresh the list, which screens any model
+        missing from the cache."""
+        save_capabilities({})
+        self.refresh_models()
+
+    def update_template_availability(self):
+        """Grey out the templates no ticked model can run.
+
+        A template is enabled when at least one TICKED model is
+        eligible for it — or when nothing is ticked yet, in which case
+        everything shows enabled. A template that greys out is
+        unticked as it goes, so a ticked template is always one some
+        ticked model can run. Skipped while a run is in progress: the
+        run's template list is already fixed.
+        """
+        if self.worker is not None:
+            return
+        ticked = self.selected_targets()
+        by_id = {t["id"]: t for t in self.templates}
+        self.template_list.blockSignals(True)
+        try:
+            for row in range(self.template_list.count()):
+                item = self.template_list.item(row)
+                template = by_id.get(item.data(Qt.UserRole))
+                if template is None:
+                    continue
+                enabled = not ticked or any(
+                    template_eligible(template, target) for target in ticked
+                )
+                if enabled:
+                    item.setFlags(
+                        item.flags() | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable
+                    )
+                else:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                    item.setCheckState(Qt.Unchecked)
+        finally:
+            self.template_list.blockSignals(False)
 
     def _set_all_checked(self, widget, state):
+        # Greyed-out templates stay untouched: Select all must never
+        # tick a template no ticked model can run.
         for row in range(widget.count()):
-            widget.item(row).setCheckState(state)
+            item = widget.item(row)
+            if not item.flags() & Qt.ItemIsEnabled:
+                continue
+            item.setCheckState(state)
 
     def select_all_models(self):
         self._set_all_checked(self.model_list, Qt.Checked)
@@ -2430,7 +4022,10 @@ class MainWindow(QMainWindow):
         chosen = []
         for row in range(self.template_list.count()):
             item = self.template_list.item(row)
-            if item.checkState() == Qt.Checked:
+            # A greyed-out template is never selected, even if it was
+            # checked programmatically — the run only ever sees
+            # templates a ticked model can run.
+            if item.checkState() == Qt.Checked and item.flags() & Qt.ItemIsEnabled:
                 template = by_id.get(item.data(Qt.UserRole))
                 if template is not None:
                     chosen.append(template)
@@ -2658,6 +4253,12 @@ class MainWindow(QMainWindow):
                     f"Estimated cost: {fmt_cost(result.get('estimated_cost_usd'))}"
                 )
         for template_id, run in result.get("templates", {}).items():
+            if run.get("skipped"):
+                lines.append(
+                    f"\n{run.get('template_name', template_id)}: "
+                    f"not eligible for this model"
+                )
+                continue
             score = run.get("template_score")
             if score is None:
                 header = (
@@ -2681,13 +4282,29 @@ class MainWindow(QMainWindow):
             for task in run.get("tasks", []):
                 passed = task.get("passed")
                 mark = "pass" if passed is True else ("fail" if passed is False else "run")
+                note = ""
+                if task.get("image_file"):
+                    note = " (image saved)"
+                elif task.get("audio_file_saved"):
+                    note = " (audio saved)"
                 lines.append(
                     f"  {mark}  {task.get('id', '?')} "
-                    f"({fmt_toks(task.get('decode_tok_s'))} tok/s)"
+                    f"({fmt_toks(task.get('decode_tok_s'))} tok/s){note}"
                 )
                 detail = task.get("detail") or ""
                 if passed is False and detail:
                     lines.append(f"       {detail}")
+                for turn in task.get("turns", []):
+                    turn_passed = turn.get("passed")
+                    turn_mark = (
+                        "pass" if turn_passed is True
+                        else ("fail" if turn_passed is False else "run")
+                    )
+                    lines.append(
+                        f"       {turn_mark}  {turn.get('prompt', '?')}"
+                    )
+                    if turn_passed is False and turn.get("detail"):
+                        lines.append(f"           {turn['detail']}")
         self.detail_view.setPlainText("\n".join(lines))
 
     # -- history ---------------------------------------------------------
@@ -2885,7 +4502,24 @@ class MainWindow(QMainWindow):
         self.provider_model_name_input.setText("")
         self.provider_price_in_input.setText("")
         self.provider_price_out_input.setText("")
+        self.editing_model_index = None
+        self._set_caps_form(["text"])
         self._refresh_provider_models_list()
+
+    def _caps_from_form(self):
+        """Capabilities from the checkboxes (Text on its own when
+        nothing is ticked — a model with no capability at all would
+        run nothing)."""
+        caps = [
+            capability for capability in CAPABILITIES
+            if self.provider_cap_boxes[capability].isChecked()
+        ]
+        return caps or ["text"]
+
+    def _set_caps_form(self, capabilities):
+        wanted = set(capabilities or ["text"])
+        for capability, box in self.provider_cap_boxes.items():
+            box.setChecked(capability in wanted)
 
     def _refresh_provider_models_list(self):
         self.provider_models_list.clear()
@@ -2895,6 +4529,7 @@ class MainWindow(QMainWindow):
             text = model["id"]
             if model.get("display_name"):
                 text += f" — {model['display_name']}"
+            text += format_capabilities(model.get("capabilities") or ["text"])
             price_in = model.get("price_input_per_1m")
             price_out = model.get("price_output_per_1m")
             if price_in is not None or price_out is not None:
@@ -2904,6 +4539,32 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, index)
             self.provider_models_list.addItem(item)
+
+    def on_provider_model_selected(self, item):
+        """Clicking a model loads it into the form for editing (its
+        capabilities included); Update model writes the form back."""
+        if self.editing_provider is None:
+            return
+        index = item.data(Qt.UserRole)
+        models = self.editing_provider["models"]
+        if not (0 <= index < len(models)):
+            return
+        model = models[index]
+        self.editing_model_index = index
+        self.provider_model_id_input.setText(model.get("id", ""))
+        self.provider_model_name_input.setText(model.get("display_name", ""))
+        price_in = model.get("price_input_per_1m")
+        price_out = model.get("price_output_per_1m")
+        self.provider_price_in_input.setText(
+            "" if price_in is None else str(price_in)
+        )
+        self.provider_price_out_input.setText(
+            "" if price_out is None else str(price_out)
+        )
+        self._set_caps_form(model.get("capabilities") or ["text"])
+        self.provider_status.setText(
+            f"Editing {model['id']}. Press Update model, then Save provider."
+        )
 
     def _provider_from_form(self):
         """Provider dict from the form fields, keeping the stored key
@@ -3027,14 +4688,61 @@ class MainWindow(QMainWindow):
             "display_name": self.provider_model_name_input.text().strip(),
             "price_input_per_1m": price_in,
             "price_output_per_1m": price_out,
+            "capabilities": self._caps_from_form(),
         })
         self.provider_model_id_input.setText("")
         self.provider_model_name_input.setText("")
         self.provider_price_in_input.setText("")
         self.provider_price_out_input.setText("")
+        self.editing_model_index = None
+        self._set_caps_form(["text"])
         self._refresh_provider_models_list()
         self.provider_status.setText(
             f"Added {model_id}. Press Save provider to keep it."
+        )
+
+    def update_provider_model(self):
+        """Write the model form back onto the model picked in the list
+        (click a model first). The id may change, but not onto another
+        model already on this provider."""
+        if self.editing_provider is None:
+            self.provider_status.setText("Pick a provider first.")
+            return
+        index = self.editing_model_index
+        models = self.editing_provider["models"]
+        if index is None or not (0 <= index < len(models)):
+            self.provider_status.setText("Click a model in the list first.")
+            return
+        model_id = self.provider_model_id_input.text().strip()
+        if not model_id:
+            self.provider_status.setText("Type a model id first.")
+            return
+        if any(
+            m["id"] == model_id for i, m in enumerate(models) if i != index
+        ):
+            self.provider_status.setText("That model is already on this provider.")
+            return
+        price_in = self._parse_price(self.provider_price_in_input.text())
+        price_out = self._parse_price(self.provider_price_out_input.text())
+        if price_in is False or price_out is False:
+            self.provider_status.setText("Price must be a number, e.g. 0.15")
+            return
+        models[index] = {
+            "id": model_id,
+            "display_name": self.provider_model_name_input.text().strip(),
+            "price_input_per_1m": price_in,
+            "price_output_per_1m": price_out,
+            "capabilities": self._caps_from_form(),
+        }
+        self.provider_model_id_input.setText("")
+        self.provider_model_name_input.setText("")
+        self.provider_price_in_input.setText("")
+        self.provider_price_out_input.setText("")
+        self.editing_model_index = None
+        self._set_caps_form(["text"])
+        self._refresh_provider_models_list()
+        self.provider_status.setText(
+            f"Updated {model_id}. Press Save provider to keep it."
         )
 
     def _parse_price(self, text):
@@ -3061,6 +4769,7 @@ class MainWindow(QMainWindow):
         models = self.editing_provider["models"]
         if 0 <= index < len(models):
             removed = models.pop(index)
+            self.editing_model_index = None
             self._refresh_provider_models_list()
             self.provider_status.setText(
                 f"Removed {removed['id']}. Press Save provider to keep it."

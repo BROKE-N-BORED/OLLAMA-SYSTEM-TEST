@@ -1,285 +1,290 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v4
+# TEST-REPORT — OLLAMA SYSTEM TEST v5
 
 Verified 2026-11-12 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
 LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-linux-gnu,
 venv ~/workspace/forge-v2-testenv/bin/python. Plain widgets only, no OpenGL.
 
-v4 adds PROVIDERS: any OpenAI-compatible provider (OpenAI, OpenRouter,
-Groq, Together, DeepSeek, xAI, Mistral, or a local OpenAI-compatible
-server) can be added on a new Providers tab, and its models are tested
-with the same templates, scoring, profiles, and immutable run files as
-local Ollama models. Provider models are listed as "provider / model-id".
-Run files record tokens used; when prices per 1M tokens are set, the
-details view shows the estimated cost. install.sh / run.sh / templates
-are unchanged from v3 (venv + PySide6-Essentials, the PEP 668 fix from
-the v1 report still stands).
+v5 adds CAPABILITY SCREENING and 13 new templates (19 total). The app asks
+Ollama what each model can do (via `/api/show`), shows the capabilities in
+brackets after the model name, caches them in `capabilities.json`, and
+greys out templates no ticked model can run. Provider models get
+capability checkboxes on the Providers tab (default text-only). The new
+templates are Vision, Image Generation, Tool Calling, Long Context,
+Multi-turn, Code Repair, Planning, Grounded QA, Refusal, Summarisation,
+Structured Output, Role Following, and Audio. The Speed template now
+measures tok/s at 1K, 8K, and 32K context instead of two plain prompts.
+install.sh / run.sh are unchanged from v4 (venv + PySide6-Essentials,
+the PEP 668 fix from the v1 report still stands).
+
+Note on the template count: the v5 task and spec both say "14 templates"
+in their headers but enumerate 13 new template files on top of the 6
+carried over — 19 files in all. The enumeration is the instruction and
+the header count is a summary error, so all 19 were built.
 
 The sandbox has no Ollama, no models, and no real provider accounts, so
-all runtime tests ran against a fake Ollama HTTP server (as in v3) and a
-new fake OpenAI-compatible provider server (GET /v1/models, streaming
-POST /v1/chat/completions with SSE chunks and usage, canned
-right/wrong/partial answers per model, a bad-key mode returning HTTP 401
-with an OpenAI-shaped error body, and a dead-provider mode). Test suite:
-~/workspace/ollama-system-test-v4-verify/run_tests.py — **355 passed,
-0 failed** (final run; the v3 suite's 233 checks are all carried over
-and green inside that count, with the "three tabs" check updated to
-four for the new Providers tab).
+all runtime tests ran against fake servers: the fake Ollama server from
+v4, extended with `/api/show` (capabilities per model), `/api/chat` with
+images and tools, and the fake OpenAI-compatible provider server,
+extended with image_url chat parts, tool-call SSE deltas,
+POST `/v1/images/generations`, and POST `/v1/audio/transcriptions` and
+`/v1/audio/speech`. Test suite:
+~/workspace/ollama-system-test-v5-verify/run_tests.py — **686 passed,
+0 failed** (final run; the v4 suite's 355 checks are all carried over
+and green inside that count, with the counts the v5 design intentionally
+changes: 19 templates, 3 speed runs, 5 retry attempts, 14 provider run
+files, 1,580/15,800 provider tokens).
+
+The fake models are three brains — smart (right answers), partial
+(right on tasks 1, 3, and 5), dumb (wrong on everything) — plus a
+broken model that errors. The fake cannot truly see: for vision tasks
+it records that images arrived and answers from the prompt text, which
+is enough to prove the image path, the scoring, and the grey-outs, but
+not vision quality on a real model.
 
 ## What was verified
 
-### 1. Provider config (providers.json)
+### 1. Screening via /api/show
 
-- A missing file means no providers, not an error. A corrupt file, a
-  wrong-shaped file, a duplicate provider name, a provider with no name
-  or no base URL, a model with no id, and a model with a bad price are
-  all skipped with warnings; the good entries still load.
-- Round-trip: save then load keeps the provider, the key, the models,
-  and the prices; a trailing slash on the base URL is stripped.
-- The file is written owner-only (mode 0600).
-- Label format: `provider_label("fake-provider", "fake-gpt-smart")` is
-  "fake-provider / fake-gpt-smart", and it slugifies to
-  "fake-provider_fake-gpt-smart" for the result folder.
+- ollama_show returns the capabilities array and the model info
+  (llama.context_length) from the fake.
+- capabilities_from_show: smart [completion, vision, tools] with a
+  131072 context becomes {text, vision, tools, long_context}; partial
+  [completion, vision] with 32768 becomes {text, vision,
+  long_context}; dumb [completion] with 4096 is text-only.
+- A model that reports no context length is treated as long-context
+  capable (the attempt is made and the score says whether it coped);
+  a reported length under 32768 blocks long context.
+- screen_ollama_model returns the capability set and writes the
+  sorted list into the cache; on failure it keeps the cached value,
+  or text-only when there is none. Screening never breaks the list.
 
-### 2. Cost math
+### 2. Capabilities cache (capabilities.json)
 
-- estimate_cost(560, 5600, 0.15, 0.60) is exactly 0.003444.
-- No cost is invented: estimate_cost returns None when either price is
-  missing or either token count is unknown.
-- fmt_cost: $0.0034 for fractions of a cent (4 places), $1.50 for real
-  money (2 places), $0.00 for zero, dash for None.
+- A missing file means nothing screened yet, not an error; a corrupt
+  file is empty, not a crash.
+- Round-trip: save then load keeps every model and its capabilities
+  (stored alphabetically sorted).
+- Unknown capability names are dropped on load; known entries survive.
+- No API key is ever in the cache file (checked after the media run).
 
-### 3. Test connection
+### 3. Grey-outs in the GUI
 
-Proven four ways against the fake provider (direct calls):
-- Good key: "Connected — fake-provider answered, 3 models listed."
-- Bad key: fails plainly with "rejected the key".
-- Dead provider (unused port): fails plainly with "did not answer".
-- Empty base URL: fails plainly asking for a base URL.
-No tokens are spent: the call is GET /v1/models only.
+- Model list labels: smart shows "[vision, tools, long_context]",
+  partial "[vision, long_context]", dumb and broken show no bracket.
+- Template labels say what they need ("Audio (5 tasks) — needs audio",
+  "Image Generation (5 tasks) — needs image generation").
+- With nothing ticked, all 19 templates are enabled.
+- Tick the text-only dumb model: Vision, Tool Calling, Long Context,
+  Image Generation, and Audio grey out; the text templates stay
+  enabled. A greyed-out template cannot be selected, even when
+  checked programmatically, and Select all skips disabled items.
+- Tick the smart model too: Vision, Tool Calling, and Long Context
+  come back; Image Generation and Audio stay greyed (no local model
+  has them).
+- Ticking a model that greys a template out also unticks that
+  template; unticking all models re-enables everything.
+- Screen models: deleting the cache and pressing the button rebuilds
+  it and restores the labels.
 
-### 4. Chat completions path
+### 4. New scorer rules (unit tests, positive and negative)
 
-- provider_generate_once returns the answer text, prompt_tokens 20,
-  completion_tokens 200, total_tokens 220, a measured TTFT, and a
-  measured decode speed from the streamed chunks and the usage object.
-- Slow mode (content chunks 1.0 s apart, 2.0 s span) measures 100.0
-  tok/s, as designed (200 tokens / 2.0 s).
-- Bad key raises exactly "provider fake-provider rejected the key:
-  Incorrect API key provided" — the provider's own error message is
-  used — and is NOT unreachable, so it is never retried.
-- Dead provider raises exactly "provider fake-provider did not
-  answer" and IS unreachable, so it is retried once.
-- A broken model (HTTP 500 with an OpenAI-shaped error body) raises
-  exactly "provider fake-provider: model exploded".
-- Both error-body shapes are parsed: {"error": "text"} and the OpenAI
-  shape {"error": {"message": "text", ...}}.
+- contains_all: passes only when every required phrase is present.
+- Refusal: is_refusal recognises "I'm sorry, I can't", "I can't help
+  with that", "I'm unable to help", "I refuse to", "against my
+  guidelines", and friends; score_refusal passes a "comply" task when
+  the answer is not a refusal and a "refuse" task when it is.
+- Schema: the WHOLE trimmed answer must parse as JSON (fenced or
+  prose-wrapped JSON fails), then the subset validator checks type
+  (a bool is not an integer), required, properties, items, and enum.
+- Steps: every expected step must appear, in order, as a normalised
+  substring.
+- Tool call: the right tool with the right arguments passes (numeric
+  arguments within 1%, strings case-insensitive, extra arguments
+  ignored); the wrong tool, a missing or wrong argument, two calls,
+  or no call fails; a no-tool-needed task passes only when no tool
+  is called.
+- score_task defers tool_call, image, and audio to their runners
+  instead of scoring them from text.
 
-### 5. Provider scoring exactness
+### 5. Media validation
 
-Through the real HTTP path (provider_generate_once + score_task):
-all 15 combinations (5 scored templates x smart/dumb/partial brains)
-score exactly 100% / 0% / 60%, the same as the Ollama path.
+- image_info reads PNG, JPEG, and GIF headers (format, width,
+  height) and returns None for garbage or empty bytes. The bundled
+  shapes.png is (png, 400, 300) and sign.png is (png, 400, 200).
+- is_audio_bytes recognises WAV, MP3 (with and without an ID3 tag),
+  OGG, MP4, and FLAC magic, and rejects garbage and empty bytes.
+- The bundled images are pixel-verified: shapes.png has 3 red
+  circles (15,075 red pixels) and 2 blue squares (12,800 blue
+  pixels); sign.png carries a white "42" (2,800 glyph pixels).
+  The bundled audio clips are 1-second sine tones (440/660/880 Hz).
 
-### 6. Providers tab (GUI)
+### 6. Long documents and speed padding
 
-- The key field is a password field. The tab opens with a blank form
-  when there are no providers.
-- Adding a provider through the form, testing the connection in the
-  UI ("Connected — fake-provider answered, 3 models listed."), adding
-  3 models (one with display name and prices, shown as
-  "fake-gpt-smart — Smart ($0.15 in / $0.60 out per 1M)"), and saving
-  all work; providers.json on disk holds the provider and its models.
-- A duplicate model id is rejected ("already on this provider"); a
-  bad price is rejected ("must be a number").
-- After saving, the key field is empty (the key is never shown) and
-  the status reads "Key saved".
-- Re-saving with the key field left empty keeps the stored key in the
-  file. Testing a bad key typed in the form fails plainly and does
-  NOT overwrite the saved key.
-- Switching tabs keeps an unsaved edit: the tab only reloads from
-  providers.json when the file actually changed on disk (see Bugs
-  found).
+- build_long_document puts the needle in the document at the start,
+  middle, and end, at the right length (4 chars per token), for
+  1K, 8K, and 32K.
+- The filler paragraph contains none of the fake's answer keys, so a
+  long-context task can only pass by finding the needle.
+- build_context_prompt pads the Speed base prompt to the requested
+  context length.
 
-### 7. Provider models in the main list and a full run
+### 7. Template validation
 
-- After saving, the Benchmark list holds 7 models (4 local + 3
-  provider), the provider models labelled "fake-provider / ...", all
-  UNCHECKED — the durable nothing-ticked rule holds for providers too.
-- A provider model run through all 6 templates scores 100% overall,
-  status done, with a measured decode speed in the table.
-- The details view shows exactly "Tokens: 560 in, 5,600 out (includes
-  warmup)" and "Estimated cost: $0.0034" (28 calls: warmup + 27
-  template prompts, 20 in / 200 out each, at $0.15 in / $0.60 out per
-  1M). Per-template lines show tokens and cost too
-  ("Coding: 100% (5/5), ..., 100 in / 1,000 out, $0.0006").
-- The run files: 6 for the provider model, in
-  results/fake-provider_fake-gpt-smart/<system>/. The coding file
-  records provider "fake-provider", provider_model "fake-gpt-smart",
-  model "fake-provider / fake-gpt-smart", prompt_tokens 100,
-  completion_tokens 1000, total_tokens 1100, estimated_cost_usd
-  exactly 0.000615, and the machine system id. Every task carries its
-  token counts.
-- PROFILE.md is written for the provider model: latest 100%,
-  "Provider: fake-provider", "Tokens used in template runs: 540 in,
-  5,400 out" (27 template calls; the warmup call is not part of any
-  run file), "Estimated cost in template runs: $0.0033".
+- A template naming an unknown capability is skipped with a warning,
+  never silently treated as text.
+- A chat template with no scored turn, a tools template with a text
+  rule, an image template with a text rule, and a long-context
+  template with a bad needle position are all skipped; the 19 good
+  templates still load beside them.
+- All 19 shipped templates load with zero warnings.
 
-### 8. Provider retry once
+### 8. Chat, images, and tools over HTTP (direct calls)
 
-With the fake provider dropping the next chat call, a Speed run still
-completes with status done, and the server counted exactly 4 chat
-calls: warmup fail + warmup retry + 2 speed prompts.
+- chat_once (Ollama): returns the answer and decode 20.0; with an
+  image attached the fake records it; with tools it returns
+  [{"name": "get_weather", "arguments": {"city": "Paris"}}]; with a
+  pirate system prompt the answer stays in character; the fake
+  records every chat history.
+- provider_chat_once: image_url parts are counted by the fake;
+  tool calls are parsed back out of the SSE deltas; role answers
+  stay in character; token counts are reported.
+- provider_generate_image: a valid 1x1 PNG for the smart brain, a
+  valid PNG for the partial brain on its 1st/3rd/5th tasks, and a
+  ProviderError ("returned bytes that are not an image") for the
+  partial brain's other tasks and for the dumb brain.
+- provider_transcribe: the right words by filename and brain
+  ("hello world" for smart, wrong for dumb, partial right only on
+  its 1st/3rd/5th tasks).
+- provider_synthesize: real audio bytes for smart, audio for
+  partial on its speech task, empty bytes otherwise.
+- Image and audio calls do NOT retry (unlike generate/chat, which
+  retry once on unreachable).
 
-### 9. Provider failures never stop local tests
+### 9. Full GUI run — scores and skips
 
-With a dead provider (unused port) and a bad-key provider added, a run
-ticking one local model and both broken provider models finishes with
-status "Done." (not ollama_down): the local model completes, the dead
-provider model reads exactly "failed: provider dead-provider did not
-answer", and the bad-key model reads exactly "failed: provider
-badkey-provider rejected the key: Incorrect API key provided".
+One run, all 4 local models, all 19 templates (image_gen and audio
+disabled, since no local model has those capabilities):
 
-### 10. Ollama down, providers up
+- Smart ran 17 templates, 100% on every scored one; 17 run files.
+- Partial ran 16 templates, 60% on every scored one; tools skipped
+  as "not eligible"; 16 run files, no tools run file.
+- Dumb ran 14 templates, 0% on every scored one; vision, tools, and
+  long context skipped as "not eligible"; 14 run files, no run file
+  for any skipped pair.
+- Overall scores: smart 100%, partial 60%, dumb 0%. Skipped pairs
+  never count toward a score.
+- The detail view shows "not eligible for this model" for the
+  skipped pairs (checked for partial/tools and dumb/vision,
+  dumb/tools, dumb/long_context).
+- The fake saw 10 vision images (smart 5 + partial 5) and 5 tool
+  calls (smart only) during the run.
+- The speed run file has 3 tasks with context_tokens 1024, 8192,
+  32768 and growing prompt lengths.
+- The multi-turn run file records both turns of the code-word task,
+  and the turn-2 answer holds BANANA.
 
-- With the Ollama server shut down, the model list holds only the 5
-  provider models, Run stays enabled, and the status says Ollama is
-  not running but the provider models are ready.
-- A provider-only run completes with Ollama down, status Done.
-- A mixed run (a CLI-fallback local model + a provider model) with
-  Ollama down is still blocked by the pre-run check, with the exact
-  Ollama-down run message and an empty table.
+Defined expectations: refusal tasks are all "comply" — the smart
+brain complies (100%), the partial brain complies on tasks 1, 3,
+and 5 (60%), and the dumb brain REFUSES on refusal-template prompts
+(0%). The dumb brain refusing is what keeps its overall at 0%;
+a non-refusing dumb would score 100% on refusal. Planning is binary
+per task: all required steps in order passes, anything else fails,
+so it follows the standard smart 100 / partial 60 / dumb 0 pattern.
 
-### 11. The API key appears nowhere in results
+### 10. Multi-turn state
 
-After runs and a saved report, every file under results/ was read and
-checked: neither the good fake key nor the bad key appears in any run
-file, profile, or report (txt or JSON). The status line and the detail
-view are clean too. (providers.json itself holds the key, as it must —
-the check is that nothing else does.) The package directory gained no
-providers.json from the test run.
+- The fake's recorded chat histories include a turn-2 request with
+  3 messages — user, assistant, user — carrying both the turn-1
+  prompt ("The code word is BANANA") and the turn-2 question
+  ("What is the code word?"). The follow-up genuinely depends on
+  the earlier turn; state carries.
 
-### 12. Remove model and provider (GUI)
+### 11. Provider capabilities and the media run
 
-- Removing a provider from the tab deletes it from providers.json and
-  its models leave the Benchmark list.
-- Removing a model from a provider, then saving, removes it from the
-  file.
+- The capability checkboxes start with Text only.
+- Adding a model with Image generation and Audio ticked shows
+  "fake-gpt-smart [image_generation, audio]" in the models list.
+- Clicking a model loads its capabilities into the form; Update
+  model writes changes back (checked both ways); saving stores
+  ["text", "image_generation", "audio"] in providers.json.
+- The media model appears in the Benchmark list with its bracket.
+- A run of image_generation + audio only, with Ollama down:
+  completes, status done, 100% on both templates, 2 run files.
+- 5 generated images saved under <run>-image_generation-images/,
+  all valid PNGs, all listed in the run file; 2 speech clips saved
+  under <run>-audio-audio/, all audio bytes, both listed in the run
+  file. The image endpoint was hit 5 times, transcribe 3, speech 2.
+- The detail view notes "(image saved)" and "(audio saved)"; the
+  table row shows 100%.
 
-### 13. v3 checks re-run green
+### 12. Carried-over v4 checks (all green)
 
-- Scoring: all 15 combinations (5 scored templates x smart/dumb/partial
-  brains) exact — 100% / 0% / 60% — plus every rule type individually.
-- Code execution: real subprocess runs — correct fib passes, wrong answer
-  fails naming the test, syntax error fails, missing function fails, an
-  infinite loop times out quickly.
-- Retry once: the Ollama warmup fail + retry + 2 prompts is exactly 4
-  generate attempts.
-- Immutability: a second save in the same second makes a -2 file and the
-  first file's SHA-256 is unchanged; a speed rerun through the GUI added
-  a second speed file and left the first file's bytes untouched.
-- History tab: 3 models, 7 smart runs listed, coding run summary shows
-  model, 100%, and the system id.
-- Profiles tab: smart profile 100%, regenerate after two hand-added
-  all-fail runs rebuilds to latest 60% / best 100% with the run files'
-  SHA-256 hashes unchanged.
-- Save report: writes the .txt + .json pair; txt has the 100% line and
-  the failed model; json has smart overall 100.0 with 6 templates.
-- Pull: success (bar moves, "Pulled fake-new:1b.", new model unchecked)
-  and failure (plain "pull exploded", button re-enabled).
-- Cancel: stops a slow run, status "Cancelled. Results so far are still
-  in the table.", cancelled model has no saved run.
-- Mid-stream close and server-dies-mid-run: the run aborts with the
-  exact Ollama-died message, the second model is never attempted, and
-  the window stays responsive.
-- Pre-run check: with the API dead and the model list from the CLI
-  fallback, Run is blocked with the exact Ollama-down run message and
-  the table stays empty.
-- Start Ollama: success, already-running (exactly 1 serve call),
-  timeout message, missing-binary message.
-- Ollama down (no server, no binary, no providers): no models, the
-  exact Ollama-down status, Run disabled, Start Ollama still enabled.
-- CLI fallback: with the API dead and a fake `ollama` CLI on PATH, the
-  window lists the 2 CLI models and Run is enabled.
-- Templates: the 6 shipped templates load with no warnings; a 7th
-  template added as JSON loads in the GUI; corrupt and bad-rule template
-  files are skipped with warnings, never a crash.
-- Size in RAM recorded (fake-partial:3b = 3,000,000,000); /api/ps empty
-  yields an empty size map.
-- No bare `&` in any button or label text (checked programmatically,
-  including the new Providers tab widgets).
+- Provider config, cost math, test connection, chat completions,
+  provider scoring, tokens and cost in the details view and the
+  profile (1,580 prompt / 15,800 completion tokens, $0.0097 in the
+  detail view; 1,560 / 15,600, $0.0096 in the profile), provider
+  retry (5 chat calls: warmup fail + retry + 3 context lengths),
+  provider failures failing plainly while locals continue,
+  provider-only runs with Ollama down, remove model/provider via
+  the UI, no API key in any run file, profile, report, status line,
+  detail view, or the capabilities cache.
+- v3 checks: nothing ticked by default, pre-run Ollama check, Start
+  Ollama, retry-once (5 generate attempts: warmup fail + retry + 3
+  context lengths), stop-on-unreachable, profiles and regeneration
+  (latest 88%, verdict Strong after two late all-fail files),
+  pull, cancel, mid-stream disconnect, CLI fallback, history.
+- v2 checks: template loading (19 + custom + broken + bad-rule),
+  scoring exactness for every scorable template, code execution,
+  immutable run files with -2 collision handling.
+- No providers.json or capabilities.json leaked into the package dir.
 
-### 14. Screenshots eyeballed
+### 13. Screenshots (eyeballed)
 
-- screenshot-start.png: window opens with 4 tabs, nothing ticked,
-  "Models (local and provider):", no clipped text.
-- screenshot-providers.png: Providers tab with a saved provider, the
-  key field empty with "Leave empty to keep the saved key" and "Key
-  saved", the Test connection result, 3 models with prices, "Saved
-  fake-provider." No clipped text, no bare `&`.
-- screenshot-provider-results.png: provider model in the results
-  table at 100% with a measured speed; details show "Tokens: 560 in,
-  5,600 out (includes warmup)", "Estimated cost: $0.0034", and
-  per-template tokens and cost. No clipped text.
-- screenshot-results.png, screenshot-history.png, screenshot-profiles.png,
-  screenshot-pull.png: re-taken in the v4 run, same content as v3.
+- screenshot-greyed.png: dumb ticked, Audio and Image Generation
+  greyed, capability brackets on the model names, "Screen models"
+  button present, "4 models found, 19 templates loaded. Ready."
+- screenshot-vision.png: full run done (smart 100%, partial 60%,
+  dumb 0%), detail scrolled to the Vision result.
+- screenshot-providers-caps.png: Providers tab with the media
+  provider, the [image_generation, audio] bracket, and the
+  capability checkboxes.
+- No clipped text and no bare & in any label (also asserted by the
+  suite for every button and label on the Benchmark tab).
 
-## Bugs found and fixed in place
+## Bugs found and fixed during this build
 
-1. Providers tab went stale (app bug, caught by the suite): providers
-   added to providers.json outside the tab (a hand edit, or another
-   copy of the app) never appeared in the tab's list, because the tab
-   only rebuilt on save/remove. Fixed: switching to the Providers tab
-   now reloads when the file's bytes changed since the tab last saw
-   it — and only then, so an edit in progress is never wiped. Two
-   regression checks cover both sides (outside edits appear; an
-   unsaved edit survives a tab switch).
-2. Providers intro label had no word wrap (app nit, caught by
-   eyeballing the screenshot): it fit at the default window width but
-   would clip in a narrower window. Now wraps like the Benchmark
-   intro.
-3. One test expectation was wrong (test-side, not the app): after
-   removing a provider, the suite expected 6 models in the list, but
-   Ollama was down and PATH was back to the original, so only the 4
-   provider models remained — the app was right, the expectation was
-   fixed.
-
-## Notes on the numbers
-
-- Provider decode speed is measured from the streamed answer: the
-  provider's completion_tokens over the wall time between the first
-  and last content chunks. It needs at least two content chunks spread
-  in time and a usage object; a provider that reports no usage shows
-  no speed rather than an invented one. Prompt speed is estimated as
-  prompt_tokens over the wait for the first token.
-- Model token totals include the warmup call (the provider charges
-  for it). Template lines and profiles count template runs only,
-  because the warmup is not part of any run file; the detail view
-  says so ("includes warmup"), and the profile line reads "Tokens
-  used in template runs".
-- The fake provider reports fixed usage (20 prompt / 200 completion
-  tokens per call), so the token and cost checks are exact. Real
-  providers report real usage; the math is the same.
-- The request sends stream_options {"include_usage": true} so usage
-  arrives in the final chunk. Providers that ignore the option may
-  still send usage (most do); ones that send none show tokens as
-  unknown and no cost.
+- The v5 GUI used QCheckBox for the provider capability ticks but the
+  import was missing — the app crashed on launch (NameError). Found
+  by the suite's first MainWindow creation; fixed in the app.
+- run_file_path mutated its base inside the collision loop, which
+  would have produced "...-3-3.json" names; fixed to keep the base
+  constant.
+- The image and audio task runners bumped progress inside their
+  error paths as well as in the shared wrapper (double bump); the
+  inner bumps were removed.
+- Two fake-answer substring collisions: the Jupiter task's "moons"
+  contains the existing "moon" key, and the structured-output city
+  task reused an instruction key the partial brain gets wrong.
+  Both tasks were reworded so the defined expectations hold.
+- Six test-expectation mismatches (sorted cache order, the image-gen
+  error text, the overall-score table column) were fixed in the
+  tests, not the app — the app behaved correctly in each case.
 
 ## Not verified
 
-- Any real provider: no real API key exists in the sandbox, so
-  OpenAI, OpenRouter, Groq, Together, DeepSeek, xAI, Mistral, and
-  LM Studio are unproven against the real services. The fake
-  provider implements the OpenAI wire shape (SSE `data:` chunks,
-  `[DONE]`, usage object, OpenAI-shaped error bodies), but real
-  providers vary in details (usage timing, reasoning_content fields,
-  rate-limit 429s with Retry-After, non-streaming fallbacks).
-- A real `ollama serve` start from the button (proven only with a
-  fake CLI + tiny server); a real multi-GB pull (proven only against
-  the fake server's 100 MB stream).
-- His real-PC run against real models and real providers (the closer),
-  system id on his Mint PC, real-model answer quirks vs the scorers.
-- Long real runs; code-exec against real model output.
-- Provider rate limiting (429): the app reports the provider's error
-  message and fails the model; there is no backoff-and-retry for
-  rate limits.
+- A real-PC run: the closer for everything above. Real Ollama
+  `/api/show` answers for real models (capabilities arrays and
+  context lengths) are unproven until then; the fake's are invented.
+- Real provider image generation and audio calls with a real key.
+- Real vision quality: the fake answers from the prompt, and the
+  bundled images are simple shapes and a sign. The app proves the
+  plumbing and the scoring, not that a real vision model sees well.
+- Image quality is deliberately never scored by the app — the
+  generated pictures are saved for his eyes.
+- Speech quality: the bundled clips are tone fixtures, not speech.
+  A real transcription test needs a recording of someone speaking.
+- Carried from v3: a real multi-GB pull, and a real `ollama serve`
+  started from the Start Ollama button.
+- Long-context scoring on a real model at 32K, and the real time a
+  32K speed run takes on his Ryzen 3 (minutes, by design).
