@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system libraries for Qt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libdbus-1-3 libfontconfig1 libxkbcommon-x11-0 libxcb-cursor0
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate test fixtures if missing
+        # The vision images and audio clips are binary files; if a
+        # checkout is missing any of them, rebuild them from the
+        # generator so the suite still runs. When they are present
+        # this step does nothing and the suite checks the real files.
+        run: |
+          if [ ! -f images/shapes.png ] || [ ! -f images/sign.png ] || [ ! -f audio/clip-hello.wav ] || [ ! -f audio/clip-count.wav ] || [ ! -f audio/clip-weather.wav ]; then
+            python tests/make_fixtures.py
+          fi
+
+      - name: Run the verification suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tests/run_tests.py
