@@ -1,5 +1,155 @@
 # Changelog
 
+## v9 (2026-11-12)
+
+Repo-audit polish release (tasks T13–T15) — the last version in the
+queue. No new templates.
+
+- Search/filter on the model + template lists (T13). Filter boxes
+  above both pick lists on the Benchmark tab ("Filter models...",
+  "Filter templates..."): typing narrows the visible items, and the
+  match is against the item text, so filtering "vision" finds every
+  vision model through the capability brackets in its label. Items
+  are hidden, never removed, so a ticked item keeps its tick while
+  filtered out of view and clearing the filter restores everything
+  with ticks intact. The grey-outs keep working with a filter on
+  (they iterate every item, hidden or not), and a refresh re-applies
+  the filter text to the rebuilt lists.
+- Dark mode (T14). View > Dark mode switches the whole window to a
+  dark theme — dark backgrounds with light text across the lists,
+  tables, text views, tabs, buttons, combo boxes, menus, progress
+  bars, and scrollbars — and the choice survives a restart (saved
+  in QSettings next to the window geometry, applied before the
+  window shows). Light stays the default: nothing changes for
+  existing users until they toggle it.
+- README fixes + repo hygiene (T15). The prompt count is fixed: a
+  full run is 103 prompts (90 scored tasks + 5 multi-turn extra
+  turns + 5 role-following extra turns + 3 speed runs), not
+  "roughly 80". The README shows a screenshot of the window
+  (screenshot.png, grabbed from the app itself). The app creates
+  the `images` and `audio` folders on its first launch, so there is
+  somewhere to put your own test image or recording. Suggested repo
+  description and topics are recorded in TEST-REPORT.md for the
+  lead to set in the repo settings at ship time (they are GitHub
+  settings, not files).
+
+## v8 (2026-11-12)
+
+Repo-audit management release (tasks T9–T11). No new templates.
+
+- Run deletion + store-size display (T9). The Past runs tab has a
+  Delete run button: pick a run and it asks to confirm, then removes
+  the run file and the media folder it saved (images and audio next
+  to the run file), and rebuilds the model's profile from the runs
+  that are left. Nothing else is touched — no other model's runs, no
+  other run of the same model — and Delete stays disabled while a
+  run is in progress, so a run's files can never be deleted under
+  it. The tab also shows the size of the results store ("Results use
+  12.3 MB"), updated after every run and every deletion.
+- Cost guard + per-template time budget (T10). Pressing Run with
+  provider models ticked shows the estimated cost first: the tokens
+  the chosen templates will use (prompt text at about four
+  characters per token, exact context lengths for the long-context
+  and speed tests, and the most each call can answer) priced at the
+  rates saved for each model, warmup included. When the estimate is
+  over the $1.00 confirmation threshold, the run asks to confirm,
+  naming the estimated cost and the models; under it, the run starts
+  straight away and the estimate shows in the status line. When no
+  prices are saved for a ticked provider model, the estimate says
+  "no prices saved — cost unknown" instead of inventing a number,
+  and still asks to confirm. The estimate covers text tokens only
+  and is an upper bound. The time budget is an opt-in wall-time
+  limit per template on the Benchmark tab ("Stop a template after __
+  minutes (0 = no limit)", default 0 — no limit): when set and a
+  template's jobs run past it, that template's jobs stop with a
+  plain "time budget reached" status, the score counts only the
+  tasks that ran, and the run carries on with the next template.
+  Each (model, template) pair gets its own budget window.
+- Result export CSV/HTML + side-by-side comparison (T11). Export
+  CSV and Export HTML on the Benchmark tab save the current results
+  — model, overall score, average decode speed, status, and
+  per-template scores — to a file you choose, with a plain message
+  when there is nothing to export. A new Compare tab puts two
+  models side by side: pick two models from the dropdowns and it
+  shows their latest score on each template they ran, plus their
+  overall score and speed; picking the same model twice shows a
+  plain message instead of a duplicated table. Exports carry scores
+  only — no answers, no API keys.
+
+## v7 (2026-11-12)
+
+Repo-audit usability release (tasks T5–T8). No new templates.
+
+- Headless mode (T5). `python3 ollama_system_test.py --headless
+  --models <names> --templates <ids>` runs the same worker with no
+  window, for scripts and cron. Model names are comma-separated; a
+  provider model is written "provider / model-id". It writes the same
+  immutable run files and rebuilds the profiles, prints a plain
+  summary, and exits 0 when the run finished or 1 when it did not
+  (unknown model or template, Ollama not running, or the run
+  stopped). `--help` documents every flag. No QApplication is created
+  in headless mode — the worker runs under a QCoreApplication, which
+  needs no window and no display. Ctrl+C stops after the current
+  task, like the Cancel button.
+- Version in window + window icon (T6). A single `__version__ = "7"`
+  in the source is the one source of truth; the title bar shows
+  "OLLAMA SYSTEM TEST v7" and the About box reads the same value.
+  The window has an icon (ost-icon.png, a gauge mark rendered for
+  this release), shipped in the tree and the zip.
+- Geometry persistence + shortcuts + menu bar (T7). Window size and
+  position are saved on close (QSettings) and restored on launch.
+  Shortcuts: Ctrl+R Run, Ctrl+S Save report, Esc Cancel — Ctrl+R
+  during a run is a no-op (Run is disabled then) and Esc does nothing
+  when no run is running. A minimal menu bar: File (Save report,
+  Quit) and Help (About, showing the version). The Save report menu
+  item mirrors the button's enabled state.
+- .desktop launcher (T8). Install-OST.desktop (double-click
+  installer) and OST.desktop (launcher) ship in the repo and the
+  zip. install.sh installs the launcher into the app menu
+  (~/.local/share/applications/) and the icon into
+  ~/.local/share/icons/, with a plain message saying so. The launcher
+  resolves its own folder (it works from a path with spaces) and
+  starts the app with the .venv python when there is one, else
+  system python3.
+
+## v6 (2026-11-12)
+
+Repo-audit fix release (tasks T1–T4). No new templates.
+
+- "Not run" instead of a false failure (T1). The template loader warns
+  when a vision or audio task names a test file that is not in the
+  `images/` or `audio/` folder. A task whose test file is missing is
+  recorded with passed None and the detail "not run: test image/audio
+  not found" — never a failure. Template scores count only the tasks
+  that actually ran; when nothing ran, there is no score at all. The
+  detail view, the history view and list, the saved session report,
+  and profiles all show "not run" distinctly from a failure and from
+  "no scoring". A run from a checkout without the fixtures shows
+  Vision and Audio as not-run, never 0%.
+- .gitignore + atomic providers.json (T2). `.gitignore` covers
+  providers.json, capabilities.json, results/, __pycache__/, .venv/,
+  and *.pyc, plus the test suite's run artifacts. save_providers
+  writes to a temporary file in the same directory, chmods it 0o600
+  before writing any key bytes, then renames it over providers.json:
+  a crash mid-write leaves the old file intact, and the keys are
+  never world-readable.
+- Verification suite in the repo + CI (T3). The 686-check suite
+  (run_tests.py, the fake Ollama/provider servers, the fixture and
+  template generators, the test templates and fake `ollama` CLIs)
+  now lives under tests/ and locates the app relative to the repo
+  root, so it runs from any checkout. A GitHub Actions workflow
+  (.github/workflows/test.yml) runs it on every push with offscreen
+  Qt; it regenerates the test fixtures first if a checkout is
+  missing them. The README documents how to run the suite locally.
+- PySide6 guard + install verification + pin (T4). Launching without
+  PySide6 prints a plain message naming install.sh instead of a
+  traceback. install.sh installs from requirements.txt, which pins
+  PySide6-Essentials to 6.12.0 (the version verified against), and
+  verifies the install (PySide6 imports, the app compiles) before
+  reporting success — it fails loudly if the check fails. The README
+  documents that a clone needs `chmod +x install.sh run.sh` (exec
+  bits do not survive the snapshot push; the Release zip carries them).
+
 ## v5 (2026-11-12)
 
 - Capability screening. The app asks Ollama what each model can do

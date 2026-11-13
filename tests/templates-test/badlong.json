@@ -1,0 +1,1 @@
+{"id": "badlong", "name": "Bad Long", "scored": true, "capability": "long_context", "tasks": [{"id": "t1", "kind": "long_context", "needle": "n", "context_length": 1024, "position": "sideways", "prompt": "x", "rule": "contains", "expected": "n"}]}

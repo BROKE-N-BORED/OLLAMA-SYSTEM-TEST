@@ -1,0 +1,1 @@
+{"id": "badcap", "name": "Bad Cap", "scored": true, "capability": "telepathy", "tasks": [{"id": "t1", "prompt": "x", "rule": "contains", "expected": "x"}]}

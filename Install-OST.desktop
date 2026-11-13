@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Install OST
+Comment=Install OLLAMA SYSTEM TEST — benchmark the Ollama models on this PC
+Exec=python3 -c "import os,subprocess,sys; a=sys.argv[1] if len(sys.argv)>1 else ''; d=os.path.dirname(a) or os.getcwd(); r=subprocess.call(['sh','./install.sh'],cwd=d); print(); print('Install finished.' if r==0 else 'Install hit a problem - see the lines above.'); input('Press Enter to close this window.') if sys.stdin.isatty() else None" %k
+Terminal=true
+Icon=system-software-install
+Categories=Utility;System;

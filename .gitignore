@@ -1,0 +1,27 @@
+# API keys and machine state — never committed.
+providers.json
+capabilities.json
+
+# Run results and profiles live on the machine, not in the repo.
+results/
+
+# The private install folder from install.sh.
+.venv/
+
+# Python bytecode.
+__pycache__/
+*.pyc
+
+# Test-suite run artifacts. tests/run_tests.py regenerates them on
+# every run; only the suite sources are committed.
+tests/results-test/
+tests/*.png
+tests/*.log
+tests/*.pid
+tests/serve-calls.txt
+tests/saved-report.txt
+tests/saved-report.json
+tests/sample-run-file.json
+tests/providers-test.json
+tests/capabilities-test.json
+tests/_v6_scratch/

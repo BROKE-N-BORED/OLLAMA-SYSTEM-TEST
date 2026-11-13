@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OLLAMA SYSTEM TEST v5 - benchmark the Ollama models on this PC,
+"""OLLAMA SYSTEM TEST v8 - benchmark the Ollama models on this PC,
 and cloud providers' models too.
 
 Native Qt desktop window. Talks to Ollama on localhost:11434
@@ -35,6 +35,36 @@ capability ticks on the Providers tab), and templates no ticked model
 can run are greyed out and untickable. The Speed template now measures
 tokens per second at 1K, 8K, and 32K context, so prefill cost shows.
 
+v6 is a repo-audit fix release (no new templates): a missing test
+image or audio clip records its tasks as "not run" instead of
+failing them, and the run never scores 0% for a missing file;
+providers.json is written atomically and owner-only from the first
+byte; the verification suite lives in the repo under tests/ with a
+GitHub Actions workflow; launching without PySide6 prints a plain
+message naming install.sh instead of a traceback; install.sh
+verifies the install before reporting success, and PySide6-Essentials
+is pinned to 6.12.0.
+
+v7 is a repo-audit usability release (no new templates): a headless
+mode (--headless --models ... --templates ...) runs the same worker
+with no window, for scripts and cron; the window carries the version
+in its title bar and an icon; window size and position survive a
+restart, with keyboard shortcuts (Ctrl+R Run, Ctrl+S Save report,
+Esc Cancel) and a minimal menu bar (File, Help, About showing the
+version); and the app ships double-click desktop files — Install-OST
+runs the installer, OST opens the app.
+
+v8 is a repo-audit management release (no new templates): a run can
+be deleted from the Past runs tab (run file and its media folder go,
+the profile rebuilds from what is left) and the tab shows how much
+disk the results store uses; pressing Run with provider models ticked
+shows the estimated cost first and asks to confirm when it is over
+$1.00 (or when no prices are saved, so the cost is unknown); an
+opt-in per-template time budget stops a template's jobs at the limit
+with a plain "time budget reached" status, default off; and the
+current results export to CSV and HTML, with a Compare tab putting
+two models' per-template scores side by side.
+
 DURABLE RULE: nothing is ever ticked by default. Every model and every
 template starts unchecked; the user ticks what they want to test.
 
@@ -43,12 +73,18 @@ a request is made. It is never written to a run file, a report, a
 profile, or the status line, and it is never shown on screen.
 """
 
+import argparse
 import ast
 import base64
+import csv
+import html
+import io
 import json
 import os
 import platform
 import re
+import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -59,29 +95,48 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QProgressBar,
-    QPushButton,
-    QTabWidget,
-    QTableWidget,
-    QTableWidgetItem,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
+try:
+    from PySide6.QtCore import (
+        QCoreApplication, QSettings, Qt, QThread, QTimer, Signal,
+    )
+    from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
+    from PySide6.QtWidgets import (
+        QApplication,
+        QCheckBox,
+        QComboBox,
+        QFileDialog,
+        QHBoxLayout,
+        QHeaderView,
+        QLabel,
+        QLineEdit,
+        QListWidget,
+        QListWidgetItem,
+        QMainWindow,
+        QMessageBox,
+        QProgressBar,
+        QPushButton,
+        QSpinBox,
+        QTabWidget,
+        QTableWidget,
+        QTableWidgetItem,
+        QTextEdit,
+        QVBoxLayout,
+        QWidget,
+    )
+except ImportError:
+    # Plain language, no traceback: the fix is install.sh, which puts
+    # PySide6 in the app's private folder.
+    print(
+        "This app needs PySide6 to open its window, and it is not installed.",
+        file=sys.stderr,
+    )
+    print("Run install.sh first — it installs PySide6 for you.", file=sys.stderr)
+    sys.exit(1)
 
 APP_NAME = "OLLAMA SYSTEM TEST"
+# The one source of truth for the version: the title bar, the About
+# box, and anything else that names the version reads this.
+__version__ = "9"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -99,6 +154,10 @@ START_OLLAMA_TIMEOUT_MSG = "Ollama could not be started. Run ollama serve in a t
 START_OLLAMA_MISSING_MSG = "Ollama is not installed. Install it first, then try again."
 NO_MODELS_MESSAGE = "No models installed yet. Pull one with ollama pull, then press Refresh."
 NO_TEMPLATES_MESSAGE = "No test templates found in the templates folder."
+# A task whose test file is missing never ran: it is recorded with
+# passed None and one of these details, never as a failure.
+NOT_RUN_IMAGE = "not run: test image not found"
+NOT_RUN_AUDIO = "not run: test audio not found"
 RETRY_DELAY = 3.0            # seconds before retrying a failed generate once
 START_OLLAMA_TIMEOUT = 30.0  # seconds to wait for `ollama serve` to answer
 START_OLLAMA_POLL = 1.0      # seconds between checks while waiting
@@ -108,6 +167,18 @@ PROVIDER_TEST_TIMEOUT = 15.0    # seconds for the Test connection call
 PROVIDER_LABEL_SEP = " / "      # "provider / model-id", used everywhere
 SHOW_TIMEOUT = 2.0              # seconds for one /api/show screening call
 LONG_CONTEXT_MIN_TOKENS = 32768  # a context this long counts as long-context
+# The cost guard asks to confirm a provider run when the estimated
+# cost is over this amount. $1.00: a plain round number, documented
+# in the README. Under it the run starts with no extra step.
+COST_CONFIRM_THRESHOLD_USD = 1.00
+# Detail text on a task that never ran because its template's time
+# budget ran out first. Like "not run", it is not a failure: the
+# score counts only the tasks that actually ran.
+BUDGET_REACHED = "time budget reached"
+# Rough tokens per character for the pre-run cost estimate: about
+# four characters per token. The estimate is an upper bound (see
+# estimate_template_tokens), never a promise of the exact bill.
+CHARS_PER_TOKEN = 4
 # Capabilities a model can have. "text" is the baseline every chat model
 # has; the rest gate the templates that need them. A template's
 # "capability" field must be one of these.
@@ -213,6 +284,157 @@ def get_audio_dir():
     )
 
 
+def ensure_media_dirs():
+    """Create the test-image and test-clip folders if they are not
+    there yet, so a user adding their own image or recording has
+    somewhere to put it. Called on every launch; harmless when the
+    folders already exist."""
+    os.makedirs(get_images_dir(), exist_ok=True)
+    os.makedirs(get_audio_dir(), exist_ok=True)
+
+
+# The dark theme (T14): dark backgrounds with light text throughout,
+# covering every widget the window uses — lists, tables, text edits,
+# tabs, buttons, combo boxes, menus, the progress bar. Light stays the
+# default; this only applies when the user toggles View > Dark mode.
+DARK_STYLESHEET = """
+QWidget {
+    background-color: #2b2b2b;
+    color: #e6e6e6;
+    selection-background-color: #3a6ea5;
+    selection-color: #ffffff;
+}
+QMainWindow {
+    background-color: #2b2b2b;
+}
+QListWidget, QTableWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox {
+    background-color: #1e1e1e;
+    color: #e6e6e6;
+    border: 1px solid #555555;
+}
+QListWidget::item:selected, QTableWidget::item:selected {
+    background-color: #3a6ea5;
+    color: #ffffff;
+}
+QListWidget::item:disabled {
+    color: #8a8a8a;
+}
+QHeaderView::section {
+    background-color: #3a3a3a;
+    color: #e6e6e6;
+    border: 1px solid #555555;
+}
+QTabWidget::pane {
+    border: 1px solid #555555;
+    background-color: #2b2b2b;
+}
+QTabBar::tab {
+    background-color: #3a3a3a;
+    color: #e6e6e6;
+    border: 1px solid #555555;
+    padding: 6px 12px;
+}
+QTabBar::tab:selected {
+    background-color: #1e1e1e;
+    color: #ffffff;
+}
+QPushButton {
+    background-color: #3a3a3a;
+    color: #e6e6e6;
+    border: 1px solid #555555;
+    padding: 4px 12px;
+}
+QPushButton:hover {
+    background-color: #4a4a4a;
+}
+QPushButton:pressed {
+    background-color: #2f5d8a;
+}
+QPushButton:disabled {
+    color: #8a8a8a;
+}
+QComboBox::drop-down {
+    border: none;
+}
+QComboBox QAbstractItemView {
+    background-color: #1e1e1e;
+    color: #e6e6e6;
+    selection-background-color: #3a6ea5;
+}
+QMenuBar {
+    background-color: #2b2b2b;
+    color: #e6e6e6;
+}
+QMenuBar::item:selected {
+    background-color: #3a6ea5;
+}
+QMenu {
+    background-color: #2b2b2b;
+    color: #e6e6e6;
+    border: 1px solid #555555;
+}
+QMenu::item:selected {
+    background-color: #3a6ea5;
+    color: #ffffff;
+}
+QProgressBar {
+    background-color: #1e1e1e;
+    color: #e6e6e6;
+    border: 1px solid #555555;
+}
+QProgressBar::chunk {
+    background-color: #3a6ea5;
+}
+QScrollBar:vertical {
+    background-color: #2b2b2b;
+    width: 14px;
+}
+QScrollBar::handle:vertical {
+    background-color: #555555;
+}
+QScrollBar::handle:vertical:hover {
+    background-color: #666666;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background-color: #2b2b2b;
+}
+QScrollBar:horizontal {
+    background-color: #2b2b2b;
+    height: 14px;
+}
+QScrollBar::handle:horizontal {
+    background-color: #555555;
+}
+QScrollBar::handle:horizontal:hover {
+    background-color: #666666;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background-color: #2b2b2b;
+}
+QToolTip {
+    background-color: #3a3a3a;
+    color: #e6e6e6;
+    border: 1px solid #555555;
+}
+QWidget:disabled {
+    color: #8a8a8a;
+}
+"""
+
+
+def apply_theme(dark):
+    """Apply the dark stylesheet to the running application, or clear
+    it back to the default light theme. A no-op without a
+    QApplication — headless mode runs under a QCoreApplication,
+    which has no window to restyle."""
+    app = QApplication.instance()
+    if not isinstance(app, QApplication):
+        return
+    app.setStyleSheet(DARK_STYLESHEET if dark else "")
+
+
 def tok_s(count, duration_ns):
     """Tokens per second from an Ollama count and a nanosecond duration."""
     if count is None or duration_ns is None or duration_ns <= 0:
@@ -295,6 +517,140 @@ def fmt_cost(value):
 def provider_label(provider_name, model_id):
     """One label format for provider models, used everywhere."""
     return f"{provider_name}{PROVIDER_LABEL_SEP}{model_id}"
+
+
+def _chars_to_tokens(chars):
+    """Rough token count for a stretch of text: about four
+    characters per token, rounded up. Empty text is zero tokens."""
+    if not chars:
+        return 0
+    return (chars + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+
+
+def estimate_template_tokens(template):
+    """Predictable (prompt, completion) token counts for one template.
+
+    The same token math the run files record, predicted before the
+    run: prompt tokens from the text the run will send, completion
+    tokens from num_predict — the most the run asks for on each call.
+    The estimate is an UPPER BOUND: a model usually stops well short
+    of num_predict, so the real bill is usually lower.
+
+    What is counted, per task kind:
+    - generate / vision / tools: the prompt text (plus the tool
+      definitions for a tools task), one call each. Image tokens are
+      not counted — the run files do not record them either.
+    - chat: every turn is a call, and each turn sends the whole
+      history so far, so the prompt grows turn by turn (plus the
+      system prompt, when the task has one).
+    - long_context: the context length is exact prompt tokens, plus
+      the question text.
+    - image_gen / audio: no text tokens at all — the run files record
+      None for those tasks, and so does this estimate.
+    - unscored: context lengths are exact prompt tokens (Speed uses
+      its lengths and ignores its plain prompts, same as the worker);
+      otherwise the plain prompts.
+    """
+    num_predict = template.get("num_predict", 0)
+    prompt_tokens = 0
+    completion_tokens = 0
+    if template.get("scored"):
+        for task in template.get("tasks", []):
+            kind = task.get("kind", "generate")
+            if kind in ("image_gen", "audio"):
+                continue
+            if kind == "chat":
+                turns = task.get("turns", [])
+                system_chars = len(task.get("system") or "")
+                seen_chars = 0
+                for turn in turns:
+                    seen_chars += len(turn.get("prompt") or "")
+                    prompt_tokens += _chars_to_tokens(
+                        system_chars + seen_chars
+                    )
+                    completion_tokens += num_predict
+                continue
+            if kind == "long_context":
+                prompt_tokens += task.get("context_length", 0)
+                prompt_tokens += _chars_to_tokens(
+                    len(task.get("prompt") or "")
+                )
+                completion_tokens += num_predict
+                continue
+            chars = len(task.get("prompt") or "")
+            if kind == "tools" and task.get("tools"):
+                chars += len(json.dumps(task["tools"]))
+            prompt_tokens += _chars_to_tokens(chars)
+            completion_tokens += num_predict
+    elif template.get("context_lengths"):
+        for length in template["context_lengths"]:
+            prompt_tokens += length
+            completion_tokens += num_predict
+    else:
+        for prompt in template.get("prompts", []):
+            prompt_tokens += _chars_to_tokens(len(prompt))
+            completion_tokens += num_predict
+    return prompt_tokens, completion_tokens
+
+
+def estimate_run_cost(targets, templates):
+    """Pre-run cost estimate for the provider targets in a run.
+
+    Returns a dict: "per_model" is one entry per provider target
+    (label, cost-or-None, prompt tokens, completion tokens,
+    has-prices); "total" is the summed cost, or None when any
+    provider model has no prices saved; "unknown" lists the models
+    without prices; "provider_models" lists every provider label.
+    Ollama targets are free and never appear. The warmup call is
+    counted (the provider charges for it too), for text models only
+    — a model with no text capability gets a connection test instead
+    of a text warmup, same as the worker. Templates a target cannot
+    run are skipped, same as the worker.
+    """
+    per_model = []
+    total = 0.0
+    unknown = []
+    for target in targets:
+        if target["kind"] != "provider":
+            continue
+        prompt_tokens = 0
+        completion_tokens = 0
+        if "text" in set(target.get("capabilities") or ["text"]):
+            prompt_tokens += _chars_to_tokens(len(WARMUP_PROMPT))
+            completion_tokens += WARMUP_PREDICT
+        for template in templates:
+            if not template_eligible(template, target):
+                continue
+            template_prompt, template_completion = (
+                estimate_template_tokens(template)
+            )
+            prompt_tokens += template_prompt
+            completion_tokens += template_completion
+        cost = estimate_cost(
+            prompt_tokens, completion_tokens,
+            target["price_input_per_1m"], target["price_output_per_1m"],
+        )
+        has_prices = (
+            target["price_input_per_1m"] is not None
+            and target["price_output_per_1m"] is not None
+        )
+        if cost is None:
+            unknown.append(target["label"])
+        else:
+            total += cost
+        per_model.append({
+            "label": target["label"],
+            "cost": cost,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "has_prices": has_prices,
+        })
+    return {
+        "per_model": per_model,
+        "total": None if unknown else total,
+        "unknown": unknown,
+        "provider_models": [entry["label"] for entry in per_model],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -865,17 +1221,39 @@ def load_providers(path=None):
 
 
 def save_providers(providers, path=None):
-    """Write providers.json. The file holds API keys, so it is written
-    readable only by its owner (best effort on systems that allow it)."""
+    """Write providers.json atomically. The file holds API keys, so the
+    write goes to a temporary file in the same directory, that file is
+    chmodded 0o600 BEFORE any key bytes are written to it, and only
+    then is it renamed over providers.json. A crash mid-write leaves
+    the old file intact, and at no point are the keys world-readable.
+    A failed write removes the temporary file and raises."""
     if path is None:
         path = get_providers_file()
     data = {"providers": providers}
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".providers-", suffix=".tmp", dir=directory
+    )
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        # Owner-only before a single key byte is written.
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None  # fdopen owns the descriptor now
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _provider_error_reason(exc):
@@ -2008,6 +2386,32 @@ def load_templates(templates_dir=None):
                 if not isinstance(base, str) or not base:
                     base = prompts[0] if prompts else "Write a short story."
                 template["context_base_prompt"] = base
+        if scored:
+            # Fixture check: a vision task names an image in images/, a
+            # transcribe task names a clip in audio/. A missing fixture
+            # is a warning, not a dropped template — the run records
+            # those tasks as "not run" instead of failing them. One
+            # warning per missing file, however many tasks name it.
+            seen_missing = set()
+            for task in template["tasks"]:
+                if task.get("kind") == "vision":
+                    fixture = task.get("image")
+                    folder, label = get_images_dir(), "image"
+                elif (task.get("kind") == "audio"
+                        and task.get("audio_task") == "transcribe"):
+                    fixture = task.get("audio_file")
+                    folder, label = get_audio_dir(), "audio file"
+                else:
+                    continue
+                if not fixture or (label, fixture) in seen_missing:
+                    continue
+                seen_missing.add((label, fixture))
+                if not os.path.exists(os.path.join(folder, fixture)):
+                    warnings.append(
+                        f"{filename}: task {task['id']} needs {label} "
+                        f"{fixture!r}, but that file is not in the "
+                        f"{os.path.basename(folder)} folder"
+                    )
         seen_ids.add(template_id)
         templates.append(template)
     templates.sort(key=lambda t: t["id"])
@@ -2176,6 +2580,9 @@ def list_history_runs(results_dir, model_slug):
                 "score": data.get("template_score"),
                 "passed": data.get("passed"),
                 "total": data.get("total"),
+                "not_run": data.get("not_run", 0),
+                "budget_stopped": data.get("budget_stopped", 0),
+                "time_budget_reached": data.get("time_budget_reached", False),
             })
     runs.sort(key=lambda r: (r["timestamp"], r["filename"]), reverse=True)
     return runs
@@ -2190,6 +2597,85 @@ def load_run_file(path):
         return None
 
 
+def is_not_run(task):
+    """A task that never ran because its test file was missing — not a
+    failure. Unscored tasks (Speed) also carry passed None, but with an
+    empty detail, so the detail is what marks a task as not run."""
+    return (
+        task.get("passed") is None
+        and (task.get("detail") or "").startswith("not run:")
+    )
+
+
+def is_budget_stopped(task):
+    """A task that never ran because its template's time budget ran
+    out first — not a failure, same as a not-run task. The score
+    counts only the tasks that actually ran."""
+    return (
+        task.get("passed") is None
+        and (task.get("detail") or "") == BUDGET_REACHED
+    )
+
+
+def store_size(results_dir):
+    """Total bytes of every file under the results store, or 0 when
+    the folder does not exist. Unreadable files are skipped."""
+    total = 0
+    for root, _dirs, files in os.walk(results_dir):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total
+
+
+def fmt_store_size(size):
+    """Human-readable store size: "12.3 MB", "850 KB", "42 B". One
+    decimal for MB and GB, so a small change in the store shows."""
+    if size >= 1_000_000_000:
+        return f"{size / 1_000_000_000:.1f} GB"
+    if size >= 1_000_000:
+        return f"{size / 1_000_000:.1f} MB"
+    if size >= 1_000:
+        return f"{size / 1_000:.0f} KB"
+    return f"{size} B"
+
+
+def delete_run_file(path):
+    """Delete one run file and its media folders.
+
+    Generated images and audio live next to the run file in folders
+    named after it (<base>-images, <base>-audio); both go with the
+    file, so nothing of the run is left behind. Only that run's own
+    files are touched — no other model's runs, and no other run of
+    the same model. Returns the paths removed (file first, then
+    folders). A missing file or folder is skipped, not an error.
+    """
+    removed = []
+    folder = os.path.dirname(path)
+    base = os.path.splitext(os.path.basename(path))[0]
+    try:
+        os.remove(path)
+        removed.append(path)
+    except OSError:
+        pass
+    for subfolder in ("images", "audio"):
+        media_dir = os.path.join(folder, f"{base}-{subfolder}")
+        if os.path.isdir(media_dir):
+            shutil.rmtree(media_dir, ignore_errors=True)
+            if not os.path.exists(media_dir):
+                removed.append(media_dir)
+    return removed
+
+
+def _not_run_suffix(count):
+    """", 3 not run" for a score line, or "" when nothing was not run."""
+    if not count:
+        return ""
+    return f", {count} not run"
+
+
 def render_run_summary(run_data):
     """Plain-text summary of one run file, for the history view."""
     lines = [
@@ -2199,11 +2685,26 @@ def render_run_summary(run_data):
         f"Provider: {run_data.get('provider', 'ollama')}",
     ]
     score = run_data.get("template_score")
-    if score is None:
+    not_run = run_data.get("not_run", 0) or 0
+    if score is None and not_run:
+        lines.append(
+            f"Score: not run ({not_run} "
+            f"{'task' if not_run == 1 else 'tasks'} not run — "
+            "test file missing)"
+        )
+    elif score is None:
         lines.append("Score: no scoring (speed only)")
     else:
         lines.append(
-            f"Score: {score:.0f}% ({run_data.get('passed', '?')}/{run_data.get('total', '?')} tasks)"
+            f"Score: {score:.0f}% ({run_data.get('passed', '?')}/{run_data.get('total', '?')} tasks"
+            f"{_not_run_suffix(not_run)})"
+        )
+    budget_stopped = run_data.get("budget_stopped", 0) or 0
+    if budget_stopped:
+        lines.append(
+            f"Stopped early: time budget reached "
+            f"({budget_stopped} "
+            f"{'task' if budget_stopped == 1 else 'tasks'} not run)"
         )
     avg_toks = run_data.get("avg_decode_tok_s")
     lines.append(f"Avg decode speed: {fmt_toks(avg_toks)} tokens per second")
@@ -2219,12 +2720,21 @@ def render_run_summary(run_data):
     lines.append("")
     for task in run_data.get("tasks", []):
         passed = task.get("passed")
-        mark = "pass" if passed is True else ("fail" if passed is False else "run")
+        if passed is True:
+            mark = "pass"
+        elif passed is False:
+            mark = "fail"
+        elif is_not_run(task):
+            mark = "not run"
+        elif is_budget_stopped(task):
+            mark = "time budget reached"
+        else:
+            mark = "run"
         lines.append(
             f"{mark}  {task.get('id', '?')} ({fmt_toks(task.get('decode_tok_s'))} tok/s)"
         )
         detail = task.get("detail") or ""
-        if passed is False and detail:
+        if (passed is False or is_not_run(task) or is_budget_stopped(task)) and detail:
             lines.append(f"     {detail}")
     return "\n".join(lines)
 
@@ -2314,14 +2824,18 @@ def build_profile(results_dir, model_slug):
         t_runs = by_template[tid]
         name = t_runs[-1].get("template_name", tid)
         scored = [r for r in t_runs if r.get("template_score") is not None]
+        # A template whose latest run never ran (missing test file) is
+        # "not run" in the profile, not "no scoring" — it was a scored
+        # template, it just never got its test.
+        latest_not_run = bool(t_runs[-1].get("not_run"))
         if scored:
             latest = scored[-1]["template_score"]
             best = max(r["template_score"] for r in scored)
             latest_scores.append(latest)
             best_scores.append(best)
-            template_rows.append((name, latest, best, len(t_runs)))
+            template_rows.append((name, latest, best, len(t_runs), False))
         else:
-            template_rows.append((name, None, None, len(t_runs)))
+            template_rows.append((name, None, None, len(t_runs), latest_not_run))
     overall_latest = (
         sum(latest_scores) / len(latest_scores) if latest_scores else None
     )
@@ -2333,11 +2847,11 @@ def build_profile(results_dir, model_slug):
     ]
     avg_speed = sum(speeds) / len(speeds) if speeds else None
     strengths = [
-        name for name, latest, _best, _n in template_rows
+        name for name, latest, _best, _n, _nr in template_rows
         if latest is not None and latest >= STRENGTH_AT
     ]
     weaknesses = [
-        name for name, latest, _best, _n in template_rows
+        name for name, latest, _best, _n, _nr in template_rows
         if latest is not None and latest < WEAKNESS_UNDER
     ]
 
@@ -2372,8 +2886,10 @@ def build_profile(results_dir, model_slug):
     lines.append("")
     lines.append("| Template | Latest | Best | Runs |")
     lines.append("| --- | --- | --- | --- |")
-    for name, latest, best, count in template_rows:
-        if latest is None:
+    for name, latest, best, count, not_run in template_rows:
+        if latest is None and not_run:
+            lines.append(f"| {name} | not run | not run | {count} |")
+        elif latest is None:
             lines.append(f"| {name} | no scoring | no scoring | {count} |")
         else:
             lines.append(f"| {name} | {latest:.0f}% | {best:.0f}% | {count} |")
@@ -2483,19 +2999,228 @@ def render_text_report(results):
                 )
                 continue
             score = run.get("template_score")
-            if score is None:
+            not_run = run.get("not_run", 0) or 0
+            budget_stopped = run.get("budget_stopped", 0) or 0
+            if score is None and not_run:
+                lines.append(
+                    f"  {run.get('template_name', template_id)}: not run "
+                    f"({not_run} {'task' if not_run == 1 else 'tasks'} "
+                    "not run — test file missing)"
+                )
+            elif score is None and budget_stopped:
+                lines.append(
+                    f"  {run.get('template_name', template_id)}: "
+                    f"time budget reached "
+                    f"({budget_stopped} "
+                    f"{'task' if budget_stopped == 1 else 'tasks'} stopped "
+                    "before they ran)"
+                )
+            elif score is None:
                 lines.append(
                     f"  {run.get('template_name', template_id)}: no scoring, "
                     f"{fmt_toks(run.get('avg_decode_tok_s'))} tok/s"
                 )
             else:
-                lines.append(
+                line = (
                     f"  {run.get('template_name', template_id)}: {score:.0f}% "
-                    f"({run.get('passed')}/{run.get('total')}), "
+                    f"({run.get('passed')}/{run.get('total')}"
+                    f"{_not_run_suffix(not_run)}), "
                     f"{fmt_toks(run.get('avg_decode_tok_s'))} tok/s"
                 )
+                if budget_stopped:
+                    line += (
+                        f" — time budget reached "
+                        f"({budget_stopped} "
+                        f"{'task' if budget_stopped == 1 else 'tasks'} stopped)"
+                    )
+                lines.append(line)
         lines.append("")
     return "\n".join(lines)
+
+
+def template_score_text(run):
+    """One cell of text for a template run: its score, or what
+    happened instead. "not eligible" when the model could not run it
+    at all, "not run" when nothing ran for a missing test file,
+    "time budget reached" when the budget stopped it before any task
+    ran, "no scoring" for the unscored templates. A score that was
+    cut short by the budget says so next to the number."""
+    if run.get("skipped"):
+        return "not eligible"
+    score = run.get("template_score")
+    not_run = run.get("not_run", 0) or 0
+    budget_stopped = run.get("budget_stopped", 0) or 0
+    if score is None and not_run:
+        return "not run"
+    if score is None and budget_stopped:
+        return "time budget reached"
+    if score is None:
+        return "no scoring"
+    text = f"{score:.0f}%"
+    if budget_stopped:
+        text += " (time budget reached)"
+    return text
+
+
+def export_table(results):
+    """The current results as a table: (columns, rows) of plain text.
+
+    Columns are Model, Overall score, Avg decode tok/s, Status, then
+    one column per template that any result ran (in the order the
+    templates first appear). A model that did not run a template
+    shows "—" in that column. No answers and no API keys — only the
+    scores, speeds, and statuses the results table shows.
+    """
+    columns = ["Model", "Overall score", "Avg decode tok/s", "Status"]
+    template_names = []
+    for result in results:
+        for run in result.get("templates", {}).values():
+            name = run.get("template_name", run.get("template", "?"))
+            if name not in template_names:
+                template_names.append(name)
+    columns.extend(template_names)
+    rows = []
+    for result in sort_results(results):
+        row = [
+            result["name"],
+            fmt_score(result.get("overall_score")),
+            fmt_toks(result.get("avg_decode_tok_s")),
+            result["status"],
+        ]
+        by_name = {}
+        for run in result.get("templates", {}).values():
+            by_name[run.get("template_name", run.get("template", "?"))] = run
+        for name in template_names:
+            run = by_name.get(name)
+            row.append(template_score_text(run) if run is not None else "—")
+        rows.append(row)
+    return columns, rows
+
+
+def render_export_csv(results):
+    """The current results as CSV text (see export_table)."""
+    columns, rows = export_table(results)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(columns)
+    writer.writerows(rows)
+    return buffer.getvalue()
+
+
+def render_export_html(results):
+    """The current results as a small self-contained HTML page: the
+    same table as the CSV, with a heading and the date. Scores and
+    model names are escaped; nothing else from the results is in it."""
+    columns, rows = export_table(results)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        "<!DOCTYPE html>",
+        "<html>",
+        "<head>",
+        '<meta charset="utf-8">',
+        "<title>OLLAMA SYSTEM TEST — results</title>",
+        "<style>",
+        "body { font-family: sans-serif; }",
+        "table { border-collapse: collapse; }",
+        "th, td { border: 1px solid #999; padding: 4px 8px; "
+        "text-align: left; }",
+        "th { background: #eee; }",
+        "</style>",
+        "</head>",
+        "<body>",
+        "<h1>OLLAMA SYSTEM TEST — results</h1>",
+        f"<p>Exported {html.escape(stamp)}.</p>",
+        "<table>",
+        "<tr>" + "".join(
+            f"<th>{html.escape(column)}</th>" for column in columns
+        ) + "</tr>",
+    ]
+    for row in rows:
+        lines.append(
+            "<tr>" + "".join(
+                f"<td>{html.escape(cell)}</td>" for cell in row
+            ) + "</tr>"
+        )
+    lines.extend(["</table>", "</body>", "</html>", ""])
+    return "\n".join(lines)
+
+
+def compare_models(results_dir, slug_a, slug_b):
+    """Two models' latest scores side by side, from their run files.
+
+    Returns a dict: the two display names, one row per template
+    either model ran (template name, latest score or None for each
+    model, and whether each side's latest run was "not run"), plus
+    each model's overall score (the mean of its latest scored
+    templates, like the profile) and average decode speed. A
+    template neither model scored shows "no scoring" in the view;
+    a latest run that never ran shows "not run". Returns None when
+    either model has no runs at all.
+    """
+    runs_a = load_model_runs(results_dir, slug_a)
+    runs_b = load_model_runs(results_dir, slug_b)
+    if not runs_a or not runs_b:
+        return None
+
+    def latest_by_template(runs):
+        by_template = {}
+        for run in runs:
+            by_template.setdefault(run.get("template", "?"), []).append(run)
+        latest = {}
+        for tid, t_runs in by_template.items():
+            name = t_runs[-1].get("template_name", tid)
+            scored = [r for r in t_runs if r.get("template_score") is not None]
+            latest_not_run = bool(t_runs[-1].get("not_run"))
+            latest[tid] = {
+                "name": name,
+                "score": scored[-1]["template_score"] if scored else None,
+                "not_run": latest_not_run and not scored,
+            }
+        return latest
+
+    def overall_and_speed(runs, latest):
+        scores = [
+            entry["score"] for entry in latest.values()
+            if entry["score"] is not None
+        ]
+        overall = sum(scores) / len(scores) if scores else None
+        speeds = [
+            r["avg_decode_tok_s"] for r in runs
+            if r.get("avg_decode_tok_s") is not None
+        ]
+        speed = sum(speeds) / len(speeds) if speeds else None
+        return overall, speed
+
+    latest_a = latest_by_template(runs_a)
+    latest_b = latest_by_template(runs_b)
+    overall_a, speed_a = overall_and_speed(runs_a, latest_a)
+    overall_b, speed_b = overall_and_speed(runs_b, latest_b)
+    rows = []
+    for tid in sorted(
+        set(latest_a) | set(latest_b),
+        key=lambda t: (latest_a.get(t) or latest_b[t])["name"],
+    ):
+        entry_a = latest_a.get(tid)
+        entry_b = latest_b.get(tid)
+        name = (entry_a or entry_b)["name"]
+        rows.append({
+            "name": name,
+            "score_a": entry_a["score"] if entry_a else None,
+            "score_b": entry_b["score"] if entry_b else None,
+            "not_run_a": bool(entry_a and entry_a["not_run"]),
+            "not_run_b": bool(entry_b and entry_b["not_run"]),
+            "missing_a": entry_a is None,
+            "missing_b": entry_b is None,
+        })
+    return {
+        "name_a": runs_a[-1].get("model") or slug_a,
+        "name_b": runs_b[-1].get("model") or slug_b,
+        "rows": rows,
+        "overall_a": overall_a,
+        "overall_b": overall_b,
+        "speed_a": speed_a,
+        "speed_b": speed_b,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2619,13 +3344,18 @@ class BenchWorker(QThread):
     # "done", "cancelled", or "ollama_down"
     run_finished = Signal(str)
 
-    def __init__(self, targets, templates, sys_id, machine, results_dir):
+    def __init__(self, targets, templates, sys_id, machine, results_dir,
+                 time_budget_seconds=None):
         super().__init__()
         self.targets = targets
         self.templates = templates
         self.sys_id = sys_id
         self.machine = machine
         self.results_dir = results_dir
+        # Opt-in wall-time budget per template, in seconds (None means
+        # no budget — the default). Each (model, template) pair gets
+        # its own window, starting when the template starts.
+        self.time_budget_seconds = time_budget_seconds
         self._stop = False
 
     def request_cancel(self):
@@ -2633,6 +3363,21 @@ class BenchWorker(QThread):
 
     def _should_stop(self):
         return self._stop
+
+    def _budget_reached(self, started):
+        """True when the time budget is set and this template's
+        window has run out."""
+        if self.time_budget_seconds is None:
+            return False
+        return time.monotonic() - started >= self.time_budget_seconds
+
+    def _budget_result(self, job_id, prompt, task):
+        """A task record for a job the time budget stopped: passed
+        None, never False — the model did not fail, it ran out of
+        time. Excluded from the score like a not-run task."""
+        record = self._failed_result(job_id, prompt, task, BUDGET_REACHED)
+        record["passed"] = None
+        return record
 
     def _call_once(self, target, prompt, num_predict):
         if target["kind"] == "provider":
@@ -2733,6 +3478,14 @@ class BenchWorker(QThread):
             "detail": detail,
         }
 
+    def _not_run_result(self, job_id, prompt, task, detail):
+        """A task record for a task that never ran (its test file was
+        missing). passed is None, never False: a missing file is not
+        the model's failure, and the score counts only tasks that ran."""
+        record = self._failed_result(job_id, prompt, task, detail)
+        record["passed"] = None
+        return record
+
     def _task_generate(self, target, template, task, prompt):
         """One prompt in, one answer out (generate + long-context)."""
         label = target["label"]
@@ -2830,9 +3583,8 @@ class BenchWorker(QThread):
                 raw = handle.read()
         except OSError:
             self._bump_progress(label, template, task["id"])
-            record = self._failed_result(
-                task["id"], task["prompt"], task,
-                f"test image not found: {task['image']}",
+            record = self._not_run_result(
+                task["id"], task["prompt"], task, NOT_RUN_IMAGE,
             )
             record["image"] = task["image"]
             return record, None
@@ -2942,9 +3694,8 @@ class BenchWorker(QThread):
             audio_path = os.path.join(get_audio_dir(), task["audio_file"])
             if not os.path.exists(audio_path):
                 self._bump_progress(label, template, task["id"])
-                record = self._failed_result(
-                    task["id"], task["prompt"], task,
-                    f"audio file not found: {task['audio_file']}",
+                record = self._not_run_result(
+                    task["id"], task["prompt"], task, NOT_RUN_AUDIO,
                 )
                 record["audio_file"] = task["audio_file"]
                 return record, None
@@ -3058,10 +3809,25 @@ class BenchWorker(QThread):
         num_predict = template["num_predict"]
         task_results = []
         media = []
+        # The budget window starts when the template starts, per
+        # (model, template) pair. Checked between jobs: a job already
+        # running finishes, then the rest stop with "time budget
+        # reached" and the run carries on with the next template.
+        started = time.monotonic()
+        budget_hit = False
         if template["scored"]:
-            for task in template["tasks"]:
+            for index, task in enumerate(template["tasks"]):
                 if self._stop:
                     raise Cancelled()
+                if self._budget_reached(started):
+                    budget_hit = True
+                    for remaining in template["tasks"][index:]:
+                        task_results.append(self._budget_result(
+                            remaining["id"], remaining.get("prompt", ""),
+                            remaining,
+                        ))
+                        self._bump_progress(label, template, remaining["id"])
+                    break
                 record, item = self._run_scored_task(target, template, task)
                 if item is not None:
                     media.append((task["id"],) + item)
@@ -3080,9 +3846,21 @@ class BenchWorker(QThread):
                     (f"run-{i + 1}", prompt, None)
                     for i, prompt in enumerate(template["prompts"])
                 ]
-            for job_id, prompt, extra in jobs:
+            for job_index, (job_id, prompt, extra) in enumerate(jobs):
                 if self._stop:
                     raise Cancelled()
+                if self._budget_reached(started):
+                    budget_hit = True
+                    for remaining_id, remaining_prompt, remaining_extra in jobs[job_index:]:
+                        record = self._budget_result(
+                            remaining_id, remaining_prompt, None
+                        )
+                        if remaining_extra:
+                            record.update(remaining_extra)
+                            record["prompt_chars"] = len(remaining_prompt)
+                        task_results.append(record)
+                        self._bump_progress(label, template, remaining_id)
+                    break
                 try:
                     metrics = self._generate(target, prompt, num_predict)
                 except OllamaError as exc:
@@ -3116,10 +3894,23 @@ class BenchWorker(QThread):
                     record["prompt_chars"] = len(prompt)
                 task_results.append(record)
                 self._bump_progress(label, template, job_id)
+        # Tasks that never ran (missing test file) count in neither the
+        # numerator nor the denominator: the score is over the tasks
+        # that actually ran. When nothing ran, there is no score at
+        # all — the views show "not run", never 0%. Tasks the time
+        # budget stopped count the same way: they never ran either.
+        not_run_count = sum(1 for t in task_results if is_not_run(t))
+        budget_stopped = sum(
+            1 for t in task_results if is_budget_stopped(t)
+        )
         if template["scored"]:
-            passed_count = sum(1 for t in task_results if t["passed"] is True)
-            total = len(task_results)
-            score = 100.0 * passed_count / total if total else 0.0
+            ran = [t for t in task_results
+                   if not is_not_run(t) and not is_budget_stopped(t)]
+            passed_count = sum(1 for t in ran if t["passed"] is True)
+            total = len(ran)
+            score = 100.0 * passed_count / total if total else None
+            if total == 0:
+                passed_count = None
         else:
             passed_count = None
             total = len(task_results)
@@ -3165,6 +3956,9 @@ class BenchWorker(QThread):
             "template_score": score,
             "passed": passed_count,
             "total": total,
+            "not_run": not_run_count,
+            "time_budget_reached": budget_hit,
+            "budget_stopped": budget_stopped,
             "avg_decode_tok_s": sum(speeds) / len(speeds) if speeds else None,
             "prompt_tokens": run_prompt_tokens,
             "completion_tokens": run_completion_tokens,
@@ -3268,6 +4062,7 @@ class BenchWorker(QThread):
                             "template_score": None,
                             "passed": None,
                             "total": 0,
+                            "not_run": 0,
                             "tasks": [],
                             "avg_decode_tok_s": None,
                             "prompt_tokens": None,
@@ -3488,8 +4283,25 @@ TABLE_COLUMNS = (
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} v{__version__}")
+        icon_path = os.path.join(APP_DIR, "ost-icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.resize(980, 720)
+        # Size and position survive a restart: the last geometry is
+        # saved on close and restored here. A first launch (or a
+        # missing/broken value) keeps the default 980x720.
+        settings = QSettings("BrokeNBored", APP_NAME)
+        saved_geometry = settings.value("geometry")
+        if saved_geometry is not None:
+            self.restoreGeometry(saved_geometry)
+        # The media folders exist from the first launch, so a user
+        # adding their own test image or audio clip has somewhere to
+        # put it. The saved theme applies before the window shows, so
+        # a dark-mode user never sees a light flash.
+        ensure_media_dirs()
+        self.dark_mode = settings.value("dark_mode", False, type=bool)
+        apply_theme(self.dark_mode)
         self.worker = None
         self.pull_worker = None
         self.starter = None
@@ -3535,6 +4347,11 @@ class MainWindow(QMainWindow):
         pick_row = QHBoxLayout()
         model_box = QVBoxLayout()
         model_box.addWidget(QLabel("Models (local and provider):"))
+        self.model_filter = QLineEdit()
+        self.model_filter.setPlaceholderText("Filter models...")
+        self.model_filter.setClearButtonEnabled(True)
+        self.model_filter.textChanged.connect(self._apply_model_filter)
+        model_box.addWidget(self.model_filter)
         self.model_list = QListWidget()
         self.model_list.setMaximumHeight(180)
         # Ticking or unticking a model changes which templates any
@@ -3557,6 +4374,11 @@ class MainWindow(QMainWindow):
 
         template_box = QVBoxLayout()
         template_box.addWidget(QLabel("Test templates:"))
+        self.template_filter = QLineEdit()
+        self.template_filter.setPlaceholderText("Filter templates...")
+        self.template_filter.setClearButtonEnabled(True)
+        self.template_filter.textChanged.connect(self._apply_template_filter)
+        template_box.addWidget(self.template_filter)
         self.template_list = QListWidget()
         self.template_list.setMaximumHeight(180)
         template_box.addWidget(self.template_list)
@@ -3581,6 +4403,12 @@ class MainWindow(QMainWindow):
         self.save_button = QPushButton("Save report")
         self.save_button.clicked.connect(self.save_report)
         self.save_button.setEnabled(False)
+        self.export_csv_button = QPushButton("Export CSV")
+        self.export_csv_button.clicked.connect(self.export_csv)
+        self.export_csv_button.setEnabled(False)
+        self.export_html_button = QPushButton("Export HTML")
+        self.export_html_button.clicked.connect(self.export_html)
+        self.export_html_button.setEnabled(False)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_models)
         self.start_ollama_button = QPushButton("Start Ollama")
@@ -3588,10 +4416,28 @@ class MainWindow(QMainWindow):
         run_buttons.addWidget(self.run_button)
         run_buttons.addWidget(self.cancel_button)
         run_buttons.addWidget(self.save_button)
+        run_buttons.addWidget(self.export_csv_button)
+        run_buttons.addWidget(self.export_html_button)
         run_buttons.addWidget(self.refresh_button)
         run_buttons.addWidget(self.start_ollama_button)
         run_buttons.addStretch()
         layout.addLayout(run_buttons)
+
+        # Opt-in per-template time budget. Default 0 = no limit: a
+        # limit needs a concrete reason, and here the user sets it.
+        # When set and a template's jobs run past it, that template's
+        # jobs stop with "time budget reached" and the run carries on
+        # with the next template.
+        budget_row = QHBoxLayout()
+        budget_row.addWidget(QLabel("Stop a template after"))
+        self.budget_spin = QSpinBox()
+        self.budget_spin.setRange(0, 600)
+        self.budget_spin.setValue(0)
+        self.budget_spin.setSuffix(" minutes")
+        budget_row.addWidget(self.budget_spin)
+        budget_row.addWidget(QLabel("(0 = no limit)"))
+        budget_row.addStretch()
+        layout.addLayout(budget_row)
 
         # ---- Pull a model ----
         pull_row = QHBoxLayout()
@@ -3663,11 +4509,26 @@ class MainWindow(QMainWindow):
         history_layout.addLayout(history_top)
         self.history_list = QListWidget()
         self.history_list.itemClicked.connect(self.on_history_run_clicked)
+        self.history_list.currentItemChanged.connect(
+            self._update_delete_button)
         history_layout.addWidget(self.history_list)
         self.history_view = QTextEdit()
         self.history_view.setReadOnly(True)
         self.history_view.setPlainText("Pick a run to see its scores.")
         history_layout.addWidget(self.history_view)
+        # Deleting a run removes its file and its media folder, then
+        # rebuilds the model's profile from the runs that are left.
+        # The button stays disabled while a run is in progress, so a
+        # run's files can never be deleted under it.
+        history_bottom = QHBoxLayout()
+        self.delete_run_button = QPushButton("Delete run")
+        self.delete_run_button.clicked.connect(self.delete_selected_run)
+        self.delete_run_button.setEnabled(False)
+        self.store_size_label = QLabel("Results use —")
+        history_bottom.addWidget(self.delete_run_button)
+        history_bottom.addWidget(self.store_size_label)
+        history_bottom.addStretch()
+        history_layout.addLayout(history_bottom)
 
         # ---- Profiles tab ----
         profiles_tab = QWidget()
@@ -3694,6 +4555,42 @@ class MainWindow(QMainWindow):
         self.profile_view.setReadOnly(True)
         self.profile_view.setPlainText("Pick a model to see its profile.")
         profiles_layout.addWidget(self.profile_view)
+
+        # ---- Compare tab ----
+        compare_tab = QWidget()
+        tabs.addTab(compare_tab, "Compare")
+        compare_layout = QVBoxLayout(compare_tab)
+        compare_layout.addWidget(QLabel(
+            "Two models side by side: their latest score on each "
+            "template they ran, plus their overall score and speed. "
+            "Pick two different models to compare."
+        ))
+        compare_top = QHBoxLayout()
+        self.compare_model_a = QComboBox()
+        self.compare_model_a.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.compare_model_a.currentIndexChanged.connect(self._update_compare)
+        self.compare_model_b = QComboBox()
+        self.compare_model_b.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.compare_model_b.currentIndexChanged.connect(self._update_compare)
+        compare_top.addWidget(QLabel("Model 1:"))
+        compare_top.addWidget(self.compare_model_a)
+        compare_top.addWidget(QLabel("Model 2:"))
+        compare_top.addWidget(self.compare_model_b)
+        compare_top.addStretch()
+        compare_layout.addLayout(compare_top)
+        self.compare_message = QLabel("")
+        self.compare_message.setWordWrap(True)
+        compare_layout.addWidget(self.compare_message)
+        self.compare_table = QTableWidget(0, 3)
+        self.compare_table.setHorizontalHeaderLabels(
+            ["Template", "Model 1", "Model 2"])
+        self.compare_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.compare_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        compare_header = self.compare_table.horizontalHeader()
+        compare_header.setSectionResizeMode(0, QHeaderView.Stretch)
+        compare_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        compare_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        compare_layout.addWidget(self.compare_table)
 
         # ---- Providers tab ----
         providers_tab = QWidget()
@@ -3825,7 +4722,80 @@ class MainWindow(QMainWindow):
         self.refresh_models()
         self.refresh_history()
         self.refresh_profiles()
+        self.refresh_compare()
         self.refresh_providers()
+        self._build_menu_bar()
+        self._build_shortcuts()
+
+    def closeEvent(self, event):
+        # Save the window's size and position so the next launch
+        # opens where this one left off.
+        settings = QSettings("BrokeNBored", APP_NAME)
+        settings.setValue("geometry", self.saveGeometry())
+        super().closeEvent(event)
+
+    def _build_menu_bar(self):
+        """A minimal menu bar: File (Save report, Quit), View (Dark
+        mode), Help (About)."""
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("File")
+        self.save_report_action = QAction("Save report", self)
+        self.save_report_action.setShortcut(QKeySequence("Ctrl+S"))
+        self.save_report_action.triggered.connect(self.save_report)
+        self.save_report_action.setEnabled(False)
+        file_menu.addAction(self.save_report_action)
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+        view_menu = menu_bar.addMenu("View")
+        self.dark_mode_action = QAction("Dark mode", self)
+        self.dark_mode_action.setCheckable(True)
+        self.dark_mode_action.setChecked(self.dark_mode)
+        self.dark_mode_action.triggered.connect(self._toggle_dark_mode)
+        view_menu.addAction(self.dark_mode_action)
+        help_menu = menu_bar.addMenu("Help")
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
+    def _toggle_dark_mode(self, checked):
+        """The View menu's Dark mode toggle: restyle the whole window
+        and remember the choice, so the next launch opens the same way."""
+        self.dark_mode = checked
+        apply_theme(checked)
+        settings = QSettings("BrokeNBored", APP_NAME)
+        settings.setValue("dark_mode", checked)
+
+    def _build_shortcuts(self):
+        """Keyboard shortcuts. Ctrl+S lives on the File menu action;
+        Ctrl+R and Esc are window shortcuts.
+
+        Ctrl+R starts a run only when no run is in progress — during
+        a run it is a no-op, same as the disabled Run button. Esc
+        cancels a running run and does nothing when no run is running.
+        """
+        self.run_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        self.run_shortcut.activated.connect(self._shortcut_run)
+        self.cancel_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self.cancel_shortcut.activated.connect(self.cancel_run)
+
+    def _shortcut_run(self):
+        if self.worker is None:
+            self.start_run()
+
+    def about_text(self):
+        """The About box text, built from __version__ (kept separate
+        from show_about so it can be checked without opening a dialog)."""
+        return (
+            f"{APP_NAME} v{__version__}\n\n"
+            "Benchmark the Ollama models on this PC, and cloud "
+            "providers' models too.\n\n"
+            "Nothing is ticked by default. Tick the models and the "
+            "test templates you want, then press Run."
+        )
+
+    def show_about(self):
+        QMessageBox.about(self, f"About {APP_NAME}", self.about_text())
 
     # -- models and templates --------------------------------------------
 
@@ -3858,6 +4828,9 @@ class MainWindow(QMainWindow):
             self.template_list.addItem(item)
         self.template_warnings = warnings
         self.update_template_availability()
+        # A refresh rebuilds the list from scratch, so the filter
+        # text the user already typed applies to the new items too.
+        self._apply_template_filter()
         return warnings
 
     def refresh_models(self):
@@ -3921,6 +4894,9 @@ class MainWindow(QMainWindow):
             )
             item.setData(Qt.UserRole, target)
             self.model_list.addItem(item)
+        # A refresh rebuilds the list from scratch, so the filter
+        # text the user already typed applies to the new items too.
+        self._apply_model_filter()
         if not self.templates:
             self.status_label.setText(NO_TEMPLATES_MESSAGE)
             self.run_button.setEnabled(False)
@@ -3950,6 +4926,24 @@ class MainWindow(QMainWindow):
         missing from the cache."""
         save_capabilities({})
         self.refresh_models()
+
+    def _apply_list_filter(self, filter_box, list_widget):
+        """Hide the items that do not match the filter text. Hidden,
+        never removed: removing an item would lose its tick, and the
+        grey-out logic iterates every item either way, hidden or not.
+        The match is against the item text — model labels carry their
+        capability brackets in the text, so filtering "vision" finds
+        every vision model."""
+        term = filter_box.text().strip().lower()
+        for row in range(list_widget.count()):
+            item = list_widget.item(row)
+            item.setHidden(bool(term) and term not in item.text().lower())
+
+    def _apply_model_filter(self, _text=""):
+        self._apply_list_filter(self.model_filter, self.model_list)
+
+    def _apply_template_filter(self, _text=""):
+        self._apply_list_filter(self.template_filter, self.template_list)
 
     def update_template_availability(self):
         """Grey out the templates no ticked model can run.
@@ -4051,6 +5045,11 @@ class MainWindow(QMainWindow):
         if needs_ollama and not ollama_reachable():
             self.status_label.setText(OLLAMA_DOWN_RUN_MESSAGE)
             return
+        # The cost guard: a provider run shows its estimated cost
+        # first and asks to confirm when it is over the threshold
+        # (or when no prices are saved, so the cost is unknown).
+        if not self._confirm_provider_cost(targets, templates):
+            return
         # Sorting stays OFF while the run builds the table: a live sort
         # moves rows mid-update and later setItem calls land on the wrong
         # model. It goes back on when the run finishes.
@@ -4060,6 +5059,9 @@ class MainWindow(QMainWindow):
         self.result_order = []
         self.detail_view.setPlainText("Run in progress...")
         self.save_button.setEnabled(False)
+        self.save_report_action.setEnabled(False)
+        self.export_csv_button.setEnabled(False)
+        self.export_html_button.setEnabled(False)
         self.run_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.select_all_button.setEnabled(False)
@@ -4069,8 +5071,10 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(True)
         self.progress_bar.setValue(0)
         self.worker = BenchWorker(
-            targets, templates, self.sys_id, self.machine, get_results_dir()
+            targets, templates, self.sys_id, self.machine, get_results_dir(),
+            time_budget_seconds=self._time_budget_seconds(),
         )
+        self._update_delete_button()
         self.worker.model_started.connect(self.on_model_started)
         self.worker.template_done.connect(self.on_template_done)
         self.worker.model_done.connect(self.on_model_done)
@@ -4083,6 +5087,74 @@ class MainWindow(QMainWindow):
             self.worker.request_cancel()
             self.cancel_button.setEnabled(False)
             self.status_label.setText("Stopping after the current task...")
+
+    def _time_budget_seconds(self):
+        """The per-template time budget in seconds, or None when the
+        control is 0 (no limit — the default)."""
+        minutes = self.budget_spin.value()
+        return minutes * 60 if minutes else None
+
+    def _confirm_provider_cost(self, targets, templates):
+        """The cost guard: a run with provider models shows its
+        estimated cost before it starts. Over the $1.00 threshold —
+        or when no prices are saved, so the cost is unknown — it asks
+        to confirm, naming the estimate and the models; under the
+        threshold it starts with no extra step and the estimate shows
+        in the status line instead. Returns False when the user says
+        no (or when there is nothing to confirm, True)."""
+        provider_targets = [t for t in targets if t["kind"] == "provider"]
+        if not provider_targets:
+            return True
+        estimate = estimate_run_cost(provider_targets, templates)
+        lines = ["This run will use provider models, which cost real money:"]
+        for entry in estimate["per_model"]:
+            if entry["has_prices"]:
+                lines.append(
+                    f"  {entry['label']}: about {fmt_cost(entry['cost'])} "
+                    f"(about {fmt_tokens(entry['prompt_tokens'])} tokens in, "
+                    f"{fmt_tokens(entry['completion_tokens'])} out)"
+                )
+            else:
+                lines.append(
+                    f"  {entry['label']}: no prices saved — cost unknown"
+                )
+        if estimate["unknown"]:
+            lines.append("")
+            lines.append(
+                "No prices are saved for "
+                + ", ".join(estimate["unknown"])
+                + ", so the total cost is unknown."
+            )
+            needs_confirm = True
+        elif estimate["total"] > COST_CONFIRM_THRESHOLD_USD:
+            lines.append("")
+            lines.append(
+                f"Estimated total: about {fmt_cost(estimate['total'])} — "
+                f"over the {fmt_cost(COST_CONFIRM_THRESHOLD_USD)} "
+                "confirmation threshold."
+            )
+            needs_confirm = True
+        else:
+            needs_confirm = False
+        if not needs_confirm:
+            if estimate["total"] < 0.01:
+                cost_text = "less than a cent"
+            else:
+                cost_text = f"about {fmt_cost(estimate['total'])}"
+            self.status_label.setText(
+                f"Estimated provider cost: {cost_text} — starting the run."
+            )
+            return True
+        lines.append("")
+        lines.append("Run anyway?")
+        answer = QMessageBox.question(
+            self, "Confirm provider run", "\n".join(lines),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            self.status_label.setText("Run cancelled.")
+            return False
+        return True
 
     # -- start Ollama ----------------------------------------------------
 
@@ -4197,6 +5269,9 @@ class MainWindow(QMainWindow):
         self.clear_templates_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.save_button.setEnabled(bool(self.results))
+        self.save_report_action.setEnabled(bool(self.results))
+        self.export_csv_button.setEnabled(bool(self.results))
+        self.export_html_button.setEnabled(bool(self.results))
         self.table.setSortingEnabled(True)
         if reason == "done":
             self.status_label.setText("Done. Press Save report to keep the results.")
@@ -4219,6 +5294,8 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.refresh_history()
         self.refresh_profiles_for_run()
+        self.refresh_compare()
+        self._update_delete_button()
 
     def refresh_profiles_for_run(self):
         """Rebuild the profiles of every model this run touched."""
@@ -4260,7 +5337,23 @@ class MainWindow(QMainWindow):
                 )
                 continue
             score = run.get("template_score")
-            if score is None:
+            not_run = run.get("not_run", 0) or 0
+            budget_stopped = run.get("budget_stopped", 0) or 0
+            if score is None and not_run:
+                header = (
+                    f"\n{run.get('template_name', template_id)}: not run "
+                    f"({not_run} {'task' if not_run == 1 else 'tasks'} "
+                    "not run — test file missing)"
+                )
+            elif score is None and budget_stopped:
+                header = (
+                    f"\n{run.get('template_name', template_id)}: "
+                    f"time budget reached "
+                    f"({budget_stopped} "
+                    f"{'task' if budget_stopped == 1 else 'tasks'} stopped "
+                    "before they ran)"
+                )
+            elif score is None:
                 header = (
                     f"\n{run.get('template_name', template_id)}: no scoring, "
                     f"{fmt_toks(run.get('avg_decode_tok_s'))} tok/s"
@@ -4268,9 +5361,16 @@ class MainWindow(QMainWindow):
             else:
                 header = (
                     f"\n{run.get('template_name', template_id)}: {score:.0f}% "
-                    f"({run.get('passed')}/{run.get('total')}), "
+                    f"({run.get('passed')}/{run.get('total')}"
+                    f"{_not_run_suffix(not_run)}), "
                     f"{fmt_toks(run.get('avg_decode_tok_s'))} tok/s"
                 )
+                if budget_stopped:
+                    header += (
+                        f" — time budget reached "
+                        f"({budget_stopped} "
+                        f"{'task' if budget_stopped == 1 else 'tasks'} stopped)"
+                    )
             if run.get("total_tokens") is not None:
                 header += (
                     f", {fmt_tokens(run.get('prompt_tokens'))} in / "
@@ -4281,7 +5381,16 @@ class MainWindow(QMainWindow):
             lines.append(header)
             for task in run.get("tasks", []):
                 passed = task.get("passed")
-                mark = "pass" if passed is True else ("fail" if passed is False else "run")
+                if passed is True:
+                    mark = "pass"
+                elif passed is False:
+                    mark = "fail"
+                elif is_not_run(task):
+                    mark = "not run"
+                elif is_budget_stopped(task):
+                    mark = "time budget reached"
+                else:
+                    mark = "run"
                 note = ""
                 if task.get("image_file"):
                     note = " (image saved)"
@@ -4292,7 +5401,8 @@ class MainWindow(QMainWindow):
                     f"({fmt_toks(task.get('decode_tok_s'))} tok/s){note}"
                 )
                 detail = task.get("detail") or ""
-                if passed is False and detail:
+                if (passed is False or is_not_run(task)
+                        or is_budget_stopped(task)) and detail:
                     lines.append(f"       {detail}")
                 for turn in task.get("turns", []):
                     turn_passed = turn.get("passed")
@@ -4314,6 +5424,8 @@ class MainWindow(QMainWindow):
             self.refresh_history()
         elif self.tabs.tabText(index) == "Profiles":
             self.refresh_profiles()
+        elif self.tabs.tabText(index) == "Compare":
+            self.refresh_compare()
         elif self.tabs.tabText(index) == "Providers":
             # Pick up outside edits to providers.json (a hand edit, or
             # another copy of the app), but only when the file actually
@@ -4343,6 +5455,50 @@ class MainWindow(QMainWindow):
         elif models:
             self.history_model_combo.setCurrentIndex(0)
         self.on_history_model_changed()
+        self._update_store_size()
+        self._update_delete_button()
+
+    def _update_store_size(self):
+        """The size of the results store, on the Past runs tab."""
+        self.store_size_label.setText(
+            f"Results use {fmt_store_size(store_size(get_results_dir()))}"
+        )
+
+    def _update_delete_button(self, _current=None, _previous=None):
+        """Delete is enabled only when a run is selected and no run
+        is in progress — a run's files are never deleted under it."""
+        selected = self.history_list.currentItem() is not None
+        self.delete_run_button.setEnabled(
+            selected and self.worker is None
+        )
+
+    def delete_selected_run(self):
+        """Delete the selected run: its file and its media folder go,
+        then the model's profile rebuilds from the runs that are
+        left. Asks to confirm first — deletion cannot be undone."""
+        item = self.history_list.currentItem()
+        if item is None:
+            return
+        if self.worker is not None:
+            return
+        path = item.data(Qt.UserRole)
+        slug = self.history_model_combo.currentData()
+        answer = QMessageBox.question(
+            self, "Delete this run?",
+            "Delete this run? Its file and any images or audio it saved "
+            "will be removed, and the model's profile will be rebuilt "
+            "from the runs that are left. This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        delete_run_file(path)
+        if slug:
+            write_profile(get_results_dir(), slug)
+        self.refresh_history()
+        self.refresh_profiles()
+        self.history_view.setPlainText("Run deleted.")
+        self.status_label.setText("Run deleted.")
 
     def on_history_model_changed(self, _index=None):
         slug = self.history_model_combo.currentData()
@@ -4353,10 +5509,21 @@ class MainWindow(QMainWindow):
         runs = list_history_runs(get_results_dir(), slug)
         for run in runs:
             score = run["score"]
-            if score is None:
+            not_run = run.get("not_run", 0) or 0
+            budget_stopped = run.get("budget_stopped", 0) or 0
+            if score is None and not_run:
+                score_text = "not run"
+            elif score is None and budget_stopped:
+                score_text = "time budget reached"
+            elif score is None:
                 score_text = "no scoring"
             else:
-                score_text = f"{score:.0f}% ({run.get('passed')}/{run.get('total')})"
+                score_text = (
+                    f"{score:.0f}% ({run.get('passed')}/{run.get('total')}"
+                    f"{_not_run_suffix(not_run)})"
+                )
+                if budget_stopped:
+                    score_text += ", time budget reached"
             stamp = (run["timestamp"] or "").replace("T", " ")
             item = QListWidgetItem(
                 f"{run['system_id']} — {stamp} — {run['template_name']} ({score_text})"
@@ -4420,6 +5587,120 @@ class MainWindow(QMainWindow):
             self.profile_view.setPlainText("No runs yet for this model.")
             return
         self.on_profile_model_changed()
+
+    # -- compare ---------------------------------------------------------
+
+    def refresh_compare(self):
+        """Rebuild the Compare tab's model dropdowns from the models
+        that have runs, keeping the current picks when they still
+        exist. Both dropdowns start unpicked — nothing is selected
+        by default."""
+        results_dir = get_results_dir()
+        current_a = self.compare_model_a.currentData()
+        current_b = self.compare_model_b.currentData()
+        models = list_history_models(results_dir)
+        names = {}
+        for slug in models:
+            runs = list_history_runs(results_dir, slug)
+            name = slug
+            if runs:
+                data = load_run_file(runs[0]["path"])
+                if data and data.get("model"):
+                    name = data["model"]
+            names[slug] = name
+        for combo, current in ((self.compare_model_a, current_a),
+                               (self.compare_model_b, current_b)):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— pick a model —", None)
+            for slug in models:
+                combo.addItem(names[slug], slug)
+            combo.blockSignals(False)
+            if current in models:
+                combo.setCurrentIndex(models.index(current) + 1)
+        self._update_compare()
+
+    def _update_compare(self, _index=None):
+        """Fill the compare table from the two picked models, or show
+        a plain message when there is nothing to compare yet. Picking
+        the same model twice shows a message, never a duplicated
+        table."""
+        slug_a = self.compare_model_a.currentData()
+        slug_b = self.compare_model_b.currentData()
+        self.compare_table.setRowCount(0)
+        if not slug_a or not slug_b:
+            if list_history_models(get_results_dir()):
+                self.compare_message.setText("Pick two models to compare.")
+            else:
+                self.compare_message.setText(
+                    "No models have run yet. Run a test first."
+                )
+            return
+        if slug_a == slug_b:
+            self.compare_message.setText(
+                "Pick two different models to compare."
+            )
+            return
+        compared = compare_models(get_results_dir(), slug_a, slug_b)
+        if compared is None:
+            self.compare_message.setText(
+                "One of these models has no runs yet."
+            )
+            return
+        self.compare_message.setText("")
+        self.compare_table.setHorizontalHeaderLabels(
+            ["Template", compared["name_a"], compared["name_b"]]
+        )
+        rows = compared["rows"]
+        self.compare_table.setRowCount(len(rows) + 2)
+        for row_index, row in enumerate(rows):
+            self.compare_table.setItem(
+                row_index, 0, QTableWidgetItem(row["name"])
+            )
+            for col, key, not_run_key, missing_key in (
+                (1, "score_a", "not_run_a", "missing_a"),
+                (2, "score_b", "not_run_b", "missing_b"),
+            ):
+                if row[missing_key]:
+                    text = "—"
+                    value = None
+                elif row[not_run_key]:
+                    text = "not run"
+                    value = None
+                else:
+                    text = fmt_score(row[key])
+                    value = row[key]
+                self.compare_table.setItem(
+                    row_index, col, NumericItem(value, text)
+                )
+        overall_row = len(rows)
+        self.compare_table.setItem(
+            overall_row, 0, QTableWidgetItem("Overall score")
+        )
+        self.compare_table.setItem(
+            overall_row, 1,
+            NumericItem(compared["overall_a"],
+                        fmt_score(compared["overall_a"])),
+        )
+        self.compare_table.setItem(
+            overall_row, 2,
+            NumericItem(compared["overall_b"],
+                        fmt_score(compared["overall_b"])),
+        )
+        speed_row = len(rows) + 1
+        self.compare_table.setItem(
+            speed_row, 0, QTableWidgetItem("Avg decode tok/s")
+        )
+        self.compare_table.setItem(
+            speed_row, 1,
+            NumericItem(compared["speed_a"],
+                        fmt_toks(compared["speed_a"])),
+        )
+        self.compare_table.setItem(
+            speed_row, 2,
+            NumericItem(compared["speed_b"],
+                        fmt_toks(compared["speed_b"])),
+        )
 
     # -- providers -------------------------------------------------------
 
@@ -4792,10 +6073,259 @@ class MainWindow(QMainWindow):
             json.dump(build_report_data(results), handle, indent=2)
         self.status_label.setText(f"Report saved: {txt_path}")
 
+    def export_csv(self):
+        """Export the current results to a CSV file, via a file
+        dialog. Plain message when there is nothing to export."""
+        if not self.results:
+            self.status_label.setText(
+                "Nothing to export yet — run a test first."
+            )
+            return
+        folder = get_results_dir()
+        os.makedirs(folder, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+        default = os.path.join(folder, f"bench-results-{stamp}.csv")
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Export results as CSV", default, "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        results = [self.results[name] for name in self.result_order]
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(render_export_csv(results))
+        self.status_label.setText(f"Exported: {path}")
+
+    def export_html(self):
+        """Export the current results to an HTML file, via a file
+        dialog. Plain message when there is nothing to export."""
+        if not self.results:
+            self.status_label.setText(
+                "Nothing to export yet — run a test first."
+            )
+            return
+        folder = get_results_dir()
+        os.makedirs(folder, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+        default = os.path.join(folder, f"bench-results-{stamp}.html")
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Export results as HTML", default, "HTML files (*.html)"
+        )
+        if not path:
+            return
+        results = [self.results[name] for name in self.result_order]
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(render_export_html(results))
+        self.status_label.setText(f"Exported: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Headless mode: the same worker with no window, for scripts and cron
+# ---------------------------------------------------------------------------
+
+def _split_names(value):
+    """A comma-separated flag value into a list of names."""
+    return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+
+def resolve_headless_targets(names):
+    """Turn --models names into benchmark targets.
+
+    A name matching a saved provider model ("provider / model-id") is
+    a provider target; anything else is a local Ollama model, screened
+    for its capabilities the same way the window does. Returns
+    (targets, error): error is a plain message when a name matches
+    nothing or Ollama is down, else None.
+    """
+    providers, _warnings = load_providers()
+    provider_targets = {}
+    for provider in providers:
+        for model_entry in provider.get("models", []):
+            label = provider_label(provider["name"], model_entry["id"])
+            provider_targets[label] = provider_target(provider, model_entry)
+    targets = {}
+    ollama_names = []
+    for name in names:
+        if name in provider_targets:
+            targets[name] = provider_targets[name]
+            continue
+        ollama_names.append(name)
+    if ollama_names:
+        # Provider-only runs skip this check — they do not need
+        # Ollama at all, same as the window.
+        if not ollama_reachable():
+            return None, OLLAMA_DOWN_RUN_MESSAGE
+        available, _source = list_models()
+        caps_cache = load_capabilities()
+        screened = False
+        for name in ollama_names:
+            if name not in available:
+                known = sorted(set(available)) + sorted(provider_targets)
+                if known:
+                    detail = "Models I know about: " + ", ".join(known)
+                else:
+                    detail = ("No models found — is Ollama running, and "
+                              "are any providers saved?")
+                return None, f"Model not found: {name}.\n{detail}"
+            caps = screen_ollama_model(name, caps_cache)
+            screened = True
+            targets[name] = ollama_target(name, caps)
+        if screened:
+            save_capabilities(caps_cache)
+    # Back in the order the user named them.
+    return [targets[name] for name in names], None
+
+
+def run_headless(args):
+    """Run a benchmark with no window. Returns the exit code: 0 when
+    the run completed, 1 when it did not (bad names, Ollama down, or
+    the run was stopped). Prints a plain summary to stdout.
+
+    No QApplication is created here — only a QCoreApplication, which
+    needs no window and no display, to run the worker's event loop.
+    """
+    model_names = _split_names(args.models)
+    template_ids = _split_names(args.templates)
+    if not model_names:
+        print("Headless mode needs --models: the models to test, "
+              "e.g. --models qwen3:0.6b")
+        return 1
+    if not template_ids:
+        print("Headless mode needs --templates: the test templates "
+              "to run, e.g. --templates coding,math")
+        return 1
+    templates, warnings = load_templates()
+    for warning in warnings:
+        print(f"Warning: {warning}")
+    by_id = {t["id"]: t for t in templates}
+    chosen = []
+    for template_id in template_ids:
+        template = by_id.get(template_id)
+        if template is None:
+            print(f"Template not found: {template_id}.")
+            print("Templates I know about: " + ", ".join(sorted(by_id)))
+            return 1
+        chosen.append(template)
+    targets, error = resolve_headless_targets(model_names)
+    if error is not None:
+        print(error)
+        return 1
+    results_dir = get_results_dir()
+    machine = machine_info()
+    sys_id = system_id(machine)
+    results = {}
+    order = []
+    run_files = []
+
+    core_app = QCoreApplication(sys.argv)
+    # A no-op timer keeps the event loop waking up, so Ctrl+C reaches
+    # Python instead of waiting behind Qt.
+    keepalive = QTimer()
+    keepalive.setInterval(500)
+    keepalive.timeout.connect(lambda: None)
+    keepalive.start()
+
+    worker = BenchWorker(targets, chosen, sys_id, machine, results_dir)
+
+    def on_model_started(name):
+        print(f"Testing {name}...")
+
+    def on_template_done(name, run_data, path):
+        run_files.append(path)
+        score = run_data.get("template_score")
+        template_name = run_data.get("template_name", name)
+        if score is None and run_data.get("not_run"):
+            print(f"  {template_name}: not run (test file missing)")
+        elif score is None:
+            print(f"  {template_name}: no score")
+        else:
+            print(f"  {template_name}: {score:.0f}%")
+
+    def on_model_done(name, result):
+        results[name] = result
+        order.append(name)
+
+    state = {"reason": None}
+
+    def on_run_finished(reason):
+        state["reason"] = reason
+        core_app.quit()
+
+    worker.model_started.connect(on_model_started)
+    worker.template_done.connect(on_template_done)
+    worker.model_done.connect(on_model_done)
+    worker.run_finished.connect(on_run_finished)
+
+    def on_interrupt(_signum, _frame):
+        # Ctrl+C stops after the current task, like the Cancel button.
+        worker.request_cancel()
+
+    signal.signal(signal.SIGINT, on_interrupt)
+    worker.start()
+    core_app.exec()
+    worker.wait()
+
+    reason = state["reason"]
+    # Profiles rebuild after a run, same as the window does.
+    for name in order:
+        write_profile(results_dir, slugify_model(name))
+    print()
+    if reason == "ollama_down":
+        print(OLLAMA_DIED_MESSAGE)
+        return 1
+    if reason != "done":
+        print("Run stopped before it finished.")
+        return 1
+    for name in order:
+        result = results[name]
+        if result["status"] != "done":
+            print(f"{name}: {result['status']}")
+            continue
+        print(f"{name}: {fmt_score(result.get('overall_score'))} overall, "
+              f"{fmt_toks(result.get('avg_decode_tok_s'))} tok/s")
+    print(f"Run files saved under {results_dir}")
+    return 0
+
 
 def main():
+    parser = argparse.ArgumentParser(
+        prog="ollama_system_test.py",
+        description=(
+            "Benchmark the Ollama models on this PC, and cloud "
+            "providers' models too. With no flags it opens the window; "
+            "with --headless it runs a benchmark with no window, for "
+            "scripts and cron."
+        ),
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="run with no window: the same benchmark, with a plain "
+        "summary printed to stdout",
+    )
+    parser.add_argument(
+        "--models",
+        help="comma-separated models to test in headless mode, "
+        "e.g. qwen3:0.6b — a provider model is written "
+        "\"provider / model-id\"",
+    )
+    parser.add_argument(
+        "--templates",
+        help="comma-separated template ids to run in headless mode, "
+        "e.g. coding,math",
+    )
+    args = parser.parse_args()
+    # The media folders exist from the first launch, window or not.
+    ensure_media_dirs()
+    if args.headless:
+        sys.exit(run_headless(args))
+    if args.models or args.templates:
+        print("--models and --templates only apply with --headless; "
+              "opening the window.", file=sys.stderr)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    # The saved theme applies before the window is built, so a
+    # dark-mode user never sees a light flash.
+    settings = QSettings("BrokeNBored", APP_NAME)
+    apply_theme(settings.value("dark_mode", False, type=bool))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

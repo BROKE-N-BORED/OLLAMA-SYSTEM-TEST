@@ -1,0 +1,1 @@
+{"id": "custom", "name": "Custom", "description": "test template", "num_predict": 200, "scored": true, "tasks": [{"id": "t1", "prompt": "Say the word zebra.", "rule": "contains", "expected": "zebra"}]}

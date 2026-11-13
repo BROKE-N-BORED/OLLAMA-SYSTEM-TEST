@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v5
+# OLLAMA SYSTEM TEST v9
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -6,6 +6,48 @@ and the same profiles. It lists the models you have pulled, plus the
 models on any provider you add, runs each one through test templates,
 scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
+
+![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v9 is a polish release, no new templates: filter boxes above the
+model and template lists on the Benchmark tab, so you can type to
+find one instead of scrolling (ticked items keep their ticks while
+filtered, and the grey-outs keep working); a dark theme on the View
+menu, remembered across restarts; the README's prompt count fixed
+to 103 for a full run; and the app creates the `images` and `audio`
+folders on its first launch, so there is somewhere to put your own
+test image or recording.
+
+v8 is a management release, no new templates: a run can be deleted
+from the Past runs tab (its file and any images or audio it saved go
+with it, and the model's profile rebuilds from the runs that are
+left), and the tab shows how much disk the results store uses;
+pressing Run with provider models ticked shows the estimated cost
+first and asks to confirm when it is over $1.00 (or when no prices
+are saved, so the cost is unknown); an opt-in per-template time
+budget stops a template's jobs at the limit with a plain "time budget
+reached" status, default off; and the current results export to CSV
+and HTML, with a Compare tab putting two models' per-template scores
+side by side.
+
+v7 is a usability release, no new templates: you can run a benchmark
+with no window at all (`--headless`, for scripts and cron — see below);
+the window shows its version in the title bar ("OLLAMA SYSTEM TEST v7")
+and has an icon; the window opens where you left it (size and position
+survive a restart); there are keyboard shortcuts (Ctrl+R Run, Ctrl+S
+Save report, Esc Cancel) and a menu bar (File, Help, About); and the
+app ships desktop files — double-click Install-OST to install it, then
+open OST from your app menu.
+
+v6 is a fix release, no new templates: a missing test image or audio
+clip now records its tasks as "not run" instead of failing them, so a
+run never scores 0% for a missing file; `providers.json` (which holds
+your API keys) is written atomically and is owner-only from the first
+byte; the verification suite lives in the repo under `tests/` and runs
+on every push; launching without PySide6 prints a plain message telling
+you to run `install.sh` instead of a traceback; `install.sh` checks the
+install worked before saying it is done; and PySide6-Essentials is
+pinned to 6.12.0, the version the suite was verified against.
 
 v5 adds capability screening: the app checks what each model can
 actually do (vision, tool calling, long context, image generation,
@@ -24,15 +66,38 @@ Open a terminal in this folder, then type:
     sh install.sh
 
 It creates a private folder (.venv) for the one package the app needs
-(PySide6-Essentials). If it says python3-venv is missing, type this first:
+(PySide6-Essentials, pinned to 6.12.0 in `requirements.txt`). If it
+says python3-venv is missing, type this first:
 
     sudo apt install python3-venv
 
-Then run `sh install.sh` again.
+Then run `sh install.sh` again. install.sh checks the install worked
+(PySide6 imports, the app compiles) before it says it is done — if
+the check fails, it says so instead of reporting success. It also puts
+OST in your app menu, with its icon, so you can open it without a
+terminal. (If that step has a problem it says so and the app still
+runs from `sh run.sh`.)
+
+If you got the app by cloning the repo rather than from the Release
+zip, make the scripts runnable first — the exec bits do not survive
+a clone:
+
+    chmod +x install.sh run.sh
+
+(The Release zip already carries them, so a zip install needs no
+extra step.)
+
+You can also install by double-clicking Install-OST in the folder —
+it runs the same installer in a terminal window.
 
 ## Start it
 
     sh run.sh
+
+Or open OST from your app menu (install.sh puts it there). The window
+remembers its size and position: it opens where you left it. It opens
+light; View > Dark mode switches it to a dark theme, and the choice is
+remembered next time.
 
 ## How to use it
 
@@ -41,16 +106,33 @@ Then run `sh install.sh` again.
    Local Ollama models are listed by name; provider models are listed
    as "provider / model", for example `openai / gpt-4o-mini`. Models
    that can do more than plain text show it in brackets, for example
-   `qwen3-vl:2b-instruct [vision]`.
+   `qwen3-vl:2b-instruct [vision]`. The filter box above the list
+   narrows it as you type — filtering by "vision" finds every vision
+   model — and ticked models keep their ticks while filtered.
 2. Tick the test templates you want to run. Same rule: nothing is
    ticked to start with. Templates no ticked model can run are greyed
    out and cannot be ticked — tick a model that can run them and they
    light up again. With nothing ticked, everything shows enabled.
+   The filter box above the list narrows it as you type, and the
+   grey-outs keep working while a filter is on.
 3. Press Run. Each model runs each template in turn, one at a time.
    A full run (all templates, all models) takes a while — each model
-   answers roughly 80 prompts, and the 32K speed run takes minutes
-   on a CPU by design — so start with one model or one template to get
-   a feel for the speed, then run the rest.
+   answers 103 prompts (90 scored tasks, plus the extra turns in the
+   multi-turn and role-following templates, plus 3 speed runs), and
+   the 32K speed run takes minutes on a CPU by design — so start with
+   one model or one template to get a feel for the speed, then run
+   the rest. If any provider model is
+   ticked, the run shows its estimated cost first (from the prices
+   you saved and the tokens the chosen templates will use) and asks
+   you to confirm when the estimate is over $1.00 — or when no prices
+   are saved, so the cost is unknown. Under $1.00 it starts straight
+   away. The estimate covers text tokens only and is an upper bound:
+   a model usually stops well short of the most it is asked for, so
+   the real bill is usually lower. The "Stop a template after __
+   minutes" box is an opt-in time budget per template (0 = no limit,
+   the default): when set and a template's jobs run past it, that
+   template's jobs stop with "time budget reached" and the run
+   carries on with the next template.
 4. The table shows, for each model: overall score, average decode speed,
    and status. Click a model to see its per-template scores, which
    tasks passed or failed, and — for provider models — the tokens used
@@ -58,13 +140,41 @@ Then run `sh install.sh` again.
    as "not eligible for this model", never as a failure.
 5. Press Save report to keep a summary of the session. It writes two
    files into the `results` folder next to the app: a plain text report
-   and a JSON file.
+   and a JSON file. Export CSV and Export HTML save the same current
+   results — model, overall score, speed, status, and per-template
+   scores — as a spreadsheet file or a web page, wherever you choose.
 6. The Past runs tab lets you browse every run you have ever done,
-   grouped by model and by system.
+   grouped by model and by system. It also shows how much disk the
+   results store uses ("Results use 12.3 MB"). To remove a run, pick
+   it and press Delete run: its file and any images or audio it saved
+   are removed, and the model's profile rebuilds from the runs that
+   are left. Deleting asks to confirm first, and it is disabled while
+   a run is in progress.
 7. The Profiles tab shows each model's profile: latest and best scores,
    strengths and weaknesses, and a verdict written from its numbers.
    Profiles rebuild themselves after every run. Press Regenerate to
    rebuild one from the run files on disk at any time.
+8. The Compare tab puts two models side by side: pick two models and
+   it shows their latest score on each template they ran, plus their
+   overall score and speed. Picking the same model twice shows a
+   message instead of a duplicated table.
+9. Shortcuts: Ctrl+R runs, Ctrl+S saves the report, Esc cancels a
+   run. The File menu has Save report and Quit; Help has About, which
+   shows the version (also in the title bar).
+
+## Run it without the window (headless)
+
+For scripts and cron, the same benchmark runs with no window:
+
+    .venv/bin/python ollama_system_test.py --headless --models qwen3:0.6b --templates coding,math
+
+`--models` takes comma-separated model names; a provider model is
+written "provider / model-id", for example
+`--models "openai / gpt-4o-mini"`. `--templates` takes comma-separated
+template ids. It writes the same run files under `results/` (and
+rebuilds the profiles), prints a plain summary, and exits 0 when the
+run finished or 1 when it did not (unknown model or template, Ollama
+not running, or the run stopped). `--help` lists every flag.
 
 ## Capability screening
 
@@ -123,18 +233,29 @@ Your API keys live in `providers.json` next to the app. That file
 holds your keys: never share it, never upload it, never send it to
 anyone. The app never writes a key anywhere else — not into a run
 file, a report, a profile, or the status line — and the key is never
-shown on screen. When you edit a provider, the key field is left
-empty on purpose: leave it empty to keep the saved key, or type a new
-one to replace it.
+shown on screen. The file is written atomically and is readable only
+by you from the first byte, so a crash mid-save cannot lose your keys
+or leave them readable by anyone else. It is also in `.gitignore`,
+so a stray `git add .` cannot commit it. When you edit a provider,
+the key field is left empty on purpose: leave it empty to keep the
+saved key, or type a new one to replace it.
 
 Provider tests cost real API money. The details view shows the tokens
 each model used (prompt and completion, including the warmup call)
 and, when you set prices for the model, the estimated cost of the run.
-No prices set means tokens only — the app never invents a cost. Run
-files record the tokens and the prices used, so the cost stays
+No prices set means tokens only — the app never invents a cost. Before
+a run with provider models starts, the app shows the estimated cost
+for the models and templates you ticked: it counts the tokens the run
+will send (the prompts, plus the exact context lengths for the
+long-context and speed tests) and the most each call can answer, and
+prices them at the rates you saved. When the estimate is over $1.00,
+or when no prices are saved for a ticked provider model, the run asks
+you to confirm before it starts; under $1.00 it starts straight away.
+Run files record the tokens and the prices used, so the cost stays
 attached to the run even if prices change later. Image generation
 and audio calls are not token-counted by the app: those run files
-record what was returned, not a cost.
+record what was returned, not a cost, and the pre-run estimate does
+not cover them either.
 
 If a provider is down or a key is wrong, those models fail plainly
 ("provider X did not answer" / "provider X rejected the key") and the
@@ -209,6 +330,12 @@ and a shop-sign picture, both with known content). The audio test
 clips live in the `audio` folder — they are simple tone clips that
 prove the plumbing works; for a real transcription test, drop a
 recording of someone speaking into that folder and point a task at it.
+The app creates both folders on its first launch, so they are there
+waiting when you want to add your own image or clip.
+If a test image or clip is missing, the tasks that need it are
+recorded as "not run" — never as failures — and the template shows
+"not run" instead of a score. The app warns about the missing file
+when the templates load.
 
 ## Where results live
 
@@ -245,7 +372,9 @@ average speed, strengths (templates at 80% or better), weaknesses
 (templates under 50%), and a short verdict written from the numbers.
 For provider models it also totals the tokens used and the estimated
 cost across template runs. It changes as you test more; the run files
-underneath never do.
+underneath never do. Deleting a run from the Past runs tab removes
+that run's file and its media folder, and the profile rebuilds from
+the runs that are left — nothing else is touched.
 
 ## What the numbers mean
 
@@ -289,8 +418,31 @@ else you run. These are your own models on your own machine.
   the error.
 - A task says "failed": that task did not pass. Click the model to see
   why in the details.
+- A task says "not run": the test image or audio clip that task needs
+  is missing from the `images` or `audio` folder. Put the file back
+  (or re-download the Release zip, which carries them) and run again.
+  A "not run" task is not the model's fault and never counts toward
+  its score.
+- A template says "time budget reached": the per-template time budget
+  (the "Stop a template after __ minutes" box) ran out before that
+  template's jobs finished. The jobs that ran still count toward the
+  score; the ones that did not are not failures. Raise the budget —
+  or leave it at 0 for no limit — and run again.
 - A template shows "not eligible for this model": the model cannot run
   that test (no vision, no tools, and so on). It is not a failure.
   Tick a model that has the capability to run it.
 - Press Cancel any time to stop the run. Results so far stay in the table,
   and every finished template run is already saved.
+
+## Running the tests
+
+The verification suite lives in `tests/` and runs against fake Ollama
+and fake provider servers, so it needs no Ollama, no models, and no
+real provider account. From the repo root, with the app installed:
+
+    QT_QPA_PLATFORM=offscreen .venv/bin/python tests/run_tests.py
+
+It opens real windows offscreen, runs full benchmark runs against the
+fakes, and prints PASS/FAIL per check — exit code 0 means every check
+passed. It takes about 8 minutes. The same suite runs on every push
+via GitHub Actions (`.github/workflows/test.yml`).

@@ -1,0 +1,1 @@
+{"id": "badimage", "name": "Bad Image", "scored": true, "capability": "image_generation", "tasks": [{"id": "t1", "kind": "image_gen", "prompt": "x", "rule": "contains", "expected": "x"}]}

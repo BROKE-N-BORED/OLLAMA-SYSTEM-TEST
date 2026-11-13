@@ -1,0 +1,1 @@
+{"id": "badtools", "name": "Bad Tools", "scored": true, "capability": "tools", "tasks": [{"id": "t1", "kind": "tools", "prompt": "x", "rule": "contains", "expected": "x", "tools": [{"name": "t"}]}]}

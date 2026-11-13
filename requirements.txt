@@ -1,0 +1,3 @@
+# The one package OLLAMA SYSTEM TEST needs. Pinned to the version the
+# v6 verification suite was run against — do not unpin it.
+PySide6-Essentials==6.12.0

@@ -1,0 +1,1 @@
+{"id": "badrule", "name": "Bad Rule", "scored": true, "tasks": [{"id": "t1", "prompt": "x", "rule": "telepathy", "expected": "y"}]}

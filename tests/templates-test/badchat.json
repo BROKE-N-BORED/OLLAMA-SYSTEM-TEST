@@ -1,0 +1,1 @@
+{"id": "badchat", "name": "Bad Chat", "scored": true, "tasks": [{"id": "t1", "kind": "chat", "turns": [{"prompt": "hello"}]}]}

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=OST
+Comment=OLLAMA SYSTEM TEST — benchmark the Ollama models on this PC
+Exec=python3 -c "import os,subprocess,sys; a=sys.argv[1] if len(sys.argv)>1 else ''; d=os.path.dirname(a) or os.getcwd(); p=os.path.join(d,'.venv','bin','python'); p=p if os.path.exists(p) else 'python3'; subprocess.call([p,os.path.join(d,'ollama_system_test.py')],cwd=d)" %k
+Terminal=false
+Icon=ost-icon
+Categories=Utility;System;
