@@ -1,8 +1,10 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v9 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v10 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 968 v8 checks are carried over; the v9 sections
-are appended at the end (search/filter on the model + template lists,
-dark mode, README fixes + repo hygiene).
+answers per model. All 1005 v9 checks are carried over (the v9 sections
+sit at the end: search/filter on the model + template lists, dark mode,
+README fixes + repo hygiene); the v10 checks cover the real speech
+clips, transcript normalization, and the fixture generator keeping
+existing clips.
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -25,17 +27,21 @@ per check.
 """
 
 import csv
+from datetime import datetime, timedelta
 import hashlib
 import io
 import json
+import math
 import os
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+import wave
 
 # The suite lives in tests/ inside the repo; the app is at the repo
 # root, the parent of this folder. No hardcoded tree name.
@@ -348,6 +354,21 @@ def main():
           not app.score_contains("I know.", "no")[0])
     check("contains case-insensitive",
           app.score_contains("PARIS is nice.", "Paris")[0])
+    # ---------- v10: transcript normalization (T12) ----------
+    # Real transcription providers write spoken numbers as digits.
+    check("transcript_words spells digits out",
+          app.transcript_words("1, 2, 3.") == "one two three",
+          app.transcript_words("1, 2, 3."))
+    check("transcript_words keeps words, drops punctuation",
+          app.transcript_words("Hello world!") == "hello world")
+    check("transcript_words spells seventy",
+          app.transcript_words("near 70 degrees") == "near seventy degrees",
+          app.transcript_words("near 70 degrees"))
+    check("transcript_words leaves big numbers alone",
+          app.transcript_words("room 101") == "room 101")
+    check("digit transcript passes the count task",
+          app.score_task({"rule": "contains", "expected": "one two three"},
+                         app.transcript_words("1, 2, 3."))[0])
     check("numeric pass", app.score_numeric("He has 21 apples.", 21)[0])
     check("numeric float pass", app.score_numeric("150.0 miles", 150)[0])
     check("numeric fail", not app.score_numeric("He has 20 apples.", 21)[0])
@@ -1230,9 +1251,20 @@ def main():
     coding_hash = file_hash(coding_file)
     with open(coding_file, encoding="utf-8") as handle:
         coding_data = json.load(handle)
+    # "Later" must be later than the full run's own files, whenever
+    # the suite runs — a fixed 09:00 stamp only worked before 09:00
+    # (the v9 run was at 00:14; a 10:07 run failed both checks).
+    latest_stamp = max(
+        json.load(open(os.path.join(smart_dir, f), encoding="utf-8")).get(
+            "timestamp", "")
+        for f in os.listdir(smart_dir) if f.endswith(".json")
+    )
+    late_dt = datetime.fromisoformat(latest_stamp) + timedelta(days=1)
+    late_stamp = late_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    late_prefix = late_dt.strftime("%Y-%m-%d-%H%M%S")
     for stamp, template, name, template_score in (
-        ("2026-11-13T09:00:00", "coding", "Coding", 0.0),
-        ("2026-11-13T09:00:00", "math", "Math", 0.0),
+        (late_stamp, "coding", "Coding", 0.0),
+        (late_stamp, "math", "Math", 0.0),
     ):
         late = dict(coding_data)
         late.update({
@@ -1240,7 +1272,7 @@ def main():
             "timestamp": stamp, "template_score": template_score,
             "passed": 0, "total": 5,
         })
-        with open(os.path.join(smart_dir, f"2026-11-13-090000-{template}.json"),
+        with open(os.path.join(smart_dir, f"{late_prefix}-{template}.json"),
                   "w", encoding="utf-8") as handle:
             json.dump(late, handle)
     window.profile_regen_button.click()
@@ -1833,6 +1865,43 @@ def main():
     check("is_audio_bytes rejects garbage",
           not app.is_audio_bytes(b"this is not audio"))
     check("is_audio_bytes rejects empty bytes", not app.is_audio_bytes(b""))
+
+    # ---------- v10: the bundled clips are real speech (T12) ----------
+    # A pure sine tone has a near-constant amplitude envelope; speech
+    # varies a lot. Coefficient of variation of per-10ms-window RMS:
+    # the old tones measured 0.005-0.008, the speech clips 0.94-1.41.
+    def _wav_envelope_cv(path):
+        with wave.open(path, "rb") as handle:
+            rate = handle.getframerate()
+            raw = handle.readframes(handle.getnframes())
+        samples = struct.unpack("<%dh" % (len(raw) // 2), raw)
+        window = max(1, rate // 100)
+        rmss = []
+        for i in range(0, len(samples) - window + 1, window):
+            chunk = samples[i:i + window]
+            rmss.append(math.sqrt(
+                sum(s * s for s in chunk) / len(chunk)))
+        mean = sum(rmss) / len(rmss)
+        var = sum((r - mean) ** 2 for r in rmss) / len(rmss)
+        return math.sqrt(var) / mean if mean else 0.0
+
+    clip_names = ("clip-hello.wav", "clip-count.wav", "clip-weather.wav")
+    for clip_name in clip_names:
+        clip_path = os.path.join(PKG_DIR, "audio", clip_name)
+        clip_cv = _wav_envelope_cv(clip_path)
+        check(f"bundled {clip_name} is speech, not a tone",
+              clip_cv > 0.25, f"envelope CV={clip_cv:.3f}")
+    import make_fixtures
+    digests_before = {}
+    for clip_name in clip_names:
+        with open(os.path.join(PKG_DIR, "audio", clip_name), "rb") as handle:
+            digests_before[clip_name] = hashlib.sha256(handle.read()).hexdigest()
+    make_fixtures.build_fixtures()
+    for clip_name, digest in digests_before.items():
+        with open(os.path.join(PKG_DIR, "audio", clip_name), "rb") as handle:
+            digest_after = hashlib.sha256(handle.read()).hexdigest()
+        check(f"make_fixtures keeps existing {clip_name}",
+              digest_after == digest)
 
     # ---------- unit tests: long documents and padded prompts ----------
     needle = "The vault code is ZEBRA-7741."
@@ -3288,7 +3357,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 9", app.__version__ == "9",
+    check("__version__ is 10", app.__version__ == "10",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3302,8 +3371,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v9",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v9",
+    check("title bar shows OLLAMA SYSTEM TEST v10",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v10",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4689,10 +4758,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v9",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v9",
+        check("title bar shows v10",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v10",
               window9.windowTitle())
-        check("__version__ is 9", app.__version__ == "9", app.__version__)
+        check("__version__ is 10", app.__version__ == "10", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",

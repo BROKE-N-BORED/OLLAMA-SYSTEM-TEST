@@ -136,7 +136,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "9"
+__version__ = "10"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -1649,6 +1649,41 @@ def average_runs(runs):
 
 def _normalize(text):
     return " ".join(str(text).split()).lower()
+
+
+_ONES = ("zero", "one", "two", "three", "four", "five", "six", "seven",
+         "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+         "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+         "nineteen")
+_TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty",
+         "seventy", "eighty", "ninety")
+
+
+def _spell_number(value):
+    """0-99 as words; anything else stays digits."""
+    if 0 <= value < 20:
+        return _ONES[value]
+    if value < 100:
+        tens, ones = divmod(value, 10)
+        if ones:
+            return f"{_TENS[tens]} {_ONES[ones]}"
+        return _TENS[tens]
+    return str(value)
+
+
+def transcript_words(text):
+    """Normalize a transcript for scoring: spell digits out as words
+    and drop punctuation. Transcription providers write spoken numbers
+    as digits ("1, 2, 3") while the task expects words ("one two three")
+    — without this, a correct transcript fails. Only the scored copy is
+    normalized; the stored answer keeps the provider's own words."""
+    spelled = re.sub(
+        r"\b\d+\b",
+        lambda match: _spell_number(int(match.group(0))),
+        str(text),
+    )
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", spelled.lower())
+    return " ".join(cleaned.split())
 
 
 def score_contains(answer, expected):
@@ -3707,7 +3742,7 @@ class BenchWorker(QThread):
             except (ProviderError, ProviderUnreachable):
                 raise
             wall_s = time.monotonic() - t_start
-            passed, detail = score_task(task, transcript)
+            passed, detail = score_task(task, transcript_words(transcript))
             self._bump_progress(label, template, task["id"])
             return {
                 "id": task["id"],

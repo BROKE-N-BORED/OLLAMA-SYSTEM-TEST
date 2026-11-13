@@ -2,6 +2,12 @@
 providers.json
 capabilities.json
 
+# Environment files and key material — never committed.
+.env
+*.env
+*.key
+*.pem
+
 # Run results and profiles live on the machine, not in the repo.
 results/
 

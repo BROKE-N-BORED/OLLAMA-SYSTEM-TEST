@@ -327,9 +327,11 @@ audio, long_context) — only models with that capability can run it.
 
 The vision test images live in the `images` folder (a shapes picture
 and a shop-sign picture, both with known content). The audio test
-clips live in the `audio` folder — they are simple tone clips that
-prove the plumbing works; for a real transcription test, drop a
-recording of someone speaking into that folder and point a task at it.
+clips live in the `audio` folder — real spoken clips: "hello world",
+"one two three", and a weather sentence with the word "sunny" in it.
+They match the three transcribe tasks, so a working transcription
+provider should pass all three. You can still drop your own recording
+into that folder and point a task at it.
 The app creates both folders on its first launch, so they are there
 waiting when you want to add your own image or clip.
 If a test image or clip is missing, the tasks that need it are

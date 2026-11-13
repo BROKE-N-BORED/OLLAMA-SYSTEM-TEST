@@ -1,5 +1,49 @@
 # Changelog
 
+## v10 (2026-11-13)
+
+Real speech clips (task T12) — the last open repo-audit task. No new
+templates.
+
+- Real spoken audio clips (T12). The three transcribe tasks finally
+  have speech to transcribe: clip-hello.wav says "hello world"
+  (1.04 s), clip-count.wav says "one two three" (1.72 s),
+  clip-weather.wav is a weather sentence containing "sunny"
+  (2.52 s). All three are 16 kHz mono WAV, generated with
+  text-to-speech at $0. The transcribe tasks were unpassable by
+  design before this — the old clips were 1-second sine tones with
+  no speech in them.
+- Transcript normalization. Real transcription providers write
+  spoken numbers as digits ("1, 2, 3"), while the count task
+  expects words ("one two three") — the first verification run
+  proved a correct transcript would have failed. Transcripts are
+  now normalized before scoring (digits spelled out as words,
+  punctuation dropped), so a correct transcript passes however the
+  provider writes it. The stored answer keeps the provider's own
+  words; only the scored copy is normalized.
+- Fixture generator no longer destroys the clips.
+  tests/make_fixtures.py used to overwrite all three clips with
+  sine tones every run; it now keeps any existing clip and only
+  writes a tone fallback when a clip file is missing. The suite
+  pins this: it hashes the clips, runs the generator, and checks
+  the hashes are unchanged — plus three envelope checks proving
+  each clip is speech, not a tone.
+- Secrets-rule hardening. `.gitignore` now also covers `.env`,
+  `*.env`, `*.key`, and `*.pem`, on top of the providers.json and
+  capabilities.json it already covered. The tree and the full
+  11-commit GitHub history were audited for hardcoded keys,
+  tokens, passwords, and credentialed URLs: nothing real anywhere
+  (the only key-shaped strings are test fakes like "sk-dead" and
+  "test-key-not-real", and the only password-shaped strings are
+  the long-context fixture needles). No secret was ever committed,
+  so there is nothing to flag.
+- Test fix, found by the v10 suite itself. The profile-regenerate
+  check stamped its two all-fail run files 09:00 — "later" only
+  when the suite ran before 09:00 (the v9 run was at 00:14, so it
+  passed). A run after 09:00 failed both checks because the full
+  run's own files were newer. The test now stamps the files one
+  day past the latest run file present, so it passes at any hour.
+
 ## v9 (2026-11-12)
 
 Repo-audit polish release (tasks T13–T15) — the last version in the

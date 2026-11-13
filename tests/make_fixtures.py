@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Build the v5 bundled fixtures with the standard library only.
+"""Build the bundled fixtures with the standard library only.
 
 Vision images (images/):
   shapes.png — 3 red circles + 2 blue squares on white (count/describe).
   sign.png   — a dark sign with the number 42 in white (OCR).
 Audio clips (audio/):
-  clip-hello.wav, clip-count.wav, clip-weather.wav — 1-second sine
-  tones at different pitches. They are PLUMBING fixtures: they prove
-  the transcription path sends a file and scores the transcript, but
-  they carry no speech. The package README says to swap in real speech
-  clips for a real quality test.
+  clip-hello.wav, clip-count.wav, clip-weather.wav — REAL SPOKEN
+  audio, shipped in the tree (v10, task T12). They say "hello world",
+  "one two three", and a weather sentence containing "sunny", matching
+  the transcribe tasks in templates/audio.json. This script NEVER
+  overwrites an existing clip: it only writes a 1-second sine tone as
+  a plumbing fallback when a clip file is MISSING (so a fresh checkout
+  with no clips still has something to send). Do not "regenerate" the
+  clips with this script — the real speech lives in the repo.
 
 No PIL, no TTS in the sandbox: the PNGs are encoded by hand (zlib +
 struct, RGB, one filter byte per row) and the digits are drawn from
@@ -145,12 +148,28 @@ def write_wav(path, frequency, seconds=1.0, rate=8000):
     print(f"wrote {path} ({frequency} Hz)")
 
 
-if __name__ == "__main__":
+def build_fixtures():
+    """Write the PNG fixtures and any MISSING audio clip.
+
+    Existing audio clips are kept untouched — they are the real
+    speech fixtures (v10, T12), and overwriting them with tones
+    would silently un-fix the transcribe tasks.
+    """
     os.makedirs(IMAGES_DIR, exist_ok=True)
     os.makedirs(AUDIO_DIR, exist_ok=True)
     shapes_png()
     sign_png()
-    write_wav(os.path.join(AUDIO_DIR, "clip-hello.wav"), 440)
-    write_wav(os.path.join(AUDIO_DIR, "clip-count.wav"), 660)
-    write_wav(os.path.join(AUDIO_DIR, "clip-weather.wav"), 880)
+    for name, frequency in (("clip-hello.wav", 440),
+                            ("clip-count.wav", 660),
+                            ("clip-weather.wav", 880)):
+        path = os.path.join(AUDIO_DIR, name)
+        if os.path.exists(path):
+            print(f"kept existing {path}")
+        else:
+            print(f"{path} missing — writing tone fallback")
+            write_wav(path, frequency)
     print("done")
+
+
+if __name__ == "__main__":
+    build_fixtures()

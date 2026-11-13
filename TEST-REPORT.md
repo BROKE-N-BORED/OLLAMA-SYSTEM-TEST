@@ -1,6 +1,6 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v9
+# TEST-REPORT — OLLAMA SYSTEM TEST v10
 
-Verified 2026-11-12 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
+Verified 2026-11-13 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
 LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-linux-gnu,
 venv ~/workspace/forge-v2-testenv/bin/python, default HOME (overriding
@@ -8,6 +8,14 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v10 is the real-speech release (task T12) — the last open repo-audit
+task. No new templates: the three transcribe tasks finally have
+speech to transcribe (real spoken clips replace the 1-second sine
+tones), transcripts are normalized before scoring (digits spelled
+out as words, punctuation dropped) so a correct transcript passes
+however the provider writes it, and the fixture generator no longer
+overwrites the clips with tones.
 
 v9 is a repo-audit polish release (tasks T13–T15) — the last version
 in the queue. No new templates: filter boxes above the model and
@@ -34,9 +42,97 @@ all runtime tests ran against the fake servers from v5/v6 (fake Ollama
 with /api/show, /api/chat with images and tools; fake OpenAI-compatible
 provider with image_url parts, tool-call SSE deltas, image generation,
 transcription, and speech). Test suite:
-tests/run_tests.py in this tree — **1005 passed, 0 failed** (final
-run; the v8 suite's 968 checks are all carried over and green inside
-that count, plus 37 new v9 checks).
+tests/run_tests.py in this tree — **1016 passed, 0 failed** (final
+run; the v9 suite's 1005 checks are all carried over and green inside
+that count, plus 11 new v10 checks). The first full run of this suite
+came back 1010/6 — two profile-regenerate checks failed on a
+time-of-day bug in the test (it stamped its run files 09:00, which is
+only "later" before 09:00) and four version pins still said v9. Both
+were fixed in the test, not the app, and the re-run from a fresh unzip
+is the green 1016 above.
+
+## What was verified (v10)
+
+### 1. Real spoken clips (T12)
+
+- The three clips in `audio/` are real speech, 16 kHz mono WAV,
+  generated with text-to-speech at $0: clip-hello.wav says "hello
+  world" (1.04 s, 33,358 B), clip-count.wav says "one two three"
+  (1.72 s, 55,118 B), clip-weather.wav says "Today will be sunny
+  with a high near seventy degrees" (2.52 s, 80,718 B). The TTS
+  output needed cleaning before it could ship: the synthesizer
+  prepended a 37-byte ID3 tag to the WAV, which made the file
+  invalid (ffprobe rejected it), so the tag was stripped and the
+  audio resampled to clean 16 kHz WAV.
+- Each clip was transcribed back locally with faster-whisper
+  (tiny.en, CPU int8) to prove it carries the expected words:
+  "Hello world." (expected "hello world" — pass), "1, 2, 3."
+  (expected "one two three" — FAIL as transcribed, see §2),
+  "Today will be sunny with a high near 70 degrees." (expected
+  "sunny" — pass).
+- The suite pins the clips as speech, not tones: a pure sine tone
+  has a near-constant amplitude envelope, speech varies a lot.
+  Coefficient of variation of per-10 ms-window RMS measured
+  0.005–0.008 on the old tones and 0.94–1.41 on the new clips; the
+  suite checks each clip is above 0.25 (stdlib only — wave,
+  struct, math).
+- templates/audio.json no longer says the clips are test tones:
+  the description names the real spoken content.
+
+### 2. Transcript normalization
+
+- The transcribe-back in §1 caught a real defect: Whisper writes
+  spoken numbers as digits ("1, 2, 3"), while the count task
+  expects words ("one two three") — and the contains scorer needs
+  the exact phrase, so the commas alone would fail it too. A
+  correct transcript would have failed against any real provider.
+- Transcripts are now normalized before scoring
+  (`transcript_words`): digit tokens are spelled out as words
+  (0–99; larger numbers stay digits) and punctuation is dropped,
+  so "1, 2, 3." scores as "one two three". Only the scored copy
+  is normalized — the stored answer keeps the provider's own
+  words.
+- Five new suite checks pin it: digits spelled out, punctuation
+  dropped, "near 70 degrees" becomes "near seventy degrees",
+  numbers over 99 left alone, and the digit transcript passing
+  the count task.
+
+### 3. Fixture generator keeps the clips
+
+- tests/make_fixtures.py used to overwrite all three clips with
+  sine tones every run — running it once would have silently
+  un-fixed T12. It now keeps any existing clip and only writes a
+  tone fallback when a clip file is missing (so a fresh checkout
+  with no clips still has something to send). The docstring says
+  the real speech lives in the repo.
+- The suite pins it: it hashes the three clips, runs
+  `build_fixtures()`, and checks the hashes are unchanged.
+
+### 4. Secrets-rule audit
+
+- The tree and the full 11-commit GitHub history were audited for
+  hardcoded keys, tokens, passwords, and credentialed URLs: no
+  real secret anywhere. The only key-shaped strings in any
+  revision are test fakes ("test", "sk-dead", "test-key",
+  "sk-wrong", "test-key-not-real"); the only password-shaped
+  strings are the long-context fixture needles ("The meeting
+  password is ORANGE-2210"). No providers.json, .env, key, or
+  credential file was ever committed, and neither file exists on
+  main today (checked live).
+- `.gitignore` hardened in this build: `.env`, `*.env`, `*.key`,
+  `*.pem` added alongside the providers.json and capabilities.json
+  it already covered.
+
+### 5. Not verified (v10)
+
+- No real provider transcription run yet — the sandbox has no
+  provider key, so the local Whisper transcribe-back (§1) stands
+  in for a provider. A first real run against a provider account
+  is still the closer for the Audio template.
+- The clips are a TTS voice, not his voice. T12's original block
+  was "his recording or TTS" — TTS is what shipped, on the
+  "finish it" order. His own recording can still replace the
+  clips later; nothing in the app cares whose voice it is.
 
 ## What was verified (v9)
 
