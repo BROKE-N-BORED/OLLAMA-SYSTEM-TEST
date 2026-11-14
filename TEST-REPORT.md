@@ -1,6 +1,6 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v12
+# TEST-REPORT — OLLAMA SYSTEM TEST v13
 
-Verified 2026-11-13 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
+Verified 2026-11-14 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
 LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-linux-gnu,
 venv ~/workspace/forge-v2-testenv/bin/python, default HOME (overriding
@@ -8,6 +8,21 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v13 is the run release (tasks R11, R12, R13, R15 from the redesign
+list): pressing Run shows a preview first — what will run, how many
+steps, an upper-bound time estimate, and the provider cost when there
+is one — with Run and Adjust; while a run goes, a line under the
+progress bar shows the current step, the step count, the elapsed
+time, and a remaining-time estimate from the real rate so far, and a
+small status chip says Ready, Running, Done, Stopped, or Ollama
+stopped; when a run completes, one headline names the best model, its
+score and speed, and the run's totals; and the results table gains
+two columns (average time to first token, average prompt speed) while
+the detail view now shows what each model actually wrote under each
+task. The old cost guard is folded into the preview: a provider run's
+cost is named there instead of in a separate confirm, and the $1.00
+confirmation threshold is gone. No new templates, no template changes.
 
 v12 is the layout release (tasks R1, R3, R6, R7 from the redesign
 list): the one crowded Benchmark tab is now three tabs (Run setup,
@@ -60,10 +75,21 @@ all runtime tests ran against the fake servers from v5/v6 (fake Ollama
 with /api/show, /api/chat with images and tools; fake OpenAI-compatible
 provider with image_url parts, tool-call SSE deltas, image generation,
 transcription, and speech). Test suite:
-tests/run_tests.py in this tree — **1088 passed, 0 failed** (final
-run; the v11 suite's 1051 checks are all carried over and green
-inside that count, plus 37 new v12 checks). The road to green: the
-first two full runs never finished — the coordinator running them
+tests/run_tests.py in this tree — **1146 passed, 0 failed** (final
+run; the v12 suite's 1088 checks are all carried over and green
+inside that count, plus 58 new v13 checks). The road to green: the
+first run from a fresh unzip came back 1139/7 — six status-column
+reads in the suite still pointed at column 3, which is the TTFT
+column now (test-only fix; the app was right), and one new preview
+string carried an em-dash, which the v11 AST pin caught (fixed in
+the app). The second run came back 1134/7 — all seven install.sh
+checks failed when pip's temp ran out of room: the fresh unzip
+lived on the 512 MB /tmp tmpfs, so the "workspace scratch dir" the
+install tests point pip at was tmpfs too, and another thread's
+suite had /tmp at 86% (the wheel unpack hit ENOSPC). The third run
+from a fresh unzip on workspace disk is the green 1146 above. The
+v12 suite's own history follows: the first two full runs never
+finished — the coordinator running them
 died on a transport error (run 1 reached 915 PASS, run 2 reached 218
 PASS, neither printed a summary). The third run from a fresh unzip
 came back 1075/8: seven install.sh checks failed when pip's temp
@@ -89,6 +115,88 @@ test (it stamped its run files 09:00, which is only "later" before
 09:00) and four version pins still said v9. Both were fixed in the
 test, not the app, and the re-run from a fresh unzip is the green
 1016 that v11 carries.
+
+## What was verified (v13)
+
+### 1. Run preview (R11)
+
+- Pressing Run shows the preview dialog before anything runs:
+  models, templates, step count, an upper-bound time estimate, and
+  the provider cost when there is one — with Run (the default) and
+  Adjust. Adjust closes the preview, leaves the ticks alone, and
+  the status line says "Run cancelled." The time estimate uses each
+  model's measured speed from its newest past run, or 8 tok/s for a
+  model that has never run here, plus 10 s per model for loading,
+  times a 1.25 safety margin; it says "at most about" because that
+  is what it is. The step count comes from the same counter the
+  worker uses, so the preview's number is the run's number. The
+  suite checks the builder (counts, upper-bound label, cost lines,
+  unknown-price wording, a fast past run shortening the estimate),
+  the dialog's buttons, and the rewritten v8 cost-guard checks
+  (the preview names the $1.67 estimate and the model; Adjust
+  starts no run).
+- GUI-driven under Xvfb at 1366x768: the dialog appears on Run,
+  names both ticked models, shows the step total and the upper
+  estimate, and says local runs cost nothing; Run starts the run,
+  and a second preview's Adjust cancels it with no run started.
+
+### 2. Honest run progress (R12)
+
+- Under the progress bar, a line shows the current step, the step
+  count ("12 of 33 steps done"), the elapsed time, and a
+  remaining-time estimate from the real rate so far — or
+  "estimating time left" until two steps are done, because one
+  step's rate is noise. The worker reports its total step count
+  when the run starts and each finished step as it goes (the
+  warmup counts too). The progress bar itself is unchanged: it was
+  already driven by real steps, never a fake. Cancel stays on the
+  Run tab, enabled through the whole run. The suite pins the
+  mid-run line, the step count, the elapsed time, and the estimate.
+- GUI-driven: mid-run the line reads a real step count with
+  elapsed time and an estimate, and Cancel is enabled; after the
+  run it keeps its final count ("22 of 22 steps done" for the
+  drive's two-model run).
+
+### 3. Calm run status and finish moment (R13)
+
+- A small status chip at the right of the Run tab's button row
+  says Ready, Running, Done, Stopped, or Ollama stopped — one
+  word, no animation, no popup. When a run completes, one headline
+  appears under the progress bar: the best model, its score and
+  speed, and the run's totals. A stopped run shows no headline;
+  the status line already says what happened. The suite pins every
+  chip state and the finish headline's contents, including the
+  cancelled run (chip Stopped, no headline).
+- GUI-driven: the chip reads Running mid-run and Done after, and
+  the finish headline names the best model, 100%, 20.0 tok/s, and
+  the run's totals.
+
+### 4. Answers and latency in the results (R15)
+
+- The results table has six columns now: Model, Overall score, Avg
+  decode tok/s, Avg TTFT, Avg prompt tok/s, Status. The two new
+  columns are real averages from the task records (multi-turn
+  tasks record no TTFT or prompt speed, so they drop out of the
+  average). The detail view shows the saved answer under each task
+  — each turn's answer for multi-turn tasks — plus the model's
+  first-token latency and prompt speed at the top. The suite pins
+  the prompt speeds against the fake server's canned metrics
+  (40.0 / 20.0 / 10.0 tok/s), the TTFT format, the status column's
+  new position, and the answers in the detail view (including a
+  fabricated multi-turn result for the turn answers).
+- GUI-driven: the table shows the six headers with TTFT in ms and
+  prompt speeds matching the fake models, and the detail view
+  shows the model's code answer.
+
+### 5. Fresh-unzip location (verification lesson)
+
+- The v12 install-test fix points pip's temp at the workspace
+  scratch dir — but a fresh unzip on /tmp puts that scratch dir on
+  the 512 MB tmpfs, so the fix does nothing there: run 2's seven
+  install failures were ENOSPC with /tmp at 86% under load. Full
+  suites now run from a fresh unzip on workspace disk (with
+  TMPDIR=/tmp/ost-v13, a tmpfs subdir, for the small tempdirs).
+  No product change — install.sh is untouched.
 
 ## What was verified (v12)
 

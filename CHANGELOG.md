@@ -1,5 +1,42 @@
 # Changelog
 
+## v13 (2026-11-14)
+
+UI redesign, part 3 (tasks R11, R12, R13, R15) — the run itself.
+No new templates.
+
+- Run preview (R11). Pressing Run now shows what the run will do
+  before it starts — models, templates, step count, an upper-bound
+  time estimate, and the provider cost when there is one — with Run
+  and Adjust. Adjust closes the preview and leaves the ticks alone,
+  so the setup can be changed and tried again. The time estimate
+  uses each model's measured speed from its newest past run, or
+  8 tok/s for a model that has never run here, plus 10 s per model
+  for loading, times a 1.25 safety margin; it says "at most about"
+  because that is what it is. The old cost guard is folded into it:
+  a provider run's cost is named in the preview instead of in a
+  separate confirm, and the $1.00 confirmation threshold is gone.
+- Honest run progress (R12). Under the progress bar, a line shows
+  the current step, the step count ("12 of 33 steps done"), the
+  elapsed time, and a remaining-time estimate from the real rate so
+  far — or "estimating time left" until two steps are done, because
+  one step's rate is noise. The progress bar itself is unchanged:
+  it was already driven by real steps, never a fake. Cancel stays
+  on the Run tab, enabled through the whole run.
+- Calm run status and finish moment (R13). A small status chip at
+  the right of the Run tab's button row says Ready, Running, Done,
+  Stopped, or Ollama stopped — one word, no animation, no popup.
+  When a run completes, one headline appears under the progress
+  bar: the best model, its score and speed, and the run's totals.
+  A stopped run shows no headline; the status line already says
+  what happened.
+- Answers and latency in the results (R15). The results table gains
+  two columns: average time to first token and average prompt speed,
+  alongside the overall score and average decode speed. The detail
+  view now shows what each model actually wrote — the saved answer
+  under each task (each turn's answer for multi-turn tasks) — plus
+  the model's first-token latency and prompt speed at the top.
+
 ## v12 (2026-11-13)
 
 UI redesign, part 2 (tasks R1, R3, R6, R7) — the layout release.

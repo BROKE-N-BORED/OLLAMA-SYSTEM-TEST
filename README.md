@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v12
+# OLLAMA SYSTEM TEST v13
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,18 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v13 is a run release, no new templates: pressing Run shows a preview
+first — what will run, how many steps, an upper-bound time estimate,
+and the provider cost when there is one — with Run and Adjust. While
+a run goes, a line under the progress bar shows the current step, the
+step count, the elapsed time, and a remaining-time estimate from the
+real rate so far, and a small status chip says Ready, Running, Done,
+Stopped, or Ollama stopped. When a run completes, one headline names
+the best model, its score and speed, and the run's totals. The results
+table gains two columns — average time to first token and average
+prompt speed — and the detail view now shows what each model actually
+wrote under each task.
 
 v12 is a layout release, no new templates: the one crowded Benchmark
 tab is now three tabs, one job each — Run setup (pick models and
@@ -128,27 +140,38 @@ remembered next time.
    light up again. With nothing ticked, everything shows enabled.
    The filter box above the list narrows it as you type, and the
    grey-outs keep working while a filter is on.
-3. Press Run. The app switches to the Run tab and each model runs each template in turn, one at a time.
+3. Press Run. A preview shows first: what the run will do — models,
+   templates, step count, an upper-bound time estimate, and the
+   provider cost when there is one (from the prices you saved and the
+   tokens the chosen templates will use). Press Run to go ahead, or
+   Adjust to close the preview and change the ticks. The time estimate
+   uses each model's measured speed from its newest past run, or
+   8 tok/s for a model that has never run here, plus 10 s per model
+   for loading, times a safety margin; it says "at most about" because
+   that is what it is. The cost estimate covers text tokens only and
+   is an upper bound: a model usually stops well short of the most it
+   is asked for, so the real bill is usually lower. Once the run
+   starts, the app switches to the Run tab and each model runs each
+   template in turn, one at a time.
    A full run (all templates, all models) takes a while — each model
    answers 103 prompts (90 scored tasks, plus the extra turns in the
    multi-turn and role-following templates, plus 3 speed runs), and
    the 32K speed run takes minutes on a CPU by design — so start with
    one model or one template to get a feel for the speed, then run
-   the rest. If any provider model is
-   ticked, the run shows its estimated cost first (from the prices
-   you saved and the tokens the chosen templates will use) and asks
-   you to confirm when the estimate is over $1.00 — or when no prices
-   are saved, so the cost is unknown. Under $1.00 it starts straight
-   away. The estimate covers text tokens only and is an upper bound:
-   a model usually stops well short of the most it is asked for, so
-   the real bill is usually lower. The "Stop a template after __
+   the rest. While it goes, a line under the progress bar shows the
+   current step, the step count, the elapsed time, and a remaining-time
+   estimate from the real rate so far, and a small status chip says
+   Running; Cancel stays enabled through the whole run. When it
+   finishes, one headline names the best model, its score and speed,
+   and the run's totals. The "Stop a template after __
    minutes" box is an opt-in time budget per template (0 = no limit,
    the default): when set and a template's jobs run past it, that
    template's jobs stop with "time budget reached" and the run
    carries on with the next template.
 4. On the Run tab, the table shows, for each model: overall score, average decode speed,
-   and status. Click a model to see its per-template scores, which
-   tasks passed or failed, and — for provider models — the tokens used
+   average time to first token, average prompt speed, and status. Click a model to see its per-template scores, which
+   tasks passed or failed, what the model actually wrote under each
+   task, and — for provider models — the tokens used
    and the estimated cost. Templates a model was not eligible for show
    as "not eligible for this model", never as a failure.
 5. Press Save report to keep a summary of the session. It writes two

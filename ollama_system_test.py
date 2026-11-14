@@ -108,6 +108,7 @@ try:
         QCheckBox,
         QComboBox,
         QDialog,
+        QDialogButtonBox,
         QFileDialog,
         QFrame,
         QHBoxLayout,
@@ -141,7 +142,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "12"
+__version__ = "13"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -823,6 +824,24 @@ def fmt_duration(seconds):
     return f"{seconds:.2f} s"
 
 
+def fmt_eta(seconds):
+    """A wall-clock duration in words for a run estimate: "45s",
+    "3m", "18m", "1h 5m". Whole units only — an estimate is not a
+    stopwatch, and false precision is a lie."""
+    if seconds is None:
+        return "n/a"
+    total = int(round(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m"
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    if minutes:
+        return f"{hours}h {minutes}m"
+    return f"{hours}h"
+
+
 def fmt_toks(value):
     if value is None:
         return "n/a"
@@ -1005,6 +1024,141 @@ def estimate_run_cost(targets, templates):
         "total": None if unknown else total,
         "unknown": unknown,
         "provider_models": [entry["label"] for entry in per_model],
+    }
+
+
+def count_run_steps(targets, templates):
+    """Progress steps for a run: one warmup per target, then one step
+    per model call on the eligible templates only. A multi-turn task
+    counts its turns (each turn is a call); the Speed template counts
+    its context lengths. Skipped pairs cost no steps. The worker and
+    the run preview share this, so the preview's step count is the
+    same count the run itself uses."""
+    steps = 0
+    for target in targets:
+        steps += 1  # warmup
+        for template in templates:
+            if not template_eligible(template, target):
+                continue
+            if template["scored"]:
+                for task in template["tasks"]:
+                    if task.get("kind") == "chat":
+                        steps += len(task["turns"])
+                    else:
+                        steps += 1
+            else:
+                if template.get("context_lengths"):
+                    steps += len(template["context_lengths"])
+                else:
+                    steps += len(template["prompts"])
+    return max(steps, 1)
+
+
+# The run preview's time estimate (R11): what a model with no past
+# runs is assumed to do, how long a model load is allowed for, and
+# the safety margin on top. The estimate is an UPPER BOUND: the run
+# usually finishes sooner, because models usually stop well short
+# of num_predict.
+PREVIEW_DEFAULT_TOK_S = 8.0
+PREVIEW_LOAD_ALLOWANCE_S = 10.0
+PREVIEW_SAFETY_MARGIN = 1.25
+
+
+def latest_decode_speed(results_dir, label):
+    """A model's decode speed from its newest past run file, or None
+    when it has never run here (or no run recorded a speed)."""
+    runs = load_model_runs(results_dir, slugify_model(label))
+    for run in reversed(runs):
+        speed = run.get("avg_decode_tok_s")
+        if speed:
+            return speed
+    return None
+
+
+def build_run_preview(targets, templates, results_dir):
+    """R11: the run preview (library 017) — what a run will do, in
+    plain text, before it starts.
+
+    Returns a dict: "text" is the preview itself; "total_steps" is
+    the step count; "seconds_upper" is the time estimate (an upper
+    bound, in seconds); "cost" is the estimate_run_cost result for
+    the provider targets (or None for a local-only run).
+
+    The time estimate is honest about what it is: per model, the
+    tokens the run will ask for (estimate_template_tokens, an upper
+    bound itself) divided by the model's measured speed from its
+    newest past run — or 8 tok/s when it has never run here — plus
+    10 s per model for loading, all times a 1.25 safety margin. It
+    says "at most about" because that is what it is.
+    """
+    lines = []
+    total_steps = count_run_steps(targets, templates)
+    lines.append(
+        f"{len(targets)} {'model' if len(targets) == 1 else 'models'}, "
+        f"{len(templates)} {'template' if len(templates) == 1 else 'templates'}, "
+        f"{total_steps} steps in total."
+    )
+    lines.append("")
+    seconds_upper = 0.0
+    for target in targets:
+        label = target["label"]
+        steps = count_run_steps([target], templates)
+        eligible = [t for t in templates if template_eligible(t, target)]
+        lines.append(
+            f"  {label}: {len(eligible)} "
+            f"{'template' if len(eligible) == 1 else 'templates'}, "
+            f"{steps} steps"
+        )
+        speed = latest_decode_speed(results_dir, label)
+        if speed is None:
+            speed = PREVIEW_DEFAULT_TOK_S
+        speed = min(max(speed, 1.0), 500.0)
+        tokens = 0
+        for template in eligible:
+            prompt_tokens, completion_tokens = estimate_template_tokens(
+                template
+            )
+            tokens += prompt_tokens + completion_tokens
+        seconds_upper += tokens / speed + PREVIEW_LOAD_ALLOWANCE_S
+    seconds_upper *= PREVIEW_SAFETY_MARGIN
+    lines.append("")
+    lines.append(
+        f"Time: at most about {fmt_eta(seconds_upper)} (an upper "
+        "estimate; the run usually finishes sooner)."
+    )
+    provider_targets = [t for t in targets if t["kind"] == "provider"]
+    cost = None
+    if provider_targets:
+        cost = estimate_run_cost(provider_targets, templates)
+        lines.append("")
+        lines.append("Cost (provider models cost real money):")
+        for entry in cost["per_model"]:
+            if entry["has_prices"]:
+                lines.append(
+                    f"  {entry['label']}: about {fmt_cost(entry['cost'])} "
+                    f"(about {fmt_tokens(entry['prompt_tokens'])} tokens in, "
+                    f"{fmt_tokens(entry['completion_tokens'])} out)"
+                )
+            else:
+                lines.append(
+                    f"  {entry['label']}: no prices saved: cost unknown"
+                )
+        if cost["unknown"]:
+            lines.append(
+                "No prices are saved for "
+                + ", ".join(cost["unknown"])
+                + ", so the total cost is unknown."
+            )
+        else:
+            lines.append(f"Estimated total: about {fmt_cost(cost['total'])}.")
+    else:
+        lines.append("")
+        lines.append("Cost: local models only, so nothing to pay.")
+    return {
+        "text": "\n".join(lines),
+        "total_steps": total_steps,
+        "seconds_upper": seconds_upper,
+        "cost": cost,
     }
 
 
@@ -3731,6 +3885,12 @@ class BenchWorker(QThread):
     template_done = Signal(str, dict, str)  # model, run data, file path
     model_done = Signal(str, dict)
     progress = Signal(str, int)
+    # R12: the run's total step count when it starts, and the step
+    # count so far as each step finishes. The window turns these into
+    # an honest "N of M steps, about X left" line — never a fake
+    # progress bar.
+    run_started = Signal(int)
+    step_progress = Signal(int, int)
     # "done", "cancelled", or "ollama_down"
     run_finished = Signal(str)
 
@@ -3831,27 +3991,9 @@ class BenchWorker(QThread):
 
     def _count_steps(self):
         """Progress steps: one warmup per target, then one step per
-        model call on the eligible templates only. A multi-turn task
-        counts its turns (each turn is a call); the Speed template
-        counts its context lengths. Skipped pairs cost no steps."""
-        steps = 0
-        for target in self.targets:
-            steps += 1  # warmup
-            for template in self.templates:
-                if not template_eligible(template, target):
-                    continue
-                if template["scored"]:
-                    for task in template["tasks"]:
-                        if task.get("kind") == "chat":
-                            steps += len(task["turns"])
-                        else:
-                            steps += 1
-                else:
-                    if template.get("context_lengths"):
-                        steps += len(template["context_lengths"])
-                    else:
-                        steps += len(template["prompts"])
-        return max(steps, 1)
+        model call on the eligible templates only. See
+        count_run_steps — the worker and the run preview share it."""
+        return count_run_steps(self.targets, self.templates)
 
     def _failed_result(self, job_id, prompt, task, detail):
         """A task record for a call that failed before it could be scored."""
@@ -4369,10 +4511,12 @@ class BenchWorker(QThread):
         self.progress.emit(
             f"{label}: {template['name']} - {job_id}", min(percent, 100)
         )
+        self.step_progress.emit(self._done_steps, self._total_steps)
 
     def run(self):
         self._total_steps = self._count_steps()
         self._done_steps = 0
+        self.run_started.emit(self._total_steps)
         for target in self.targets:
             label = target["label"]
             if self._stop:
@@ -4387,6 +4531,8 @@ class BenchWorker(QThread):
                 "templates": {},
                 "overall_score": None,
                 "avg_decode_tok_s": None,
+                "avg_ttft_s": None,
+                "avg_prompt_tok_s": None,
                 "size_ram": None,
                 "prompt_tokens": None,
                 "completion_tokens": None,
@@ -4415,6 +4561,9 @@ class BenchWorker(QThread):
                     if not ok:
                         raise ProviderError(message)
                 self._done_steps += 1
+                # The warmup is a counted step too: report it, so the
+                # "N of M steps" line is right from the first step.
+                self.step_progress.emit(self._done_steps, self._total_steps)
             except Cancelled:
                 self.run_finished.emit("cancelled")
                 return
@@ -4489,6 +4638,28 @@ class BenchWorker(QThread):
             ]
             if speeds:
                 result["avg_decode_tok_s"] = sum(speeds) / len(speeds)
+            # R15: the same average, for first-token latency and prompt
+            # speed, so the results table can show them. Multi-turn
+            # tasks record None for both (they are several calls), so
+            # they simply drop out of the average.
+            ttfts = [
+                task["ttft_s"]
+                for run in result["templates"].values()
+                for task in run["tasks"]
+                if task.get("ttft_s") is not None
+            ]
+            if ttfts:
+                result["avg_ttft_s"] = sum(ttfts) / len(ttfts)
+            prompt_speeds = [
+                task["prompt_tok_s"]
+                for run in result["templates"].values()
+                for task in run["tasks"]
+                if task.get("prompt_tok_s") is not None
+            ]
+            if prompt_speeds:
+                result["avg_prompt_tok_s"] = (
+                    sum(prompt_speeds) / len(prompt_speeds)
+                )
             # Token totals cover the whole model: every template run
             # plus the warmup call (the provider charged for that too).
             prompt_total = 0
@@ -4667,8 +4838,46 @@ TABLE_COLUMNS = (
     "Model",
     "Overall score",
     "Avg decode tok/s",
+    "Avg TTFT",
+    "Avg prompt tok/s",
     "Status",
 )
+
+
+class RunPreviewDialog(QDialog):
+    """R11: the run preview (library 017 — see it before you commit).
+
+    Shows the run's plan in plain text — models, templates, steps,
+    an upper-bound time estimate, and the provider cost when there
+    is one — with Run (the default) and Adjust. Adjust closes the
+    dialog and leaves the setup lists untouched, so the user can
+    change the ticks and try again."""
+
+    def __init__(self, parent, preview_text):
+        super().__init__(parent)
+        self.setWindowTitle("Before you run")
+        self.resize(520, 420)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "This is what the run will do. Check it, then press Run."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.text_view = QTextEdit()
+        self.text_view.setReadOnly(True)
+        self.text_view.setPlainText(preview_text)
+        layout.addWidget(self.text_view)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        self.run_button = buttons.button(QDialogButtonBox.Ok)
+        self.run_button.setText("Run")
+        self.run_button.setDefault(True)
+        self.adjust_button = buttons.button(QDialogButtonBox.Cancel)
+        self.adjust_button.setText("Adjust")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
 
 class MainWindow(QMainWindow):
@@ -4713,6 +4922,13 @@ class MainWindow(QMainWindow):
         self.pull_worker = None
         self.starter = None
         self.provider_test_worker = None
+        # R12/R13: the running run's progress state. The start time
+        # and step counts feed the honest progress line; the current
+        # text is the latest progress signal.
+        self._run_started_at = None
+        self._run_total_steps = 0
+        self._run_done_steps = 0
+        self._run_current_text = ""
         self.results = {}
         self.result_order = []
         self.templates = []
@@ -5126,12 +5342,39 @@ class MainWindow(QMainWindow):
         run_buttons.addWidget(self.export_csv_button)
         run_buttons.addWidget(self.export_html_button)
         run_buttons.addStretch()
+        # R13: the calm status chip (library 003/021). One word — the
+        # run's state — at the right end of the button row, where a
+        # glance lands. No animation, no popup: it just changes state.
+        self.run_chip = QLabel("Ready")
+        self.run_chip.setObjectName("runChip")
+        self.run_chip.setStyleSheet(
+            "QLabel#runChip { border: 1px solid gray; "
+            "border-radius: 8px; padding: 2px 10px; }"
+        )
+        run_buttons.addWidget(self.run_chip)
         layout.addLayout(run_buttons)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
+
+        # R12: the honest progress line — current step, step count,
+        # elapsed time, and a remaining-time estimate from the real
+        # rate so far. Empty when no run is going.
+        self.progress_detail = QLabel("")
+        layout.addWidget(self.progress_detail)
+
+        # R13: the finish moment — one headline when a run completes
+        # (best model, totals, elapsed). Hidden until a run finishes.
+        self.finish_label = QLabel("")
+        self.finish_label.setObjectName("finishLabel")
+        self.finish_label.setStyleSheet(
+            "QLabel#finishLabel { font-weight: bold; }"
+        )
+        self.finish_label.setWordWrap(True)
+        self.finish_label.hide()
+        layout.addWidget(self.finish_label)
 
         self.table = QTableWidget(0, len(TABLE_COLUMNS))
         self.table.setHorizontalHeaderLabels(TABLE_COLUMNS)
@@ -5636,10 +5879,12 @@ class MainWindow(QMainWindow):
         if needs_ollama and not ollama_reachable():
             self.status_label.setText(OLLAMA_DOWN_RUN_MESSAGE)
             return
-        # The cost guard: a provider run shows its estimated cost
-        # first and asks to confirm when it is over the threshold
-        # (or when no prices are saved, so the cost is unknown).
-        if not self._confirm_provider_cost(targets, templates):
+        # R11: every run shows its preview first — what will run, how
+        # long it may take, what it will cost — and asks to go ahead.
+        # The old cost guard is folded into it: a provider run's cost
+        # is part of the preview, named there.
+        if not self._show_run_preview(targets, templates):
+            self.status_label.setText("Run cancelled.")
             return
         # The run lives on the Run tab: switch there so the user
         # watches it instead of the setup lists.
@@ -5669,6 +5914,15 @@ class MainWindow(QMainWindow):
         self.template_list.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setValue(0)
+        # R12/R13: fresh progress state, a clean finish line, and the
+        # status chip on Running.
+        self._run_started_at = time.monotonic()
+        self._run_total_steps = 0
+        self._run_done_steps = 0
+        self._run_current_text = ""
+        self.progress_detail.setText("")
+        self.finish_label.hide()
+        self.run_chip.setText("Running")
         self.worker = BenchWorker(
             targets, templates, self.sys_id, self.machine, get_results_dir(),
             time_budget_seconds=self._time_budget_seconds(),
@@ -5678,6 +5932,8 @@ class MainWindow(QMainWindow):
         self.worker.template_done.connect(self.on_template_done)
         self.worker.model_done.connect(self.on_model_done)
         self.worker.progress.connect(self.on_progress)
+        self.worker.run_started.connect(self.on_run_started)
+        self.worker.step_progress.connect(self.on_step_progress)
         self.worker.run_finished.connect(self.on_run_finished)
         self.worker.start()
         log_event(
@@ -5696,67 +5952,14 @@ class MainWindow(QMainWindow):
         minutes = self.budget_spin.value()
         return minutes * 60 if minutes else None
 
-    def _confirm_provider_cost(self, targets, templates):
-        """The cost guard: a run with provider models shows its
-        estimated cost before it starts. Over the $1.00 threshold —
-        or when no prices are saved, so the cost is unknown — it asks
-        to confirm, naming the estimate and the models; under the
-        threshold it starts with no extra step and the estimate shows
-        in the status line instead. Returns False when the user says
-        no (or when there is nothing to confirm, True)."""
-        provider_targets = [t for t in targets if t["kind"] == "provider"]
-        if not provider_targets:
-            return True
-        estimate = estimate_run_cost(provider_targets, templates)
-        lines = ["This run will use provider models, which cost real money:"]
-        for entry in estimate["per_model"]:
-            if entry["has_prices"]:
-                lines.append(
-                    f"  {entry['label']}: about {fmt_cost(entry['cost'])} "
-                    f"(about {fmt_tokens(entry['prompt_tokens'])} tokens in, "
-                    f"{fmt_tokens(entry['completion_tokens'])} out)"
-                )
-            else:
-                lines.append(
-                    f"  {entry['label']}: no prices saved: cost unknown"
-                )
-        if estimate["unknown"]:
-            lines.append("")
-            lines.append(
-                "No prices are saved for "
-                + ", ".join(estimate["unknown"])
-                + ", so the total cost is unknown."
-            )
-            needs_confirm = True
-        elif estimate["total"] > COST_CONFIRM_THRESHOLD_USD:
-            lines.append("")
-            lines.append(
-                f"Estimated total: about {fmt_cost(estimate['total'])}. "
-                f"That is over the {fmt_cost(COST_CONFIRM_THRESHOLD_USD)} "
-                "confirmation threshold."
-            )
-            needs_confirm = True
-        else:
-            needs_confirm = False
-        if not needs_confirm:
-            if estimate["total"] < 0.01:
-                cost_text = "less than a cent"
-            else:
-                cost_text = f"about {fmt_cost(estimate['total'])}"
-            self.status_label.setText(
-                f"Estimated provider cost: {cost_text}. Starting the run."
-            )
-            return True
-        lines.append("")
-        lines.append("Run anyway?")
-        answer = QMessageBox.question(
-            self, "Confirm provider run", "\n".join(lines),
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            self.status_label.setText("Run cancelled.")
-            return False
-        return True
+    def _show_run_preview(self, targets, templates):
+        """R11: show the run preview dialog (library 017) and return
+        True when the user presses Run, False on Adjust. A seam for
+        the suite, which stubs it so existing run tests pass through
+        without a dialog."""
+        preview = build_run_preview(targets, templates, get_results_dir())
+        dialog = RunPreviewDialog(self, preview["text"])
+        return dialog.exec() == QDialog.Accepted
 
     # -- start Ollama ----------------------------------------------------
 
@@ -5829,6 +6032,46 @@ class MainWindow(QMainWindow):
     def on_progress(self, text, percent):
         self.status_label.setText(text)
         self.progress_bar.setValue(percent)
+        self._run_current_text = text
+        self._refresh_progress_line()
+
+    def on_run_started(self, total_steps):
+        """R12: the run's total step count — the denominator for the
+        honest progress line."""
+        self._run_total_steps = total_steps
+        self._refresh_progress_line()
+
+    def on_step_progress(self, done, total):
+        """R12: one more step finished — update the count and the
+        remaining-time estimate."""
+        self._run_done_steps = done
+        self._run_total_steps = total
+        self._refresh_progress_line()
+
+    def _refresh_progress_line(self):
+        """R12: the honest progress line under the progress bar —
+        current step, step count, elapsed time, and a remaining-time
+        estimate from the real rate so far. No estimate until at
+        least 2 steps are done: one step's rate is noise."""
+        if self._run_started_at is None:
+            self.progress_detail.setText("")
+            return
+        elapsed = time.monotonic() - self._run_started_at
+        done = self._run_done_steps
+        total = self._run_total_steps
+        parts = []
+        if self._run_current_text:
+            parts.append(self._run_current_text)
+        if total:
+            parts.append(f"{done} of {total} steps done")
+        parts.append(f"{fmt_eta(elapsed)} elapsed")
+        if total and done >= 2 and done < total:
+            rate = elapsed / done
+            remaining = rate * (total - done)
+            parts.append(f"about {fmt_eta(remaining)} left")
+        elif total and done < total:
+            parts.append("estimating time left")
+        self.progress_detail.setText(" - ".join(parts))
 
     def on_model_started(self, name):
         row = self.table.rowCount()
@@ -5836,7 +6079,9 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 0, QTableWidgetItem(name))
         self.table.setItem(row, 1, NumericItem(None, "n/a"))
         self.table.setItem(row, 2, NumericItem(None, "n/a"))
-        self.table.setItem(row, 3, QTableWidgetItem("running"))
+        self.table.setItem(row, 3, NumericItem(None, "n/a"))
+        self.table.setItem(row, 4, NumericItem(None, "n/a"))
+        self.table.setItem(row, 5, QTableWidgetItem("running"))
 
     def _row_for(self, name):
         for row in range(self.table.rowCount()):
@@ -5862,7 +6107,16 @@ class MainWindow(QMainWindow):
         self.table.setItem(
             row, 2, NumericItem(result.get("avg_decode_tok_s"), fmt_toks(result.get("avg_decode_tok_s")))
         )
-        self.table.setItem(row, 3, QTableWidgetItem(result["status"]))
+        self.table.setItem(
+            row, 3, NumericItem(
+                result.get("avg_ttft_s"),
+                fmt_duration(result.get("avg_ttft_s")),
+            )
+        )
+        self.table.setItem(
+            row, 4, NumericItem(result.get("avg_prompt_tok_s"), fmt_toks(result.get("avg_prompt_tok_s")))
+        )
+        self.table.setItem(row, 5, QTableWidgetItem(result["status"]))
 
     def on_run_finished(self, reason):
         log_event(f"Run finished: {reason}")
@@ -5898,6 +6152,29 @@ class MainWindow(QMainWindow):
                     self.show_detail(first.text())
         else:
             self.status_label.setText("Cancelled. Results so far are still in the table.")
+        # R12/R13: the run's final state on the chip, the progress
+        # line's final count, and the finish moment on a completed
+        # run. A stopped run shows no finish headline — the status
+        # line already says what happened.
+        elapsed = None
+        if self._run_started_at is not None:
+            elapsed = time.monotonic() - self._run_started_at
+        if reason == "done":
+            self.run_chip.setText("Done")
+            if self._run_total_steps:
+                done_text = (
+                    f"{self._run_done_steps} of {self._run_total_steps} "
+                    "steps done"
+                )
+                if elapsed is not None:
+                    done_text += f", took {fmt_eta(elapsed)}."
+                self.progress_detail.setText(done_text)
+            self._show_finish_label(elapsed)
+        elif reason == "ollama_down":
+            self.run_chip.setText("Ollama stopped")
+        else:
+            self.run_chip.setText("Stopped")
+        self._run_started_at = None
         self.worker = None
         self.refresh_history()
         self.refresh_profiles_for_run()
@@ -5905,6 +6182,35 @@ class MainWindow(QMainWindow):
         self._update_delete_button()
         # A finished run completes the checklist's third step.
         self.refresh_checklist()
+
+    def _show_finish_label(self, elapsed):
+        """R13: the finish moment — one headline naming the best
+        model, its score and speed, and the run's totals. Nothing
+        shows when no model has a score (an unscored-only run)."""
+        best = None
+        for name in self.result_order:
+            result = self.results.get(name)
+            if result is None or result.get("overall_score") is None:
+                continue
+            if best is None or result["overall_score"] > best["overall_score"]:
+                best = result
+        if best is None:
+            return
+        models = len(self.result_order)
+        templates = len(best.get("templates", {}))
+        text = (
+            f"Done. Best: {best['name']}, "
+            f"{fmt_score(best.get('overall_score'))} overall at "
+            f"{fmt_toks(best.get('avg_decode_tok_s'))} tok/s. "
+            f"{models} {'model' if models == 1 else 'models'}, "
+            f"{templates} {'template' if templates == 1 else 'templates'}"
+        )
+        if elapsed is not None:
+            text += f", {fmt_eta(elapsed)}."
+        else:
+            text += "."
+        self.finish_label.setText(text)
+        self.finish_label.show()
 
     def refresh_profiles_for_run(self):
         """Rebuild the profiles of every model this run touched."""
@@ -5924,6 +6230,13 @@ class MainWindow(QMainWindow):
             return
         lines = [f"{name}: overall {fmt_score(result.get('overall_score'))}, "
                  f"avg {fmt_toks(result.get('avg_decode_tok_s'))} tok/s"]
+        # R15: the latency numbers the table now shows, in words.
+        if (result.get("avg_ttft_s") is not None
+                or result.get("avg_prompt_tok_s") is not None):
+            lines.append(
+                f"First token {fmt_duration(result.get('avg_ttft_s'))}, "
+                f"prompt {fmt_toks(result.get('avg_prompt_tok_s'))} tok/s"
+            )
         if result["status"] != "done":
             lines.append(result["status"])
             self.detail_view.setPlainText("\n".join(lines))
@@ -6009,6 +6322,15 @@ class MainWindow(QMainWindow):
                     f"  {mark}  {task.get('id', '?')} "
                     f"({fmt_toks(task.get('decode_tok_s'))} tok/s){note}"
                 )
+                # R15: the saved answer itself, so the detail view
+                # shows what the model actually wrote. The answer was
+                # already truncated at storage time (ANSWER_TRUNCATE).
+                answer = task.get("answer") or ""
+                if answer:
+                    answer_lines = answer.splitlines() or [""]
+                    lines.append("       Answer: " + answer_lines[0])
+                    for extra in answer_lines[1:]:
+                        lines.append("       " + extra)
                 detail = task.get("detail") or ""
                 if (passed is False or is_not_run(task)
                         or is_budget_stopped(task)) and detail:
@@ -6022,6 +6344,12 @@ class MainWindow(QMainWindow):
                     lines.append(
                         f"       {turn_mark}  {turn.get('prompt', '?')}"
                     )
+                    turn_answer = turn.get("answer") or ""
+                    if turn_answer:
+                        turn_lines = turn_answer.splitlines() or [""]
+                        lines.append("           Answer: " + turn_lines[0])
+                        for extra in turn_lines[1:]:
+                            lines.append("           " + extra)
                     if turn_passed is False and turn.get("detail"):
                         lines.append(f"           {turn['detail']}")
         self.detail_view.setPlainText("\n".join(lines))

@@ -1,8 +1,9 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v12 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v13 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1051 v11 checks are carried over; the v12 checks
-cover the tab split (R1), the How to Use index (R3), single instance
-(R6), and the first-run setup checklist (R7).
+answers per model. All 1088 v12 checks are carried over; the v13 checks
+cover the run preview (R11), honest run progress (R12), the calm run
+status and finish moment (R13), and answers + TTFT in the results
+(R15).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -697,17 +698,23 @@ def main():
 
     # ---------- Qt app: retry once ----------
     qt_app = QApplication(sys.argv)
-    # v8: the cost guard and the delete confirm are QMessageBox.question
-    # dialogs, and a real modal dialog would hang the suite — nobody
-    # is here to click it. The carried provider sections tick models
-    # with no prices saved, so the guard would ask on every run.
-    # Answer Yes to all of them for the carried sections; the v8
-    # sections replace this stub with a controllable one (and restore
-    # it when they finish), and the real dialog is restored at the
-    # end of main().
+    # v8: the delete confirm is a QMessageBox.question dialog, and a
+    # real modal dialog would hang the suite — nobody is here to
+    # click it. Answer Yes to all of them for the carried sections;
+    # the sections that test a confirm replace this stub with a
+    # controllable one (and restore it when they finish), and the
+    # real dialog is restored at the end of main().
     from PySide6.QtWidgets import QMessageBox
     _suite_real_question = QMessageBox.question
     QMessageBox.question = lambda *args, **kwargs: QMessageBox.Yes
+    # v13: the run preview is a modal dialog too, and a real one
+    # would hang the suite the same way. Stub the seam to always say
+    # Run for the carried sections; the v8 cost-guard rewrite and
+    # the v13 sections replace it with a controllable one (and
+    # restore it when they finish), and the real method is restored
+    # at the end of main().
+    _suite_real_preview = app.MainWindow._show_run_preview
+    app.MainWindow._show_run_preview = lambda self, t, m: True
     app.RETRY_DELAY = 0.1
     server.generate_count = 0
     server.fail_next_generate = True
@@ -949,13 +956,13 @@ def main():
             check(f"{name} avg tok/s {toks}",
                   table_text(window, row, 2) == toks, table_text(window, row, 2))
             check(f"{name} status {status}",
-                  table_text(window, row, 3) == status, table_text(window, row, 3))
+                  table_text(window, row, 5) == status, table_text(window, row, 5))
     broken_row = row_for(window, "fake-broken:1b")
     check("broken row present", broken_row is not None)
     if broken_row is not None:
         check("broken status",
-              table_text(window, broken_row, 3) == "failed: model exploded",
-              table_text(window, broken_row, 3))
+              table_text(window, broken_row, 5) == "failed: model exploded",
+              table_text(window, broken_row, 5))
         check("broken score is n/a", table_text(window, broken_row, 1) == "n/a")
     order = [table_text(window, r, 0) for r in range(window.table.rowCount())]
     check("table sorted best score first, failed last",
@@ -1408,8 +1415,8 @@ def main():
     smart_row = row_for(window3, "fake-smart:2b")
     check("mid-stream smart row failed with the hint",
           smart_row is not None
-          and table_text(window3, smart_row, 3) == "failed: " + app.UNREACHABLE_HINT,
-          table_text(window3, smart_row, 3) if smart_row is not None else "no row")
+          and table_text(window3, smart_row, 5) == "failed: " + app.UNREACHABLE_HINT,
+          table_text(window3, smart_row, 5) if smart_row is not None else "no row")
     check("mid-stream partial never attempted",
           row_for(window3, "fake-partial:3b") is None)
     check("mid-stream close happened twice (warmup + retry)",
@@ -1458,8 +1465,8 @@ def main():
     smart_row = row_for(window4, "fake-smart:2b")
     check("server-dies smart row failed with the hint",
           smart_row is not None
-          and table_text(window4, smart_row, 3) == "failed: " + app.UNREACHABLE_HINT,
-          table_text(window4, smart_row, 3) if smart_row is not None else "no row")
+          and table_text(window4, smart_row, 5) == "failed: " + app.UNREACHABLE_HINT,
+          table_text(window4, smart_row, 5) if smart_row is not None else "no row")
     window4.close()
     window4.deleteLater()
     qt_app.processEvents()
@@ -2429,7 +2436,7 @@ def main():
         check("provider row overall 100%",
               table_text(windowP, prow, 1) == "100%", table_text(windowP, prow, 1))
         check("provider row status done",
-              table_text(windowP, prow, 3) == "done", table_text(windowP, prow, 3))
+              table_text(windowP, prow, 5) == "done", table_text(windowP, prow, 5))
         toks = table_text(windowP, prow, 2)
         check("provider row has a measured speed",
               toks != "n/a" and float(toks) > 100, toks)
@@ -2542,20 +2549,20 @@ def main():
     local_row = row_for(windowP, "fake-smart:2b")
     check("local model still completes when providers fail",
           local_row is not None
-          and table_text(windowP, local_row, 3) == "done",
-          table_text(windowP, local_row, 3) if local_row is not None else "no row")
+          and table_text(windowP, local_row, 5) == "done",
+          table_text(windowP, local_row, 5) if local_row is not None else "no row")
     dead_row = row_for(windowP, "dead-provider / dead-model")
     check("dead provider model fails plainly",
           dead_row is not None
-          and table_text(windowP, dead_row, 3)
+          and table_text(windowP, dead_row, 5)
           == "failed: provider dead-provider did not answer",
-          table_text(windowP, dead_row, 3) if dead_row is not None else "no row")
+          table_text(windowP, dead_row, 5) if dead_row is not None else "no row")
     badkey_row = row_for(windowP, "badkey-provider / fake-gpt-smart")
     check("bad-key provider model fails plainly",
           badkey_row is not None
-          and table_text(windowP, badkey_row, 3)
+          and table_text(windowP, badkey_row, 5)
           == "failed: provider badkey-provider rejected the key: Incorrect API key provided",
-          table_text(windowP, badkey_row, 3) if badkey_row is not None else "no row")
+          table_text(windowP, badkey_row, 5) if badkey_row is not None else "no row")
 
     # ---------- Qt app: provider-only run works with Ollama down ----------
     oserver.shutdown()
@@ -3371,7 +3378,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 12", app.__version__ == "12",
+    check("__version__ is 13", app.__version__ == "13",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3385,8 +3392,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v12",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v12",
+    check("title bar shows OLLAMA SYSTEM TEST v13",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v13",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4199,89 +4206,114 @@ def main():
               not window8.export_csv_button.isEnabled()
               and not window8.export_html_button.isEnabled())
 
-        # ---------- v8 T10: cost guard ------------------------------------
-        set_checked_list(window8.model_list,
-                         {"v8-provider / fake-gpt-smart"})
-        set_checked_templates(window8, {"math"})
-        question_answer8["answer"] = QMessageBox.No
-        question_calls8.clear()
-        window8.run_button.click()
-        qt_app.processEvents()
-        check("over-threshold provider run asks to confirm",
-              len(question_calls8) == 1, str(len(question_calls8)))
-        if question_calls8:
-            check("confirm dialog names the estimated cost",
-                  "$1.67" in question_calls8[0], question_calls8[0])
-            check("confirm dialog names the model",
-                  "v8-provider / fake-gpt-smart" in question_calls8[0],
-                  question_calls8[0])
-        check("answering No starts no run",
-              window8.worker is None
-              and window8.status_label.text() == "Run cancelled.",
-              window8.status_label.text())
-        question_answer8["answer"] = QMessageBox.Yes
-        window8.run_button.click()
-        done8 = wait_until(
-            lambda: window8.worker is None
-            and window8.save_button.isEnabled(),
-            timeout=120, app=qt_app)
-        check("answering Yes runs the provider model", done8)
-        check("provider math run scored 100%",
-              window8.results.get(
-                  "v8-provider / fake-gpt-smart", {}).get(
-                  "templates", {}).get("math", {}).get("template_score")
-              == 100.0,
-              str(window8.results.get("v8-provider / fake-gpt-smart", {})))
+        # ---------- v8 T10: cost guard (now the run preview, v13) ---------
+        # R11 folded the cost guard into the run preview: every run
+        # shows its preview (models, steps, time, cost) and asks to
+        # go ahead. The preview seam is stubbed here to record the
+        # preview text and answer Run or Adjust on demand; the real
+        # seam (the suite-wide Run stub) is restored in the finally.
+        preview_calls8 = []
+        preview_answer8 = {"answer": True}
 
-        # A cheap run proceeds with no dialog at all.
-        set_checked_list(window8.model_list,
-                         {"v8-provider / fake-gpt-partial"})
-        set_checked_templates(window8, {"math"})
-        question_calls8.clear()
-        window8.run_button.click()
-        done8c = wait_until(
-            lambda: window8.worker is None
-            and window8.save_button.isEnabled(),
-            timeout=120, app=qt_app)
-        check("cheap provider run asks no confirm",
-              len(question_calls8) == 0, str(question_calls8))
-        check("cheap provider run completes", done8c)
-        check("partial math scored 60%",
-              window8.results.get(
-                  "v8-provider / fake-gpt-partial", {}).get(
-                  "templates", {}).get("math", {}).get("template_score")
-              == 60.0,
-              str(window8.results.get("v8-provider / fake-gpt-partial", {})))
+        def fake_preview8(self, targets, templates):
+            preview = app.build_run_preview(
+                targets, templates, app.get_results_dir())
+            preview_calls8.append(preview["text"])
+            return preview_answer8["answer"]
 
-        # No prices saved: the estimate says so plainly and still asks.
-        set_checked_list(window8.model_list,
-                         {"v8-provider / fake-gpt-dumb"})
-        set_checked_templates(window8, {"math"})
-        question_answer8["answer"] = QMessageBox.No
-        question_calls8.clear()
-        window8.run_button.click()
-        qt_app.processEvents()
-        check("unknown-price run asks to confirm",
-              len(question_calls8) == 1, str(len(question_calls8)))
-        if question_calls8:
-            check("unknown-price dialog says cost unknown plainly",
-                  "no prices saved: cost unknown" in question_calls8[0],
-                  question_calls8[0])
-        check("answering No to the unknown-price run starts nothing",
-              window8.worker is None)
+        real_preview8 = app.MainWindow._show_run_preview
+        app.MainWindow._show_run_preview = fake_preview8
+        try:
+            set_checked_list(window8.model_list,
+                             {"v8-provider / fake-gpt-smart"})
+            set_checked_templates(window8, {"math"})
+            preview_answer8["answer"] = False
+            preview_calls8.clear()
+            window8.run_button.click()
+            qt_app.processEvents()
+            check("provider run shows its preview",
+                  len(preview_calls8) == 1, str(len(preview_calls8)))
+            if preview_calls8:
+                check("preview names the estimated cost",
+                      "$1.67" in preview_calls8[0], preview_calls8[0])
+                check("preview names the model",
+                      "v8-provider / fake-gpt-smart" in preview_calls8[0],
+                      preview_calls8[0])
+            check("answering Adjust starts no run",
+                  window8.worker is None
+                  and window8.status_label.text() == "Run cancelled.",
+                  window8.status_label.text())
+            preview_answer8["answer"] = True
+            window8.run_button.click()
+            done8 = wait_until(
+                lambda: window8.worker is None
+                and window8.save_button.isEnabled(),
+                timeout=120, app=qt_app)
+            check("answering Run runs the provider model", done8)
+            check("provider math run scored 100%",
+                  window8.results.get(
+                      "v8-provider / fake-gpt-smart", {}).get(
+                      "templates", {}).get("math", {}).get("template_score")
+                  == 100.0,
+                  str(window8.results.get("v8-provider / fake-gpt-smart", {})))
 
-        # A local-only run never sees the guard.
-        set_checked_list(window8.model_list, {"fake-smart:2b"})
-        set_checked_templates(window8, {"math"})
-        question_calls8.clear()
-        window8.run_button.click()
-        done8l = wait_until(
-            lambda: window8.worker is None
-            and window8.save_button.isEnabled(),
-            timeout=120, app=qt_app)
-        check("local-only run asks no confirm",
-              len(question_calls8) == 0, str(question_calls8))
-        check("local run completes", done8l)
+            # A cheap run shows its preview too — the preview is for
+            # every run, not just expensive ones.
+            set_checked_list(window8.model_list,
+                             {"v8-provider / fake-gpt-partial"})
+            set_checked_templates(window8, {"math"})
+            preview_calls8.clear()
+            window8.run_button.click()
+            done8c = wait_until(
+                lambda: window8.worker is None
+                and window8.save_button.isEnabled(),
+                timeout=120, app=qt_app)
+            check("cheap provider run shows its preview",
+                  len(preview_calls8) == 1, str(preview_calls8))
+            check("cheap provider run completes", done8c)
+            check("partial math scored 60%",
+                  window8.results.get(
+                      "v8-provider / fake-gpt-partial", {}).get(
+                      "templates", {}).get("math", {}).get("template_score")
+                  == 60.0,
+                  str(window8.results.get("v8-provider / fake-gpt-partial", {})))
+
+            # No prices saved: the preview says so plainly and still asks.
+            set_checked_list(window8.model_list,
+                             {"v8-provider / fake-gpt-dumb"})
+            set_checked_templates(window8, {"math"})
+            preview_answer8["answer"] = False
+            preview_calls8.clear()
+            window8.run_button.click()
+            qt_app.processEvents()
+            check("unknown-price run shows its preview",
+                  len(preview_calls8) == 1, str(len(preview_calls8)))
+            if preview_calls8:
+                check("unknown-price preview says cost unknown plainly",
+                      "no prices saved: cost unknown" in preview_calls8[0],
+                      preview_calls8[0])
+            check("answering Adjust to the unknown-price run starts nothing",
+                  window8.worker is None)
+
+            # A local-only run shows the preview too — and its cost
+            # line says there is nothing to pay.
+            set_checked_list(window8.model_list, {"fake-smart:2b"})
+            set_checked_templates(window8, {"math"})
+            preview_calls8.clear()
+            window8.run_button.click()
+            done8l = wait_until(
+                lambda: window8.worker is None
+                and window8.save_button.isEnabled(),
+                timeout=120, app=qt_app)
+            check("local-only run shows its preview",
+                  len(preview_calls8) == 1, str(preview_calls8))
+            if preview_calls8:
+                check("local preview says nothing to pay",
+                      "nothing to pay" in preview_calls8[0],
+                      preview_calls8[0])
+            check("local run completes", done8l)
+        finally:
+            app.MainWindow._show_run_preview = real_preview8
 
         # ---------- v8 T10: per-template time budget ----------------------
         # A real run through the worker: a 1-second budget on math
@@ -4774,10 +4806,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v12",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v12",
+        check("title bar shows v13",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v13",
               window9.windowTitle())
-        check("__version__ is 12", app.__version__ == "12", app.__version__)
+        check("__version__ is 13", app.__version__ == "13", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -5563,7 +5595,308 @@ def main():
         else:
             os.environ["OST_RESULTS_DIR"] = prior_results12
 
+    # ---------- v13: run preview (R11), honest progress (R12),
+    # calm status + finish moment (R13), answers + TTFT (R15) ----------
+    # Unit checks first (no window needed), then a real run through
+    # a fresh window on the fake server. The checklist keys live in
+    # the real QSettings, so the prior values are saved here and
+    # restored in the finally, leaving no state behind.
+    check("fmt_eta seconds", app.fmt_eta(45) == "45s", app.fmt_eta(45))
+    check("fmt_eta minutes", app.fmt_eta(180) == "3m", app.fmt_eta(180))
+    check("fmt_eta hours and minutes",
+          app.fmt_eta(3900) == "1h 5m", app.fmt_eta(3900))
+    check("fmt_eta whole hours", app.fmt_eta(3600) == "1h",
+          app.fmt_eta(3600))
+    check("fmt_eta None is n/a", app.fmt_eta(None) == "n/a")
+    check("fmt_eta rounds to whole seconds",
+          app.fmt_eta(59.6) == "1m", app.fmt_eta(59.6))
+
+    by_id13 = {t["id"]: t for t in templates}
+    tgt13 = app.ollama_target("fake-smart:2b", ["text"])
+    check("step count is warmup + tasks",
+          app.count_run_steps([tgt13], [by_id13["coding"]]) == 6,
+          str(app.count_run_steps([tgt13], [by_id13["coding"]])))
+    check("step count covers the Speed context lengths",
+          app.count_run_steps([tgt13], [by_id13["speed"]])
+          == 1 + len(by_id13["speed"]["context_lengths"]),
+          str(app.count_run_steps([tgt13], [by_id13["speed"]])))
+    check("step count counts multi-turn turns",
+          app.count_run_steps([tgt13], [by_id13["multi_turn"]])
+          == 1 + sum(len(t["turns"])
+                     for t in by_id13["multi_turn"]["tasks"]),
+          str(app.count_run_steps([tgt13], [by_id13["multi_turn"]])))
+    check("step count skips templates the model cannot run",
+          app.count_run_steps([tgt13], [by_id13["vision"]]) == 1,
+          str(app.count_run_steps([tgt13], [by_id13["vision"]])))
+    check("step count is at least 1 with nothing to run",
+          app.count_run_steps([], []) == 1,
+          str(app.count_run_steps([], [])))
+
+    empty13 = os.path.join(SCRATCH, "results13-empty")
+    os.makedirs(empty13, exist_ok=True)
+    check("no past runs means no measured speed",
+          app.latest_decode_speed(empty13, "fake-smart:2b") is None)
+    pv13 = app.build_run_preview([tgt13], [by_id13["coding"]], empty13)
+    check("preview names the model and template counts",
+          "1 model, 1 template, 6 steps in total." in pv13["text"],
+          pv13["text"])
+    check("preview says the time is an upper estimate",
+          "at most about" in pv13["text"]
+          and "upper estimate" in pv13["text"], pv13["text"])
+    check("preview says local runs cost nothing",
+          "nothing to pay" in pv13["text"], pv13["text"])
+    check("preview total steps matches the counter",
+          pv13["total_steps"] == 6, str(pv13["total_steps"]))
+    check("preview cost is None for a local-only run",
+          pv13["cost"] is None)
+    # A past run at 100 tok/s makes the same preview much shorter
+    # than the 8 tok/s default for a model that never ran here.
+    past13 = os.path.join(SCRATCH, "results13-past")
+    past_dir13 = os.path.join(past13, "fake-smart_2b", "sys1")
+    os.makedirs(past_dir13, exist_ok=True)
+    with open(os.path.join(
+            past_dir13, "2026-11-14T00-00-00-coding.json"),
+            "w", encoding="utf-8") as handle:
+        json.dump({"timestamp": "2026-11-14T00:00:00",
+                   "template": "coding", "template_name": "Coding",
+                   "template_score": 100.0,
+                   "avg_decode_tok_s": 100.0}, handle)
+    check("measured speed comes from the newest past run",
+          app.latest_decode_speed(past13, "fake-smart:2b") == 100.0,
+          str(app.latest_decode_speed(past13, "fake-smart:2b")))
+    pv13_fast = app.build_run_preview(
+        [tgt13], [by_id13["coding"]], past13)
+    check("a fast past run shortens the time estimate",
+          pv13_fast["seconds_upper"] < pv13["seconds_upper"],
+          f"{pv13_fast['seconds_upper']:.1f} vs "
+          f"{pv13['seconds_upper']:.1f}")
+    ptgt13 = {"label": "prov / m", "kind": "provider", "model": "m",
+              "provider_name": "prov", "provider": {"name": "prov"},
+              "capabilities": ["text"],
+              "price_input_per_1m": 2.0, "price_output_per_1m": 8.0}
+    pv13p = app.build_run_preview([ptgt13], [by_id13["math"]], empty13)
+    check("provider preview names the model and its cost",
+          "prov / m" in pv13p["text"] and "about $" in pv13p["text"],
+          pv13p["text"])
+    check("provider preview total is a number",
+          pv13p["cost"] is not None
+          and pv13p["cost"]["total"] is not None)
+    ptgt13u = dict(ptgt13, label="prov / u",
+                   price_input_per_1m=None, price_output_per_1m=None)
+    pv13u = app.build_run_preview([ptgt13u], [by_id13["math"]], empty13)
+    check("unknown-price preview says cost unknown plainly",
+          "no prices saved: cost unknown" in pv13u["text"], pv13u["text"])
+    check("unknown-price preview total is None",
+          pv13u["cost"]["total"] is None)
+
+    from PySide6.QtCore import QSettings as QSettings13
+    from PySide6.QtWidgets import QDialog
+    settings13 = QSettings13("BrokeNBored", app.APP_NAME)
+    prior_dismissed13 = settings13.value("setup_dismissed")
+    prior_completed13 = settings13.value("setup_completed")
+    prior_results13 = os.environ.get("OST_RESULTS_DIR")
+    results13 = os.path.join(SCRATCH, "results13")
+    os.makedirs(results13, exist_ok=True)
+    os.environ["OST_RESULTS_DIR"] = results13
+    server13, _t13 = fake_ollama.start_server()
+    host13, port13 = server13.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host13}:{port13}"
+    window13 = app.MainWindow()
+    window13.show()
+    wait_until(lambda: window13.model_list.count() == 4, timeout=10,
+               app=qt_app)
+    try:
+        # R11: the dialog itself, driven without exec (a real modal
+        # dialog would hang the suite).
+        dialog13 = app.RunPreviewDialog(window13, pv13["text"])
+        check("preview dialog shows the preview text",
+              dialog13.text_view.toPlainText() == pv13["text"])
+        check("preview dialog has Run and Adjust buttons",
+              dialog13.run_button.text() == "Run"
+              and dialog13.adjust_button.text() == "Adjust")
+        check("Run is the dialog default",
+              dialog13.run_button.isDefault())
+        dialog13.run_button.click()
+        check("pressing Run accepts the dialog",
+              dialog13.result() == QDialog.Accepted,
+              str(dialog13.result()))
+        dialog13b = app.RunPreviewDialog(window13, pv13["text"])
+        dialog13b.adjust_button.click()
+        check("pressing Adjust rejects the dialog",
+              dialog13b.result() == QDialog.Rejected,
+              str(dialog13b.result()))
+        dialog13.close()
+        dialog13b.close()
+
+        # R13/R12/R15: the starting state, then a real run.
+        check("run chip starts on Ready",
+              window13.run_chip.text() == "Ready",
+              window13.run_chip.text())
+        check("finish label starts hidden",
+              not window13.finish_label.isVisible())
+        check("progress detail starts empty",
+              window13.progress_detail.text() == "",
+              repr(window13.progress_detail.text()))
+        check("results table has the six v13 columns",
+              [window13.table.horizontalHeaderItem(c).text()
+               for c in range(window13.table.columnCount())]
+              == ["Model", "Overall score", "Avg decode tok/s",
+                  "Avg TTFT", "Avg prompt tok/s", "Status"],
+              str([window13.table.horizontalHeaderItem(c).text()
+                   for c in range(window13.table.columnCount())]))
+        set_checked_list(window13.model_list,
+                         {"fake-smart:2b", "fake-partial:3b",
+                          "fake-dumb:1b"})
+        set_checked_templates(window13, {"math", "coding"})
+        window13.run_button.click()
+        mid13 = wait_until(
+            lambda: "steps done" in window13.progress_detail.text(),
+            timeout=30, app=qt_app)
+        check("progress line shows a step count mid-run", mid13,
+              window13.progress_detail.text())
+        check("run chip says Running during a run",
+              window13.run_chip.text() == "Running",
+              window13.run_chip.text())
+        check("Cancel is enabled during a run",
+              window13.cancel_button.isEnabled())
+        check("progress line shows elapsed time",
+              "elapsed" in window13.progress_detail.text(),
+              window13.progress_detail.text())
+        check("progress line estimates the time left",
+              "left" in window13.progress_detail.text()
+              or "estimating" in window13.progress_detail.text(),
+              window13.progress_detail.text())
+        done13 = wait_until(
+            lambda: window13.worker is None
+            and window13.save_button.isEnabled(),
+            timeout=300, app=qt_app)
+        check("v13 run completes", done13)
+        check("run chip says Done after a run",
+              window13.run_chip.text() == "Done",
+              window13.run_chip.text())
+        check("finish label shows after a run",
+              window13.finish_label.isVisible())
+        check("finish label names the best model and score",
+              "fake-smart:2b" in window13.finish_label.text()
+              and "100%" in window13.finish_label.text(),
+              window13.finish_label.text())
+        check("finish label names the best speed",
+              "20.0 tok/s" in window13.finish_label.text(),
+              window13.finish_label.text())
+        check("finish label names the run totals",
+              "3 models, 2 templates" in window13.finish_label.text(),
+              window13.finish_label.text())
+        check("progress line keeps its final count",
+              "33 of 33 steps done" in window13.progress_detail.text(),
+              window13.progress_detail.text())
+        row_smart13 = row_for(window13, "fake-smart:2b")
+        row_partial13 = row_for(window13, "fake-partial:3b")
+        row_dumb13 = row_for(window13, "fake-dumb:1b")
+        check("smart prompt speed is 40.0 tok/s",
+              row_smart13 is not None
+              and table_text(window13, row_smart13, 4) == "40.0",
+              table_text(window13, row_smart13, 4)
+              if row_smart13 is not None else "no row")
+        check("partial prompt speed is 20.0 tok/s",
+              row_partial13 is not None
+              and table_text(window13, row_partial13, 4) == "20.0",
+              table_text(window13, row_partial13, 4)
+              if row_partial13 is not None else "no row")
+        check("dumb prompt speed is 10.0 tok/s",
+              row_dumb13 is not None
+              and table_text(window13, row_dumb13, 4) == "10.0",
+              table_text(window13, row_dumb13, 4)
+              if row_dumb13 is not None else "no row")
+        ttft13 = (table_text(window13, row_smart13, 3)
+                  if row_smart13 is not None else "")
+        check("smart TTFT is shown in ms or seconds",
+              ttft13.endswith(" ms") or ttft13.endswith(" s"), ttft13)
+        check("status is in the last column after the run",
+              row_smart13 is not None
+              and table_text(window13, row_smart13, 5) == "done",
+              table_text(window13, row_smart13, 5)
+              if row_smart13 is not None else "no row")
+        if row_smart13 is not None:
+            window13.table.selectRow(row_smart13)
+            window13.on_table_clicked(row_smart13, 0)
+            detail13 = window13.detail_view.toPlainText()
+            check("detail view shows the saved answer",
+                  "def fib" in detail13, detail13[:400])
+            check("detail view shows first-token latency",
+                  "First token" in detail13, detail13[:200])
+            check("detail view shows prompt speed",
+                  "prompt 40.0 tok/s" in detail13, detail13[:200])
+
+        # Turn answers: drive show_detail with a fabricated
+        # multi-turn result, no run needed.
+        window13.results["probe-model"] = {
+            "name": "probe-model", "status": "done",
+            "overall_score": 100.0, "avg_decode_tok_s": 20.0,
+            "avg_ttft_s": 0.5, "avg_prompt_tok_s": 40.0,
+            "total_tokens": None,
+            "templates": {"multi_turn": {
+                "template": "multi_turn",
+                "template_name": "Multi-turn",
+                "template_score": 100.0, "passed": 1, "total": 1,
+                "not_run": 0, "avg_decode_tok_s": 20.0,
+                "tasks": [{"id": "mt1", "passed": True,
+                           "decode_tok_s": 20.0,
+                           "answer": "last turn answer",
+                           "turns": [
+                               {"prompt": "first?", "passed": True,
+                                "answer": "first turn answer"},
+                               {"prompt": "second?", "passed": True,
+                                "answer": "second turn answer"},
+                           ]}],
+            }},
+        }
+        window13.show_detail("probe-model")
+        detail_mt13 = window13.detail_view.toPlainText()
+        check("detail view shows each turn's answer",
+              "first turn answer" in detail_mt13
+              and "second turn answer" in detail_mt13, detail_mt13)
+        del window13.results["probe-model"]
+
+        # A cancelled run: chip says Stopped, no finish headline.
+        set_checked_list(window13.model_list, {"fake-smart:2b"})
+        set_checked_templates(window13, {"math", "coding"})
+        window13.run_button.click()
+        mid13b = wait_until(
+            lambda: "steps done" in window13.progress_detail.text(),
+            timeout=30, app=qt_app)
+        check("second run starts (for the cancel check)", mid13b)
+        window13.cancel_button.click()
+        qt_app.processEvents()
+        cancelled13 = wait_until(lambda: window13.worker is None,
+                                 timeout=120, app=qt_app)
+        check("cancelled run stops", cancelled13)
+        check("run chip says Stopped after a cancel",
+              window13.run_chip.text() == "Stopped",
+              window13.run_chip.text())
+        check("no finish headline after a cancel",
+              not window13.finish_label.isVisible())
+    finally:
+        window13.close()
+        window13.deleteLater()
+        qt_app.processEvents()
+        server13.shutdown()
+        server13.server_close()
+        if prior_dismissed13 is None:
+            settings13.remove("setup_dismissed")
+        else:
+            settings13.setValue("setup_dismissed", prior_dismissed13)
+        if prior_completed13 is None:
+            settings13.remove("setup_completed")
+        else:
+            settings13.setValue("setup_completed", prior_completed13)
+        settings13.sync()
+        if prior_results13 is None:
+            os.environ.pop("OST_RESULTS_DIR", None)
+        else:
+            os.environ["OST_RESULTS_DIR"] = prior_results13
+
     QMessageBox.question = _suite_real_question
+    app.MainWindow._show_run_preview = _suite_real_preview
 
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
