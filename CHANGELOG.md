@@ -1,5 +1,43 @@
 # Changelog
 
+## v16 (2026-11-14)
+
+Math scoring rework (tasks M1–M6 from the math list). No UI
+changes, no new templates — the Math template grows from 5 tasks
+to 10, and every numeric answer in the app is scored by the new
+rules.
+
+- Score the last number (M1). The scorer used to pass when the
+  expected number appeared anywhere in the answer — in wrong
+  working, a discarded guess, or a "let me check" aside. Now the
+  last number in the answer is the answer: working that mentions
+  21 but concludes 19 fails, and the detail names the final
+  answer ("final answer was 19, expected 21").
+- Per-task tolerance (M2). The flat 1% tolerance is gone: a
+  numeric answer must match exactly, unless the task gives an
+  absolute tolerance or says approximate (1%). The train task
+  (150 miles) now rejects 149 and 151.
+- Ten math tasks (M3). The 5 current tasks stay as the easy end.
+  Five harder ones join them: a two-step word problem (muffins),
+  a three-step money problem with a decimal answer (taxi), a
+  fraction answer (pizza, 5/8 as 0.625), a unit conversion
+  (liters to milliliters), and solve for x. The fake brains now
+  separate on math: smart 100%, partial 50%, dumb 0%.
+- Partial credit for right setup (M4). A numeric task can carry
+  intermediate step values; each step scores when its value
+  appears in the working, and the final answer scores on the
+  last number. A task with the right setup and the wrong final
+  scores half, not 0 and not full, and the detail view marks it
+  "partial (0.5)". Template scores and passed counts are over
+  credits now, so a half-right task counts half ("(4.5/5)").
+- Number words (M5). Written numbers become digits before
+  scoring: "twenty-one" passes the apples task, "one hundred and
+  fifty" passes the train task. Only whole words, so "someone"
+  is untouched.
+- Fractions and scientific notation (M6). "1/2" extracts as 0.5,
+  not 1 and 2; "1.5e3" extracts as 1500. A zero denominator is
+  skipped, never an error.
+
 ## v15 (2026-11-14)
 
 UI redesign, part 5 (tasks R19, R20, R21, R22, R23, R24) — the

@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v15
+# TEST-REPORT — OLLAMA SYSTEM TEST v16
 
 Verified 2026-11-14 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
@@ -8,6 +8,19 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v16 is the math-scoring release (tasks M1–M6 from the math list):
+the Math template grows from 5 tasks to 10, from one-step sums
+to multi-step problems, a fraction answer, algebra, and a unit
+conversion — and every numeric answer in the app is scored by
+stricter rules. The last number in the answer is the answer, so
+a number mentioned in passing no longer passes; answers must
+match exactly unless the task gives a tolerance or says
+approximate; written numbers ("twenty-one") and fractions
+("1/2") score like digits; and a task with the right setup and
+the wrong final answer scores partial credit instead of 0, marked
+"partial (0.5)" in the detail view. No UI changes, no new
+templates.
 
 v15 is the pulls-and-polish release (tasks R19, R20, R21, R22, R23,
 R24 from the redesign list): a pull can be stopped and resumed,
@@ -102,10 +115,26 @@ all runtime tests ran against the fake servers from v5/v6 (fake Ollama
 with /api/show, /api/chat with images and tools; fake OpenAI-compatible
 provider with image_url parts, tool-call SSE deltas, image generation,
 transcription, and speech). Test suite:
-tests/run_tests.py in this tree — **1323 passed, 0 failed** (final
-run; the v14 suite's 1232 checks are all carried over and green
-inside that count, plus 91 new v15 checks). The road to green: the
-first run came back 1316/4, all four test-only. The v14 providers
+tests/run_tests.py in this tree — **1359 passed, 0 failed** (final
+run; the v15 suite's 1323 checks are all carried over and green
+inside that count, plus 36 new v16 checks). The road to green: the
+first run crashed at the audio checks — the new number-word dicts
+were named _ONES/_TENS, which the v10 transcript normalizer
+already owns (digits to words), so the new dicts overwrote the old
+ones and transcript_words died with KeyError: 1. A real app defect
+(the suite caught it, not the probes — the probes never called
+transcript_words). The v16 dicts are _WORD_ONES/_WORD_TENS now,
+and the second run came back 1351/8 — all eight test-only, all
+numbers the math growth moved that the first sweep missed: the
+provider full run's detail tokens (1,680 in, 16,800 out) and its
+cost, which crosses the $0.01 line now so fmt_cost shows $0.01
+instead of four decimals (the profile totals moved the same
+way: 1,660 in, 16,600 out, $0.01); the budget check's total
+(10 minus stopped, not 5); and the template filter's label
+("Math (10 tasks)" in two checks). The third run from a fresh
+unzip on workspace disk, TMPDIR=/tmp/ost-v16 with a watchdog
+keeping it alive, is the green 1359 above. The v15
+suite's own history follows: the first run came back 1316/4, all four test-only. The v14 providers
 sections check searched the whole window for group boxes, and the
 v15 try-it box is a third one — the check now searches the
 Providers tab page only. The v14 settings-accept check compared
@@ -183,6 +212,60 @@ test (it stamped its run files 09:00, which is only "later" before
 09:00) and four version pins still said v9. Both were fixed in the
 test, not the app, and the re-run from a fresh unzip is the green
 1016 that v11 carries.
+
+## What was verified (v16)
+
+No GUI drive: v16 changes scoring only, and the one visible
+change — the template list reading "Math (10 tasks)" — is a
+label built from the template file, covered by the suite's
+template-filter checks (which read the visible label text) and
+by the "math has 10 tasks" check on the file itself. What the
+suite proves, section by section:
+
+§1. Last-number scoring (M1). An answer whose working mentions
+21 but concludes 19 fails; one concluding 21 passes; and the
+detail names the final answer ("final answer was 19, expected
+21"). The four existing numeric checks (21 passes, 150.0 passes,
+20 fails, no numbers fail) still pass under the new rule.
+
+§2. Per-task tolerance (M2). The train task rejects 149 and 151
+and accepts 150 exactly. A task marked approximate still allows
+1% (149 passes, 148 fails), and an absolute tolerance allows
+what it says (151 passes with a tolerance of 2, 153 fails).
+
+§3. Ten math tasks (M3). The template keeps its 5 easy tasks
+first and adds muffins (two-step, step 48), taxi (three-step,
+step 25, decimal answer 32.5), pizza (fraction 5/8 as 0.625),
+milliliters (unit conversion, 2500), and solve-x (algebra, 5).
+A real run through the window — smart, partial, and dumb on math
+only — separates them: 100%, 50%, 0%, with 10 tasks and passed
+counts of 10, 5, and 0. The fake server's partial brain gets 2
+of the 5 new tasks (muffins, pizza).
+
+§4. Partial credit (M4). Right setup with a wrong final scores
+0.5; fully wrong scores 0; all right scores 1. The task fails
+unless every part is right, and the detail names the right step.
+End to end through a real worker run, a canned answer with the
+right step (25) and the wrong final (30) scores 50% with passed
+0.5 and total 1, the task record carries credit 0.5, and both
+the run summary and the detail view mark it "partial (0.5)".
+
+§5. Number words and fractions (M5, M6). "twenty-one" is 21,
+"one hundred and fifty" is 150, and "someone" is untouched;
+written numbers pass the apples and train tasks. "1/2" extracts
+as 0.5, "5/8" as 0.625, "1.5e3" as 1500, and a fraction answer
+passes the pizza task; "1,000 and 2.5" still extracts as
+1000.0 and 2.5, and a zero denominator is skipped.
+
+§6. What the growth moved, and what did not. Growing math to 10
+tasks moved the numbers that depend on it, all updated in the
+suite and green: the full-run partial overall is 59% now (math
+50% among fourteen 60% templates), the compare overall for the
+math+coding export run is 55%, the v13 run's final count is
+48 of 48 steps, the v8 preview cost is $3.29, and a full run is
+108 prompts. Every other template still scores 100/60/0 across
+the three brains under the new scorer (probed directly before
+the suite ran), so the stricter rules changed math only.
 
 ## What was verified (v15)
 

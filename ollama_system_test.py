@@ -151,7 +151,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "15"
+__version__ = "16"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -2466,23 +2466,234 @@ def score_contains(answer, expected):
     return False, f"expected '{expected}' not in the answer"
 
 
+# Number words (M5/T5): zero to nineteen, the tens, and hundred.
+# The normalizer turns written numbers into digits before
+# extraction, so "twenty-one" and "one hundred and fifty" score
+# like 21 and 150. Named _WORD_* because _ONES/_TENS already
+# exist above (v10: digits to words, for transcripts).
+_WORD_ONES = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_WORD_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_NUMBER_WORDS = dict(_WORD_ONES)
+_NUMBER_WORDS.update(_WORD_TENS)
+
+
+def _spell_number_words(text):
+    """Replace written numbers with digits (M5): zero to nineteen,
+    tens, tens-and-ones ("twenty-one", "twenty one"), and hundreds
+    ("one hundred", "one hundred and fifty"). Only whole words, so
+    "someone" is untouched; "and" only joins inside a hundred run
+    ("one hundred and fifty"), never starts or ends one. Case
+    insensitive. Text without number words comes back unchanged."""
+    tokens = re.findall(r"[A-Za-z]+|[^A-Za-z]+", str(text))
+    out = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        lowered = token.lower()
+        if lowered not in _NUMBER_WORDS and lowered != "hundred":
+            out.append(token)
+            index += 1
+            continue
+        # A run of number words: collect its value, then emit the
+        # digits once for the whole run. Separators the run
+        # consumed are dropped with it; a trailing separator the
+        # run did not consume stays in the text.
+        current = 0
+        while index < len(tokens):
+            word = tokens[index].lower()
+            if word in _NUMBER_WORDS:
+                current += _NUMBER_WORDS[word]
+                index += 1
+            elif word == "hundred":
+                current = (current or 1) * 100
+                index += 1
+            elif word == "and" and current:
+                # "and" joins only when a number word follows it.
+                following = None
+                look = index + 1
+                while look < len(tokens):
+                    if tokens[look].strip():
+                        following = tokens[look].lower()
+                        break
+                    look += 1
+                if following in _NUMBER_WORDS or following == "hundred":
+                    index += 1
+                else:
+                    break
+            elif not word.strip():
+                # Whitespace inside a run (or a hyphen, which the
+                # tokenizer splits out): skip it, the run continues
+                # when the next word is a number word.
+                following = None
+                look = index + 1
+                while look < len(tokens):
+                    if tokens[look].strip():
+                        following = tokens[look].lower()
+                        break
+                    look += 1
+                if (following in _NUMBER_WORDS
+                        or following == "hundred"
+                        or (following == "and" and current)):
+                    index += 1
+                else:
+                    break
+            elif word == "-":
+                index += 1
+            else:
+                break
+        out.append(str(current))
+    return "".join(out)
+
+
+# One number token: a fraction first ("1/2"), then scientific
+# notation ("1.5e3"), then a plain number. The order matters —
+# "1/2" must match as a fraction, not as 1 and 2.
+_NUMBER_RE = re.compile(
+    r"-?\d+(?:\.\d+)?\s*/\s*-?\d+(?:\.\d+)?"
+    r"|-?\d+(?:\.\d+)?[eE][+-]?\d+"
+    r"|-?\d+(?:\.\d+)?"
+)
+
+
 def _extract_numbers(answer):
-    found = re.findall(r"-?\d+(?:\.\d+)?", str(answer).replace(",", ""))
+    """Numbers in an answer, left to right (M5/M6): written numbers
+    become digits first ("twenty-one" is 21), fractions evaluate
+    ("1/2" is 0.5, not 1 and 2), and scientific notation matches
+    ("1.5e3" is 1500). Commas are stripped, so "1,000" is 1000.
+    A zero denominator is skipped, never an error."""
+    text = _spell_number_words(str(answer).replace(",", ""))
     numbers = []
-    for item in found:
-        try:
-            numbers.append(float(item))
-        except ValueError:
-            pass
+    for match in _NUMBER_RE.finditer(text):
+        token = match.group(0)
+        if "/" in token:
+            numerator, denominator = token.split("/")
+            try:
+                divisor = float(denominator)
+                if divisor == 0:
+                    continue
+                numbers.append(float(numerator) / divisor)
+            except ValueError:
+                pass
+        else:
+            try:
+                numbers.append(float(token))
+            except ValueError:
+                pass
     return numbers
 
 
-def score_numeric(answer, expected):
-    """Expected number appears as a number in the answer."""
-    for value in _extract_numbers(answer):
-        if abs(value - float(expected)) <= 0.01 * max(1.0, abs(float(expected))):
-            return True, ""
-    return False, f"expected the number {expected} in the answer"
+def _numbers_match(value, expected, tolerance=None, approximate=False):
+    """One number against one expected value, with the task's
+    tolerance (M2): an absolute tolerance when the task gives one,
+    1% when the task says approximate, exact otherwise."""
+    expected = float(expected)
+    if tolerance is not None:
+        return abs(value - expected) <= float(tolerance)
+    if approximate:
+        return abs(value - expected) <= 0.01 * max(1.0, abs(expected))
+    return value == expected
+
+
+def score_numeric(answer, expected, tolerance=None, approximate=False):
+    """The LAST number in the answer must match the expected value
+    (M1) — a number mentioned in passing no longer passes. Exact
+    unless the task gives a tolerance or says approximate (M2)."""
+    numbers = _extract_numbers(answer)
+    if not numbers:
+        return False, f"expected the number {expected} in the answer"
+    if _numbers_match(numbers[-1], expected, tolerance, approximate):
+        return True, ""
+    return False, (
+        f"final answer was {numbers[-1]:g}, "
+        f"expected {float(expected):g}"
+    )
+
+
+def _numeric_parts(answer, task):
+    """A numeric task's parts (M4): (final_ok, steps_ok, numbers).
+    The final answer scores on the last number; each intermediate
+    step scores when its value appears anywhere in the working."""
+    numbers = _extract_numbers(answer)
+    tolerance = task.get("tolerance")
+    approximate = bool(task.get("approximate", False))
+    if not numbers:
+        return False, [False] * len(task.get("steps") or []), numbers
+    final_ok = _numbers_match(
+        numbers[-1], task.get("expected"), tolerance, approximate)
+    steps_ok = [
+        any(_numbers_match(value, step, tolerance, approximate)
+            for value in numbers)
+        for step in (task.get("steps") or [])
+    ]
+    return final_ok, steps_ok, numbers
+
+
+def score_numeric_task(answer, task):
+    """A numeric task with its tolerance and steps (M2/M4). Passed
+    means every part right — the final answer and every
+    intermediate step. The detail names what was right, so a
+    partial answer says so instead of just failing."""
+    final_ok, steps_ok, numbers = _numeric_parts(answer, task)
+    steps = task.get("steps") or []
+    if not numbers:
+        return False, (
+            f"expected the number {task.get('expected')} in the answer"
+        )
+    if final_ok and all(steps_ok):
+        return True, ""
+    parts = []
+    for step, ok in zip(steps, steps_ok):
+        parts.append(
+            f"step {float(step):g} {'right' if ok else 'not found'}")
+    parts.append(
+        "final answer right"
+        if final_ok
+        else f"final answer was {numbers[-1]:g}, "
+             f"expected {float(task.get('expected')):g}"
+    )
+    return False, "; ".join(parts)
+
+
+def task_credit(task, answer, passed):
+    """Credit 0.0-1.0 for one task's answer (M4). A numeric task
+    with a steps list earns a fraction per part right — the final
+    answer plus each intermediate step — so right setup with a
+    wrong final scores partial, not 0 and not full. Everything
+    else earns 1.0 for a pass, 0.0 for a fail."""
+    if task.get("rule") == "numeric" and task.get("steps"):
+        final_ok, steps_ok, _numbers = _numeric_parts(answer, task)
+        parts = len(steps_ok) + 1
+        got = sum(steps_ok) + (1 if final_ok else 0)
+        return got / parts if parts else 0.0
+    return 1.0 if passed else 0.0
+
+
+def task_mark(task):
+    """One task's mark for the detail and summary views (M4):
+    pass, fail, partial with its credit ("partial (0.5)"), not
+    run, time budget reached, or run (unscored)."""
+    passed = task.get("passed")
+    if passed is True:
+        return "pass"
+    if passed is False:
+        credit = task.get("credit")
+        if credit is not None and 0 < credit < 1:
+            return f"partial ({credit:g})"
+        return "fail"
+    if is_not_run(task):
+        return "not run"
+    if is_budget_stopped(task):
+        return "time budget reached"
+    return "run"
 
 
 def extract_json(answer):
@@ -2818,7 +3029,7 @@ def score_task(task, answer):
     if rule == "contains_all":
         return score_contains_all(answer, task.get("expected", []))
     if rule == "numeric":
-        return score_numeric(answer, task.get("expected"))
+        return score_numeric_task(answer, task)
     if rule == "json":
         return score_json(answer, task.get("expected", {}))
     if rule == "code":
@@ -3547,16 +3758,7 @@ def render_run_summary(run_data):
     lines.append("")
     for task in run_data.get("tasks", []):
         passed = task.get("passed")
-        if passed is True:
-            mark = "pass"
-        elif passed is False:
-            mark = "fail"
-        elif is_not_run(task):
-            mark = "not run"
-        elif is_budget_stopped(task):
-            mark = "time budget reached"
-        else:
-            mark = "run"
+        mark = task_mark(task)
         lines.append(
             f"{mark}  {task.get('id', '?')} ({fmt_toks(task.get('decode_tok_s'))} tok/s)"
         )
@@ -4390,6 +4592,12 @@ class BenchWorker(QThread):
             "prompt": prompt,
             "answer": _truncate_answer(metrics["answer"]),
             "passed": passed,
+            # M4: partial credit — 1.0 for a pass, 0.0 for a fail,
+            # a fraction for a numeric task with steps.
+            "credit": (
+                task_credit(task, metrics["answer"], passed)
+                if task is not None else 0.0
+            ),
             "decode_tok_s": metrics["decode_tok_s"],
             "prompt_tok_s": metrics["prompt_tok_s"],
             "ttft_s": metrics["ttft_s"],
@@ -4795,11 +5003,24 @@ class BenchWorker(QThread):
         if template["scored"]:
             ran = [t for t in task_results
                    if not is_not_run(t) and not is_budget_stopped(t)]
-            passed_count = sum(1 for t in ran if t["passed"] is True)
+            # M4: the score is over credits, not passes — a task
+            # with steps earns a fraction per part right, so a
+            # half-right task counts half. Tasks without a credit
+            # field (older builders) count 1.0 for a pass, 0.0
+            # for a fail. "Passed" is the credit sum, whole when
+            # nothing was partial, so "(4.5/5)" reads true.
+            credit_sum = sum(
+                t.get("credit", 1.0 if t["passed"] is True else 0.0)
+                for t in ran
+            )
             total = len(ran)
-            score = 100.0 * passed_count / total if total else None
+            score = 100.0 * credit_sum / total if total else None
             if total == 0:
                 passed_count = None
+            elif credit_sum == int(credit_sum):
+                passed_count = int(credit_sum)
+            else:
+                passed_count = credit_sum
         else:
             passed_count = None
             total = len(task_results)
@@ -8095,16 +8316,7 @@ class MainWindow(QMainWindow):
             lines.append(header)
             for task in run.get("tasks", []):
                 passed = task.get("passed")
-                if passed is True:
-                    mark = "pass"
-                elif passed is False:
-                    mark = "fail"
-                elif is_not_run(task):
-                    mark = "not run"
-                elif is_budget_stopped(task):
-                    mark = "time budget reached"
-                else:
-                    mark = "run"
+                mark = task_mark(task)
                 note = ""
                 if task.get("image_file"):
                     note = " (image saved)"

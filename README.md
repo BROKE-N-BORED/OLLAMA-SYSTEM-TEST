@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v15
+# OLLAMA SYSTEM TEST v16
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -9,19 +9,16 @@ weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
 
-v15 is a pulls-and-polish release, no new templates: a pull can be
-stopped and resumed, queued behind another, and watched with a real
-speed and time-left readout. The Past runs tab gains a timeline
-scrubber — drag across a model's runs and watch the scores change.
-Bigger text is one tap on the first-run checklist and in Settings,
-with a Reduce motion switch beside it. The focus ring is a visible
-2 px border, Tab moves in visual order, and focus comes back where
-it was when you switch tabs. Every tick says what is picked now, and
-the finish headline has a tick and a short fade. The Models tab can
-delete a model and ask one model one question with no run; the Run
-tab can re-run only the pairs that failed; and any template's tasks
-can be read before running it, from the Preview button or a
-double-click.
+v16 is a math-scoring release, no UI changes: the Math template
+grows from 5 tasks to 10, from one-step sums to multi-step
+problems, a fraction answer, algebra, and a unit conversion —
+and every numeric answer is scored by stricter rules. The last
+number in the answer is the answer, so a number mentioned in
+passing no longer passes; answers must match exactly unless the
+task gives a tolerance or says approximate; written numbers
+("twenty-one") and fractions ("1/2") score like digits; and a
+task with the right setup and the wrong final answer scores
+partial credit instead of 0. A full run is 108 prompts now.
 
 v14 is a results-and-settings release, no new templates: the Profiles
 tab is a dashboard now — one hero tile for the latest overall score,
@@ -181,7 +178,7 @@ remembered next time.
    starts, the app switches to the Run tab and each model runs each
    template in turn, one at a time.
    A full run (all templates, all models) takes a while — each model
-   answers 103 prompts (90 scored tasks, plus the extra turns in the
+   answers 108 prompts (95 scored tasks, plus the extra turns in the
    multi-turn and role-following templates, plus 3 speed runs), and
    the 32K speed run takes minutes on a CPU by design — so start with
    one model or one template to get a feel for the speed, then run

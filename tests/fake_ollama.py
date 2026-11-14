@@ -185,6 +185,13 @@ SMART_ANSWERS = [
     ("percent", "15 percent of 240 is 36."),
     ("stickers", "Each friend gets 12 stickers."),
     ("rectangle", "The area is 60 square cm."),
+    # v16: the 5 new math tasks. The step tasks name their step
+    # value in the working, then the final answer last.
+    ("muffin", "She makes 48 muffins and sells 30, so 18 are left."),
+    ("taxi", "The ride costs 25 before the tip, so 32.5 in total."),
+    ("pizza", "3 slices are gone, so 0.625 of the pizza is left."),
+    ("milliliter", "2.5 liters is 2500 milliliters."),
+    ("solve for x", "3x is 15, so x is 5."),
     ("roses", "No."),
     ("wednesday", "Saturday."),
     ("tom is taller", "Harry is the shortest."),
@@ -252,6 +259,8 @@ SMART_ANSWERS = [
 PARTIAL_CORRECT = {
     "fibonacci", "reverse_string", "sort_numbers",
     "apples", "percent", "rectangle",
+    # v16: 2 of the 5 new math tasks, so partial math is 5/10.
+    "muffin", "pizza",
     "roses", "tom is taller", "black animal",
     "city", "moon", "sky on a clear day",
     "australia", "romeo", "continents",

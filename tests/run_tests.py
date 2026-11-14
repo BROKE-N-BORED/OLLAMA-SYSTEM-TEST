@@ -1,10 +1,9 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v15 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v16 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1232 v14 checks are carried over; the v15 checks
-cover the pull upgrades (R19), the past-runs timeline scrub (R20), the
-accessibility presets (R21), focus-first keyboard navigation (R22),
-micro-interactions and teach by playing (R23), and the v3 review
-leftovers (R24).
+answers per model. All 1323 v15 checks are carried over; the v16 checks
+cover the math scoring rework (M1-M6): last-number scoring, per-task
+tolerance, ten math tasks with a difficulty gradient, partial credit
+for right setup, number words, and fractions plus scientific notation.
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -346,9 +345,12 @@ def main():
                 "role_following"):
         check(f"{tid} has 5 tasks", len(by_id[tid]["tasks"]) == 5,
               str(len(by_id[tid].get("tasks", []))))
-    for tid in ("coding", "math", "reasoning", "instruction", "knowledge"):
+    for tid in ("coding", "reasoning", "instruction", "knowledge"):
         check(f"{tid} has 5 tasks", len(by_id[tid]["tasks"]) == 5,
               str(len(by_id[tid].get("tasks", []))))
+    check("math has 10 tasks (v16: grown from 5)",
+          len(by_id["math"]["tasks"]) == 10,
+          str(len(by_id["math"].get("tasks", []))))
     check("coding tasks are code rule",
           all(t["rule"] == "code" for t in by_id["coding"]["tasks"]))
 
@@ -671,7 +673,10 @@ def main():
         ]
         if not prompt_tasks:
             continue
-        for brain, want in (("smart", 100.0), ("dumb", 0.0), ("partial", 60.0)):
+        # v16: math is 10 tasks now, partial gets 5 of them.
+        partial_want = 50.0 if template["id"] == "math" else 60.0
+        for brain, want in (("smart", 100.0), ("dumb", 0.0),
+                            ("partial", partial_want)):
             passed_count = 0
             for task in prompt_tasks:
                 answer = fake_ollama.answer_for(brain, task["prompt"])
@@ -949,7 +954,7 @@ def main():
 
     expected = {
         "fake-smart:2b": ("100%", "20.0", "done"),
-        "fake-partial:3b": ("60%", "10.0", "done"),
+        "fake-partial:3b": ("59%", "10.0", "done"),
         "fake-dumb:1b": ("0%", "5.0", "done"),
     }
     for name, (score, toks, status) in expected.items():
@@ -1038,7 +1043,10 @@ def main():
     for tid in sorted(partial_run):
         run = partial_run[tid]
         if run.get("template_score") is not None:
-            check(f"partial {tid} 60%", run["template_score"] == 60.0,
+            # v16: math is 10 tasks now, partial gets 5 of them.
+            want16 = 50.0 if tid == "math" else 60.0
+            check(f"partial {tid} {want16:.0f}%",
+                  run["template_score"] == want16,
                   str(run.get("template_score")))
     dumb_run = {tid: run for tid, run in dumb_templates.items()
                 if "skipped" not in run}
@@ -2285,7 +2293,10 @@ def main():
         ]
         if not prompt_tasks:
             continue
-        for brain, want in (("smart", 100.0), ("dumb", 0.0), ("partial", 60.0)):
+        # v16: math is 10 tasks now, partial gets 5 of them.
+        partial_want = 50.0 if template["id"] == "math" else 60.0
+        for brain, want in (("smart", 100.0), ("dumb", 0.0),
+                            ("partial", partial_want)):
             passed_count = 0
             for task in prompt_tasks:
                 answer = app.provider_generate_once(
@@ -2446,9 +2457,9 @@ def main():
         check("provider row has a measured speed",
               toks != "n/a" and float(toks) > 100, toks)
     detail = windowP.detail_view.toPlainText()
-    check("detail shows 1,580 prompt tokens", "1,580 in" in detail, detail[:300])
-    check("detail shows 15,800 completion tokens", "15,800 out" in detail, detail[:300])
-    check("detail shows exact cost $0.0097", "$0.0097" in detail, detail[:300])
+    check("detail shows 1,680 prompt tokens", "1,680 in" in detail, detail[:300])
+    check("detail shows 16,800 completion tokens", "16,800 out" in detail, detail[:300])
+    check("detail shows cost $0.01", "$0.01" in detail, detail[:300])
     check("detail shows per-template tokens",
           "100 in / 1,000 out" in detail, detail)
     check("detail shows per-template cost",
@@ -2493,9 +2504,9 @@ def main():
         check("provider profile names the provider",
               "Provider: fake-provider" in prof, prof[:300])
         check("provider profile totals template tokens",
-              "Tokens used in template runs: 1,560 in, 15,600 out" in prof, prof)
+              "Tokens used in template runs: 1,660 in, 16,600 out" in prof, prof)
         check("provider profile totals template cost",
-              "Estimated cost in template runs: $0.0096" in prof, prof)
+              "Estimated cost in template runs: $0.01" in prof, prof)
     windowP.grab().save(os.path.join(VERIFY_DIR, "screenshot-provider-results.png"))
 
     # ---------- Qt app: provider retry once ----------
@@ -3393,7 +3404,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 15", app.__version__ == "15",
+    check("__version__ is 16", app.__version__ == "16",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3407,8 +3418,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v15",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v15",
+    check("title bar shows OLLAMA SYSTEM TEST v16",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v16",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -3959,8 +3970,8 @@ def main():
     templates8, _warnings8 = app.load_templates()
     by_id8 = {t["id"]: t for t in templates8}
     math_p8, math_c8 = app.estimate_template_tokens(by_id8["math"])
-    check("math estimate: completion is 5 tasks x num_predict",
-          math_c8 == 5 * by_id8["math"]["num_predict"], str(math_c8))
+    check("math estimate: completion is 10 tasks x num_predict",
+          math_c8 == 10 * by_id8["math"]["num_predict"], str(math_c8))
     check("math estimate: prompt tokens are positive and small",
           0 < math_p8 < 1000, str(math_p8))
     speed_p8, speed_c8 = app.estimate_template_tokens(by_id8["speed"])
@@ -4251,7 +4262,7 @@ def main():
                   len(preview_calls8) == 1, str(len(preview_calls8)))
             if preview_calls8:
                 check("preview names the estimated cost",
-                      "$1.67" in preview_calls8[0], preview_calls8[0])
+                      "$3.29" in preview_calls8[0], preview_calls8[0])
                 check("preview names the model",
                       "v8-provider / fake-gpt-smart" in preview_calls8[0],
                       preview_calls8[0])
@@ -4287,11 +4298,11 @@ def main():
             check("cheap provider run shows its preview",
                   len(preview_calls8) == 1, str(preview_calls8))
             check("cheap provider run completes", done8c)
-            check("partial math scored 60%",
+            check("partial math scored 50%",
                   window8.results.get(
                       "v8-provider / fake-gpt-partial", {}).get(
                       "templates", {}).get("math", {}).get("template_score")
-                  == 60.0,
+                  == 50.0,
                   str(window8.results.get("v8-provider / fake-gpt-partial", {})))
 
             # No prices saved: the preview says so plainly and still asks.
@@ -4333,7 +4344,7 @@ def main():
 
         # ---------- v8 T10: per-template time budget ----------------------
         # A real run through the worker: a 1-second budget on math
-        # (5 tasks at ~0.65 s each against the fake) stops the
+        # (10 tasks at ~0.65 s each against the fake) stops the
         # template partway, and the run carries on with coding.
         budget_targets8 = [app.ollama_target("fake-smart:2b")]
         budget_templates8 = [by_id8["math"], by_id8["coding"]]
@@ -4365,7 +4376,7 @@ def main():
         check("budget run scores only the tasks that ran",
               budget_math8.get("template_score") == 100.0
               and budget_math8.get("total")
-              == 5 - (budget_math8.get("budget_stopped") or 0),
+              == 10 - (budget_math8.get("budget_stopped") or 0),
               f"{budget_math8.get('template_score')} "
               f"({budget_math8.get('passed')}/{budget_math8.get('total')}, "
               f"stopped {budget_math8.get('budget_stopped')})")
@@ -4423,7 +4434,7 @@ def main():
         nobudget_math8 = nobudget_results8.get(
             "fake-smart:2b", {}).get("templates", {}).get("math", {})
         check("no budget means the template runs to the end",
-              nobudget_math8.get("total") == 5
+              nobudget_math8.get("total") == 10
               and nobudget_math8.get("time_budget_reached") is not True
               and nobudget_math8.get("template_score") == 100.0,
               str(nobudget_math8.get("total")))
@@ -4752,9 +4763,9 @@ def main():
                     return cell.text() if cell is not None else None
             return None
 
-        check("compare shows smart math 100% vs partial 60%",
+        check("compare shows smart math 100% vs partial 50%",
               compare_cell8("Math", 1) == "100%"
-              and compare_cell8("Math", 2) == "60%",
+              and compare_cell8("Math", 2) == "50%",
               f"{compare_cell8('Math', 1)} / {compare_cell8('Math', 2)}")
         check("compare shows smart coding 100% vs partial 60%",
               compare_cell8("Coding", 1) == "100%"
@@ -4762,7 +4773,7 @@ def main():
               f"{compare_cell8('Coding', 1)} / {compare_cell8('Coding', 2)}")
         check("compare shows the overall rows",
               compare_cell8("Overall score", 1) == "100%"
-              and compare_cell8("Overall score", 2) == "60%",
+              and compare_cell8("Overall score", 2) == "55%",
               f"{compare_cell8('Overall score', 1)} / "
               f"{compare_cell8('Overall score', 2)}")
         check("compare shows the speed rows",
@@ -4822,10 +4833,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v15",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v15",
+        check("title bar shows v16",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v16",
               window9.windowTitle())
-        check("__version__ is 15", app.__version__ == "15", app.__version__)
+        check("__version__ is 16", app.__version__ == "16", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -4868,7 +4879,7 @@ def main():
         window9.template_filter.setText("math")
         qt_app.processEvents()
         check("template filter shows only matching templates",
-              visible_texts9(window9.template_list) == ["Math (5 tasks)"],
+              visible_texts9(window9.template_list) == ["Math (10 tasks)"],
               str(visible_texts9(window9.template_list)))
         check("filter hides, never removes (template count unchanged)",
               window9.template_list.count() == 19,
@@ -4947,7 +4958,7 @@ def main():
               == ["fake-smart:2b [vision, tools, long_context]"],
               str(visible_texts9(window9.model_list)))
         check("refresh keeps the template filter applied",
-              visible_texts9(window9.template_list) == ["Math (5 tasks)"],
+              visible_texts9(window9.template_list) == ["Math (10 tasks)"],
               str(visible_texts9(window9.template_list)))
         window9.model_filter.setText("")
         window9.template_filter.setText("")
@@ -5012,8 +5023,8 @@ def main():
         # ---------- v9 T15: README fixes + repo hygiene -----------------
         readme9 = open(os.path.join(PKG_DIR, "README.md"),
                        encoding="utf-8").read()
-        check("README states 103 prompts",
-              "103 prompts" in readme9)
+        check("README states 108 prompts",
+              "108 prompts" in readme9)
         check("README no longer says roughly 80",
               "roughly 80" not in readme9)
         check("README shows the window screenshot",
@@ -5805,7 +5816,7 @@ def main():
               "3 models, 2 templates" in window13.finish_label.text(),
               window13.finish_label.text())
         check("progress line keeps its final count",
-              "33 of 33 steps done" in window13.progress_detail.text(),
+              "48 of 48 steps done" in window13.progress_detail.text(),
               window13.progress_detail.text())
         row_smart13 = row_for(window13, "fake-smart:2b")
         row_partial13 = row_for(window13, "fake-partial:3b")
@@ -6649,7 +6660,7 @@ def main():
     steps15b = app.count_run_steps(
         targets15, [math15, coding15], pairs={("a:1b", "math")})
     check("run steps skip a target with no pairs in a re-run",
-          steps15b == 6, str(steps15b))
+          steps15b == 11, str(steps15b))
     provider_target15 = {
         "label": "p15 / m15", "kind": "provider",
         "capabilities": ["text"],
@@ -6677,10 +6688,10 @@ def main():
         pairs={("a:1b", "math"), ("a:1b", "coding")})
     check("re-run preview names the failed pairs",
           preview15["text"].startswith(
-              "Re-running 2 failed pairs (1 model), 11 steps in total."),
+              "Re-running 2 failed pairs (1 model), 16 steps in total."),
           preview15["text"].splitlines()[0] if preview15["text"] else "")
     check("re-run preview counts only the paired steps",
-          preview15["total_steps"] == 11,
+          preview15["total_steps"] == 16,
           str(preview15["total_steps"]))
     math_preview15 = app.render_template_preview(math15)
     check("template preview names the tasks",
@@ -7272,6 +7283,247 @@ def main():
                 os.environ.pop(env15, None)
             else:
                 os.environ[env15] = value15
+
+    # ================= v16: math scoring rework (M1-M6) ===================
+    # ---------- v16 unit: last number, tolerance, words, fractions --------
+    # M1: the last number is the answer.
+    check("last number scores: wrong working, right conclusion passes",
+          app.score_numeric(
+              "I first guessed 19, but the answer is 21.", 21)[0])
+    check("last number scores: right number in the working, "
+          "wrong conclusion fails",
+          not app.score_numeric(
+              "I first guessed 21, but the answer is 19.", 21)[0])
+    check("last number scores: the detail names the final answer",
+          app.score_numeric("I guessed 21, but it is 19.", 21)[1]
+          == "final answer was 19, expected 21")
+    # M2: exact unless the task says otherwise.
+    check("exact match: 149 fails the train task",
+          not app.score_numeric("149 miles", 150)[0])
+    check("exact match: 151 fails the train task",
+          not app.score_numeric("151 miles", 150)[0])
+    check("exact match: 150 passes the train task",
+          app.score_numeric("150 miles", 150)[0])
+    check("approximate task still allows 1%",
+          app.score_numeric("149 miles", 150, approximate=True)[0]
+          and not app.score_numeric("148 miles", 150,
+                                    approximate=True)[0])
+    check("absolute tolerance allows what it says",
+          app.score_numeric("151 miles", 150, tolerance=2)[0]
+          and not app.score_numeric("153 miles", 150,
+                                    tolerance=2)[0])
+    # M5: number words.
+    check("number words: twenty-one is 21",
+          app._spell_number_words("twenty-one") == "21")
+    check("number words: one hundred and fifty is 150",
+          app._spell_number_words("one hundred and fifty") == "150")
+    check("number words: someone is untouched",
+          app._spell_number_words("someone said twenty one things")
+          == "someone said 21 things")
+    check("number words pass the apples task",
+          app.score_numeric("He has twenty-one apples.", 21)[0])
+    check("number words pass the train task",
+          app.score_numeric(
+              "The train travels one hundred and fifty miles.",
+              150)[0])
+    # M6: fractions and scientific notation.
+    check("fractions: 1/2 extracts as 0.5",
+          app._extract_numbers("The answer is 1/2.") == [0.5])
+    check("fractions: 5/8 extracts as 0.625",
+          app._extract_numbers("5/8 of the pizza") == [0.625])
+    check("scientific notation: 1.5e3 extracts as 1500",
+          app._extract_numbers("1.5e3 miles") == [1500.0])
+    check("fraction answer passes the pizza task",
+          app.score_numeric("She keeps 5/8 of it.", 0.625)[0])
+    check("existing extraction still works",
+          app._extract_numbers("1,000 and 2.5") == [1000.0, 2.5]
+          and app._extract_numbers("no numbers here") == [])
+    # M4: partial credit for right setup.
+    taxi16 = {"id": "taxi", "rule": "numeric", "expected": 32.5,
+              "steps": [25]}
+    check("partial credit: right setup, wrong final scores 0.5",
+          app.task_credit(
+              taxi16, "The ride costs 25 before the tip, so 30 total.",
+              False) == 0.5)
+    check("partial credit: fully wrong scores 0",
+          app.task_credit(
+              taxi16, "The ride costs 20 before the tip, so 30 total.",
+              False) == 0.0)
+    check("partial credit: all right scores 1",
+          app.task_credit(
+              taxi16, "The ride costs 25 before the tip, so 32.5 total.",
+              True) == 1.0)
+    check("partial credit: the task fails unless every part is right",
+          app.score_numeric_task(
+              "The ride costs 25 before the tip, so 30 total.",
+              taxi16)[0] is False
+          and app.score_numeric_task(
+              "The ride costs 25 before the tip, so 32.5 total.",
+              taxi16)[0] is True)
+    check("partial credit: the detail names the right step",
+          "step 25 right" in app.score_numeric_task(
+              "The ride costs 25 before the tip, so 30 total.",
+              taxi16)[1])
+    check("partial mark shows its credit",
+          app.task_mark({"passed": False, "credit": 0.5})
+          == "partial (0.5)"
+          and app.task_mark({"passed": False, "credit": 0.0}) == "fail"
+          and app.task_mark({"passed": True, "credit": 1.0}) == "pass")
+    # M3: the template itself.
+    templates16, _warnings16 = app.load_templates()
+    by_id16 = {t["id"]: t for t in templates16}
+    math16 = by_id16["math"]
+    check("math template keeps its 5 easy tasks first",
+          [t["id"] for t in math16["tasks"][:5]]
+          == ["apples", "train", "percent", "stickers", "rectangle"])
+    check("math template has a fraction answer, algebra, "
+          "and a unit conversion",
+          any(t["id"] == "pizza" and t["expected"] == 0.625
+              for t in math16["tasks"])
+          and any(t["id"] == "solve-x" and t["expected"] == 5
+                  for t in math16["tasks"])
+          and any(t["id"] == "milliliters" and t["expected"] == 2500
+                  for t in math16["tasks"]))
+    check("math step tasks carry their intermediate values",
+          any(t["id"] == "muffins" and t.get("steps") == [48]
+              for t in math16["tasks"])
+          and any(t["id"] == "taxi" and t.get("steps") == [25]
+                  for t in math16["tasks"]))
+
+    # ---------- v16 GUI: fake-run separation + partial credit ------------
+    # A real run through the window: smart, partial, and dumb on math
+    # only. The template must separate them (100/50/0), and a
+    # partial-credit answer must score half through the worker, the
+    # run file, the summary, and the detail view.
+    results16 = os.path.join(SCRATCH, "results16")
+    os.makedirs(results16, exist_ok=True)
+    prior_results16 = os.environ.get("OST_RESULTS_DIR")
+    prior_host16 = os.environ.get("OLLAMA_HOST")
+    server16, thread16 = fake_ollama.start_server()
+    host16, port16 = server16.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host16}:{port16}"
+    os.environ["OST_RESULTS_DIR"] = results16
+    window16 = None
+    try:
+        window16 = app.MainWindow()
+        window16.show()
+        wait_until(lambda: window16.model_list.count() >= 3,
+                   timeout=10, app=qt_app)
+        set_checked_list(window16.model_list,
+                         {"fake-smart:2b", "fake-partial:3b",
+                          "fake-dumb:1b"})
+        set_checked_templates(window16, {"math"})
+        window16.run_button.click()
+        done16 = wait_until(
+            lambda: window16.worker is None
+            and window16.save_button.isEnabled(),
+            timeout=180, app=qt_app)
+        check("v16 math run completes", done16)
+        smart16 = window16.results.get("fake-smart:2b", {}).get(
+            "templates", {}).get("math", {})
+        partial16 = window16.results.get("fake-partial:3b", {}).get(
+            "templates", {}).get("math", {})
+        dumb16 = window16.results.get("fake-dumb:1b", {}).get(
+            "templates", {}).get("math", {})
+        check("math separates smart from partial from dumb",
+              smart16.get("template_score") == 100.0
+              and partial16.get("template_score") == 50.0
+              and dumb16.get("template_score") == 0.0,
+              f"{smart16.get('template_score')} / "
+              f"{partial16.get('template_score')} / "
+              f"{dumb16.get('template_score')}")
+        check("math run records 10 tasks per model",
+              smart16.get("total") == 10
+              and partial16.get("total") == 10
+              and dumb16.get("total") == 10,
+              str(smart16.get("total")))
+        check("math run records passed counts as credits",
+              smart16.get("passed") == 10
+              and partial16.get("passed") == 5
+              and dumb16.get("passed") == 0,
+              f"{smart16.get('passed')} / {partial16.get('passed')} / "
+              f"{dumb16.get('passed')}")
+
+        # Partial credit end to end: a canned answer with the right
+        # step and the wrong final, through a real worker run. The
+        # probe prompt matches no earlier fake key, so the appended
+        # answer is the one the smart brain gives.
+        fake_ollama.SMART_ANSWERS.append(
+            ("partial-credit probe",
+             "The fare is 25 before the tip, so 30 in total."))
+        probe_template16 = {
+            "id": "math-partial", "name": "Math partial",
+            "num_predict": 300, "scored": True,
+            "tasks": [{
+                "id": "taxi", "rule": "numeric", "expected": 32.5,
+                "steps": [25],
+                "prompt": "A partial-credit probe: the fare is 25 "
+                          "before the tip, so 30 in total. What is "
+                          "the total?",
+            }],
+        }
+        probe_results16 = {}
+        probe_finished16 = {"done": False}
+        probe_worker16 = app.BenchWorker(
+            [app.ollama_target("fake-smart:2b")],
+            [probe_template16], window16.sys_id, window16.machine,
+            results16)
+        probe_worker16.model_done.connect(
+            lambda name, result: probe_results16.__setitem__(
+                name, result))
+        probe_worker16.run_finished.connect(
+            lambda reason: probe_finished16.__setitem__("done", reason))
+        probe_worker16.start()
+        probe_ok16 = wait_until(lambda: probe_finished16["done"],
+                                timeout=120, app=qt_app)
+        probe_worker16.wait()
+        check("partial-credit worker run finishes", probe_ok16)
+        probe_math16 = probe_results16.get(
+            "fake-smart:2b", {}).get("templates", {}).get(
+                "math-partial", {})
+        check("partial-credit run scores 50% with passed 0.5",
+              probe_math16.get("template_score") == 50.0
+              and probe_math16.get("passed") == 0.5
+              and probe_math16.get("total") == 1,
+              f"{probe_math16.get('template_score')} / "
+              f"{probe_math16.get('passed')} / "
+              f"{probe_math16.get('total')}")
+        probe_tasks16 = probe_math16.get("tasks", [])
+        check("partial-credit task record carries credit 0.5",
+              len(probe_tasks16) == 1
+              and probe_tasks16[0].get("credit") == 0.5
+              and probe_tasks16[0].get("passed") is False,
+              str(probe_tasks16))
+        summary16 = app.render_run_summary(probe_math16)
+        check("summary marks a partial task with its credit",
+              "partial (0.5)  taxi" in summary16, summary16)
+        window16.results["probe-model"] = probe_results16.get(
+            "fake-smart:2b", {})
+        window16.show_detail("probe-model")
+        qt_app.processEvents()
+        check("detail view marks a partial task with its credit",
+              "partial (0.5)  taxi"
+              in window16.detail_view.toPlainText(),
+              window16.detail_view.toPlainText()[:400])
+    finally:
+        fake_ollama.SMART_ANSWERS[:] = [
+            pair for pair in fake_ollama.SMART_ANSWERS
+            if pair[0] != "partial-credit probe"
+        ]
+        if window16 is not None:
+            window16.close()
+            window16.deleteLater()
+            qt_app.processEvents()
+        server16.shutdown()
+        server16.server_close()
+        if prior_results16 is None:
+            os.environ.pop("OST_RESULTS_DIR", None)
+        else:
+            os.environ["OST_RESULTS_DIR"] = prior_results16
+        if prior_host16 is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host16
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview
