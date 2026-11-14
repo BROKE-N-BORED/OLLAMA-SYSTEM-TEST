@@ -99,9 +99,12 @@ from datetime import datetime, timedelta
 
 try:
     from PySide6.QtCore import (
-        QCoreApplication, QSettings, Qt, QThread, QTimer, Signal,
+        QCoreApplication, QRect, QSettings, QSize, Qt, QThread, QTimer,
+        Signal,
     )
-    from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
+    from PySide6.QtGui import (
+        QAction, QIcon, QKeySequence, QPainter, QPalette, QPen, QShortcut,
+    )
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (
         QApplication,
@@ -111,6 +114,8 @@ try:
         QDialogButtonBox,
         QFileDialog,
         QFrame,
+        QGridLayout,
+        QGroupBox,
         QHBoxLayout,
         QHeaderView,
         QLabel,
@@ -121,6 +126,7 @@ try:
         QMessageBox,
         QProgressBar,
         QPushButton,
+        QScrollArea,
         QSpinBox,
         QTabWidget,
         QTableWidget,
@@ -142,7 +148,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "13"
+__version__ = "14"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -325,6 +331,7 @@ START_OLLAMA_POLL = 1.0      # seconds between checks while waiting
 PROVIDER_READ_TIMEOUT = 120.0   # seconds between provider chunks (providers are slow)
 PROVIDER_STALL_TIMEOUT = 300.0  # seconds with no provider chunk at all before giving up
 PROVIDER_TEST_TIMEOUT = 15.0    # seconds for the Test connection call
+MAX_FETCHED_MODELS = 200       # most model ids the Test connection pick-list holds
 PROVIDER_LABEL_SEP = " / "      # "provider / model-id", used everywhere
 SHOW_TIMEOUT = 2.0              # seconds for one /api/show screening call
 LONG_CONTEXT_MIN_TOKENS = 32768  # a context this long counts as long-context
@@ -407,6 +414,63 @@ def describe_error(exc):
 
 def ollama_base():
     return os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+
+
+# What the environment set before this process started. The Settings
+# window locks a field when its variable is set here — the
+# environment wins over the saved setting, always. Captured at
+# import time, because the app itself writes OLLAMA_HOST into the
+# environment when it applies a saved address, and that must not
+# lock the field it came from.
+_ENV_OLLAMA_HOST = os.environ.get("OLLAMA_HOST")
+_ENV_OLLAMA_MODELS = os.environ.get("OLLAMA_MODELS")
+
+
+def load_app_settings():
+    """The app's own settings from QSettings (R18): the models
+    folder, the Ollama address, the default time budget, and the
+    per-model usual template sets. Missing keys read as empty."""
+    settings = QSettings("BrokeNBored", APP_NAME)
+    sets_raw = settings.value("template_sets", "")
+    try:
+        template_sets = json.loads(sets_raw) if sets_raw else {}
+    except ValueError:
+        template_sets = {}
+    if not isinstance(template_sets, dict):
+        template_sets = {}
+    return {
+        "models_folder": settings.value("models_folder", "") or "",
+        "ollama_host": settings.value("ollama_host", "") or "",
+        "default_budget_minutes": settings.value(
+            "default_budget_minutes", 0, type=int
+        ),
+        "template_sets": template_sets,
+    }
+
+
+def save_app_settings(values):
+    """Write the app's own settings (R18) to QSettings."""
+    settings = QSettings("BrokeNBored", APP_NAME)
+    settings.setValue("models_folder", values.get("models_folder", ""))
+    settings.setValue("ollama_host", values.get("ollama_host", ""))
+    settings.setValue(
+        "default_budget_minutes", values.get("default_budget_minutes", 0)
+    )
+    settings.setValue(
+        "template_sets", json.dumps(values.get("template_sets", {}))
+    )
+
+
+def apply_saved_settings_to_env():
+    """Apply the saved Ollama address to this process, unless the
+    environment already sets it — the environment wins, always.
+    Called from main() before anything reads ollama_base(), window
+    or headless."""
+    if _ENV_OLLAMA_HOST is not None:
+        return
+    host = load_app_settings()["ollama_host"]
+    if host:
+        os.environ["OLLAMA_HOST"] = host
 
 
 def get_templates_dir():
@@ -1793,12 +1857,15 @@ def _provider_headers(provider):
     return headers
 
 
-def provider_test_connection(provider):
-    """GET {base}/models. Returns (ok, plain message). Spends no tokens."""
+def provider_fetch_models(provider):
+    """GET {base}/models. Returns (ok, model ids, plain message).
+    Spends no tokens. The ids are the provider's own list, in the
+    provider's order, at most MAX_FETCHED_MODELS of them — a provider
+    can list hundreds, and the pick-list only needs the first page."""
     name = provider.get("name") or "provider"
     base_url = (provider.get("base_url") or "").rstrip("/")
     if not base_url:
-        return False, "No base URL set."
+        return False, [], "No base URL set."
     req = urllib.request.Request(
         base_url + "/models", headers=_provider_headers(provider)
     )
@@ -1809,17 +1876,32 @@ def provider_test_connection(provider):
         if exc.code == 401:
             reason = _provider_error_reason(exc)
             if reason.startswith("HTTP "):
-                return False, f"provider {name} rejected the key."
-            return False, f"provider {name} rejected the key: {reason}"
-        return False, f"provider {name}: {_provider_error_reason(exc)}"
+                return False, [], f"provider {name} rejected the key."
+            return False, [], f"provider {name} rejected the key: {reason}"
+        return False, [], f"provider {name}: {_provider_error_reason(exc)}"
     except (urllib.error.URLError, socket.timeout, OSError):
-        return False, f"provider {name} did not answer. Check the base URL."
+        return False, [], f"provider {name} did not answer. Check the base URL."
     except ValueError:
-        return False, f"provider {name} answered, but not with JSON."
+        return False, [], f"provider {name} answered, but not with JSON."
     models = data.get("data") if isinstance(data, dict) else None
-    if isinstance(models, list):
-        return True, f"Connected: {name} answered, {len(models)} models listed."
-    return True, f"Connected: {name} answered."
+    if not isinstance(models, list):
+        return True, [], f"Connected: {name} answered."
+    ids = [m.get("id") for m in models if isinstance(m, dict)]
+    ids = [model_id for model_id in ids if isinstance(model_id, str) and model_id]
+    total = len(ids)
+    if total > MAX_FETCHED_MODELS:
+        ids = ids[:MAX_FETCHED_MODELS]
+        return True, ids, (
+            f"Connected: {name} answered, {total} models listed "
+            f"(showing the first {MAX_FETCHED_MODELS})."
+        )
+    return True, ids, f"Connected: {name} answered, {total} models listed."
+
+
+def provider_test_connection(provider):
+    """GET {base}/models. Returns (ok, plain message). Spends no tokens."""
+    ok, _ids, message = provider_fetch_models(provider)
+    return ok, message
 
 
 def provider_chat_once(provider, model_id, messages, num_predict,
@@ -3328,10 +3410,19 @@ def _verdict(overall_latest, strengths, weaknesses, avg_speed):
     return " ".join(parts)
 
 
-def build_profile(results_dir, model_slug):
-    """Markdown profile for one model, built from all its run files.
+def profile_numbers(results_dir, model_slug):
+    """Every number a profile is built from, in one dict.
 
-    Returns (model_name, text), or None when the model has no runs.
+    Returns None when the model has no runs. The markdown profile,
+    the bento tiles (R14), and the charts (R16) all read from this,
+    so the three can never disagree about a model. Keys: model_name,
+    provider, systems, last_tested, runs_count, token_prompt,
+    token_completion, has_tokens, total_cost, has_cost,
+    template_rows (name, latest, best, count, not_run per template),
+    overall_latest, overall_best, avg_speed, strengths, weaknesses,
+    template_scores (name, latest) for scored templates only, best
+    first, and speed_points (timestamp, decode tok/s) per run, oldest
+    first.
     """
     runs = load_model_runs(results_dir, model_slug)
     if not runs:
@@ -3398,13 +3489,70 @@ def build_profile(results_dir, model_slug):
         name for name, latest, _best, _n, _nr in template_rows
         if latest is not None and latest < WEAKNESS_UNDER
     ]
+    template_scores = sorted(
+        [(name, latest) for name, latest, _b, _n, _nr in template_rows
+         if latest is not None],
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+    speed_points = [
+        (r.get("timestamp", "?"), r["avg_decode_tok_s"])
+        for r in runs
+        if r.get("avg_decode_tok_s") is not None
+    ]
+    return {
+        "model_name": model_name,
+        "provider": provider,
+        "systems": systems,
+        "last_tested": last_tested,
+        "runs_count": len(runs),
+        "token_prompt": token_prompt,
+        "token_completion": token_completion,
+        "has_tokens": has_tokens,
+        "total_cost": total_cost,
+        "has_cost": has_cost,
+        "template_rows": template_rows,
+        "overall_latest": overall_latest,
+        "overall_best": overall_best,
+        "avg_speed": avg_speed,
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "template_scores": template_scores,
+        "speed_points": speed_points,
+    }
+
+
+def build_profile(results_dir, model_slug):
+    """Markdown profile for one model, built from all its run files.
+
+    Returns (model_name, text), or None when the model has no runs.
+    The numbers come from profile_numbers; this only renders them.
+    """
+    numbers = profile_numbers(results_dir, model_slug)
+    if numbers is None:
+        return None
+    model_name = numbers["model_name"]
+    provider = numbers["provider"]
+    systems = numbers["systems"]
+    last_tested = numbers["last_tested"]
+    token_prompt = numbers["token_prompt"]
+    token_completion = numbers["token_completion"]
+    has_tokens = numbers["has_tokens"]
+    total_cost = numbers["total_cost"]
+    has_cost = numbers["has_cost"]
+    template_rows = numbers["template_rows"]
+    overall_latest = numbers["overall_latest"]
+    overall_best = numbers["overall_best"]
+    avg_speed = numbers["avg_speed"]
+    strengths = numbers["strengths"]
+    weaknesses = numbers["weaknesses"]
 
     lines = [
         f"# {model_name}",
         "",
         f"Profile updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"Last tested: {last_tested}",
-        f"Runs: {len(runs)}",
+        f"Runs: {numbers['runs_count']}",
         f"Provider: {provider}",
         f"Systems tested on: {', '.join(systems)}",
         "",
@@ -4700,16 +4848,28 @@ class OllamaStarter(QThread):
     started_ok = Signal()
     failed = Signal(str)  # plain message
 
+    def __init__(self, models_folder=None):
+        super().__init__()
+        # R18: the saved models folder, passed to the Ollama this app
+        # starts — unless the environment already sets OLLAMA_MODELS,
+        # in which case the child inherits it and this stays out.
+        self.models_folder = models_folder
+
     def run(self):
         if ollama_reachable():
             self.started_ok.emit()
             return
+        env = None
+        if self.models_folder and "OLLAMA_MODELS" not in os.environ:
+            env = dict(os.environ)
+            env["OLLAMA_MODELS"] = self.models_folder
         try:
             subprocess.Popen(
                 ["ollama", "serve"],
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=env,
             )
         except FileNotFoundError:
             self.failed.emit(START_OLLAMA_MISSING_MSG)
@@ -4731,15 +4891,15 @@ class OllamaStarter(QThread):
 # ---------------------------------------------------------------------------
 
 class ProviderTestWorker(QThread):
-    tested = Signal(bool, str)  # ok, plain message
+    tested = Signal(bool, str, list)  # ok, plain message, fetched model ids
 
     def __init__(self, provider):
         super().__init__()
         self.provider = provider
 
     def run(self):
-        ok, message = provider_test_connection(self.provider)
-        self.tested.emit(ok, message)
+        ok, model_ids, message = provider_fetch_models(self.provider)
+        self.tested.emit(ok, message, model_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -4880,6 +5040,497 @@ class RunPreviewDialog(QDialog):
         layout.addWidget(buttons)
 
 
+# ---------------------------------------------------------------------------
+# Charts (R16, library 037) — plain Qt painting, no new dependency.
+#
+# One chart, one message, readable at a glance: bars for comparing
+# amounts (per-template scores, 0-based axis, direct value labels),
+# a line for change over time (decode speed across runs). Colors come
+# from the widget palette, so dark mode works; the numbers are always
+# printed next to the marks, so color never carries meaning alone.
+# ---------------------------------------------------------------------------
+
+def _nice_step(max_value, steps=4):
+    """Grid step for a chart axis: max_value split into about four
+    intuitive steps (1, 2, 5, or 10 times a power of ten)."""
+    if max_value <= 0:
+        return 1.0
+    raw = max_value / steps
+    power = 1.0
+    while power * 10 <= raw:
+        power *= 10
+    while power > raw:
+        power /= 10
+    for mult in (1, 2, 5, 10):
+        if mult * power >= raw:
+            return mult * power
+    return 10 * power
+
+
+def _short_date(timestamp):
+    """An ISO timestamp as a short chart label ("Nov 13")."""
+    try:
+        return datetime.fromisoformat(str(timestamp)).strftime("%b %d")
+    except ValueError:
+        return str(timestamp)[:10]
+
+
+class BarChartWidget(QWidget):
+    """Horizontal bars for comparing amounts (library 037).
+
+    set_data takes rows of (label, value) for one series, or
+    (label, value_a, value_b) for two series side by side (the
+    Compare tab: top bar is the first model, bottom bar the second).
+    Values are 0 to 100 scores; the axis is fixed at 0 so a bar twice
+    as long really means twice as much. takeaway_title states the
+    answer in plain words, above the chart.
+    """
+
+    ROW_HEIGHT = 26
+    BAR_HEIGHT = 14
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rows = []
+        self.pair_names = None
+        self.setMinimumHeight(80)
+
+    def set_data(self, rows, pair_names=None):
+        self.rows = list(rows)
+        self.pair_names = pair_names
+        self.updateGeometry()
+        self.update()
+
+    def takeaway_title(self):
+        if not self.rows:
+            return "No scored templates yet."
+        if self.pair_names is None:
+            scored = [(label, value) for label, value in self.rows]
+            best_label, best = max(scored, key=lambda pair: pair[1])
+            worst_label, worst = min(scored, key=lambda pair: pair[1])
+            if best == worst:
+                return f"Every template at {best:.0f}%."
+            return (
+                f"Strongest: {best_label} {best:.0f}%. "
+                f"Weakest: {worst_label} {worst:.0f}%."
+            )
+        name_a, name_b = self.pair_names
+        wins_a = wins_b = 0
+        for _label, value_a, value_b in self.rows:
+            if value_a is None or value_b is None:
+                continue
+            if value_a > value_b:
+                wins_a += 1
+            elif value_b > value_a:
+                wins_b += 1
+        if wins_a == wins_b:
+            return f"{name_a} and {name_b} are even across the templates."
+        leader, lead = (
+            (name_a, wins_a) if wins_a > wins_b else (name_b, wins_b)
+        )
+        noun = "template" if lead == 1 else "templates"
+        return f"{leader} leads on {lead} {noun}."
+
+    def sizeHint(self):
+        per_row = self.ROW_HEIGHT * (2 if self.pair_names else 1)
+        height = len(self.rows) * per_row + 34
+        return QSize(320, max(80, height))
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        palette = self.palette()
+        painter.fillRect(self.rect(), palette.color(QPalette.Window))
+        if not self.rows:
+            painter.setPen(palette.color(QPalette.Text))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "No scored templates yet.")
+            return
+        text_color = palette.color(QPalette.Text)
+        grid_color = palette.color(QPalette.Mid)
+        bar_color = palette.color(QPalette.Highlight)
+        bar_b_color = palette.color(QPalette.Dark)
+        metrics = painter.fontMetrics()
+        label_width = 0
+        for row in self.rows:
+            label_width = max(
+                label_width, metrics.horizontalAdvance(row[0] + "  ")
+            )
+        label_width = min(label_width, self.width() // 3)
+        value_width = metrics.horizontalAdvance("100%  ")
+        left = 4 + label_width
+        right = self.width() - 4 - value_width
+        bar_span = max(1, right - left)
+        axis_y = self.height() - 20
+        # Grid: 0, 25, 50, 75, 100 — intuitive steps for a percent
+        # scale, drawn first so the bars sit on top of them.
+        painter.setPen(QPen(grid_color))
+        for percent in (0, 25, 50, 75, 100):
+            x = left + bar_span * percent // 100
+            painter.drawLine(x, 4, x, axis_y)
+            label = f"{percent}%" if percent == 100 else str(percent)
+            painter.setPen(text_color)
+            painter.drawText(
+                QRect(x - 14, axis_y + 2, 28, 16),
+                Qt.AlignHCenter | Qt.AlignTop, label,
+            )
+            painter.setPen(QPen(grid_color))
+        per_row = self.ROW_HEIGHT * (2 if self.pair_names else 1)
+        for index, row in enumerate(self.rows):
+            label = row[0]
+            top = 6 + index * per_row
+            painter.setPen(text_color)
+            painter.drawText(
+                QRect(4, top, label_width - 4, per_row),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                metrics.elidedText(
+                    label, Qt.ElideRight, label_width - 4),
+            )
+            if self.pair_names is None:
+                value = row[1]
+                if value is None:
+                    continue
+                width = int(bar_span * max(0.0, min(100.0, value)) / 100)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(bar_color)
+                painter.drawRect(
+                    QRect(left, top + (self.ROW_HEIGHT - self.BAR_HEIGHT) // 2,
+                          max(1, width), self.BAR_HEIGHT)
+                )
+                painter.setPen(text_color)
+                painter.drawText(
+                    QRect(left + width + 4, top, value_width,
+                          self.ROW_HEIGHT),
+                    Qt.AlignLeft | Qt.AlignVCenter, f"{value:.0f}%",
+                )
+            else:
+                for series, value in ((0, row[1]), (1, row[2])):
+                    if value is None:
+                        continue
+                    width = int(
+                        bar_span * max(0.0, min(100.0, value)) / 100
+                    )
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(
+                        bar_color if series == 0 else bar_b_color
+                    )
+                    row_top = top + series * self.ROW_HEIGHT
+                    painter.drawRect(
+                        QRect(
+                            left,
+                            row_top + (self.ROW_HEIGHT - self.BAR_HEIGHT) // 2,
+                            max(1, width), self.BAR_HEIGHT,
+                        )
+                    )
+                    painter.setPen(text_color)
+                    painter.drawText(
+                        QRect(left + width + 4, row_top, value_width,
+                              self.ROW_HEIGHT),
+                        Qt.AlignLeft | Qt.AlignVCenter, f"{value:.0f}%",
+                    )
+
+
+class LineChartWidget(QWidget):
+    """A line for change over time (library 037): decode speed across
+    runs, oldest first. The vertical axis starts at 0, grid lines sit
+    at intuitive steps, and the takeaway title states the trend in
+    plain words."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.points = []
+        self.setMinimumHeight(120)
+
+    def set_data(self, points):
+        self.points = list(points)
+        self.update()
+
+    def takeaway_title(self):
+        if not self.points:
+            return "No runs with speed yet."
+        if len(self.points) == 1:
+            return f"One run so far: {self.points[0][1]:.1f} tok/s."
+        first = self.points[0][1]
+        last = self.points[-1][1]
+        if first > 0 and abs(last - first) / first <= 0.10:
+            return f"Speed is steady around {last:.1f} tok/s."
+        if last > first:
+            return f"Speed rose from {first:.1f} to {last:.1f} tok/s."
+        return f"Speed fell from {first:.1f} to {last:.1f} tok/s."
+
+    def sizeHint(self):
+        return QSize(320, 150)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        palette = self.palette()
+        painter.fillRect(self.rect(), palette.color(QPalette.Window))
+        if not self.points:
+            painter.setPen(palette.color(QPalette.Text))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "No runs with speed yet.")
+            return
+        text_color = palette.color(QPalette.Text)
+        grid_color = palette.color(QPalette.Mid)
+        line_color = palette.color(QPalette.Highlight)
+        metrics = painter.fontMetrics()
+        max_value = max(value for _label, value in self.points)
+        step = _nice_step(max_value)
+        top_value = step * 4
+        while top_value < max_value:
+            top_value += step
+        label_width = metrics.horizontalAdvance(f"{top_value:.0f}  ")
+        left = 4 + label_width
+        right = self.width() - 8
+        top = 16
+        bottom = self.height() - 22
+        plot_height = max(1, bottom - top)
+        # Grid lines at intuitive steps, labelled on the left.
+        painter.setPen(QPen(grid_color))
+        grid_value = 0.0
+        while grid_value <= top_value + 0.001:
+            y = bottom - int(plot_height * grid_value / top_value)
+            painter.drawLine(left, y, right, y)
+            painter.setPen(text_color)
+            painter.drawText(
+                QRect(4, y - 8, label_width - 2, 16),
+                Qt.AlignRight | Qt.AlignVCenter,
+                f"{grid_value:.0f}",
+            )
+            painter.setPen(QPen(grid_color))
+            grid_value += step
+        count = len(self.points)
+        xs = []
+        for index in range(count):
+            if count == 1:
+                xs.append((left + right) // 2)
+            else:
+                xs.append(
+                    left + (right - left) * index // (count - 1)
+                )
+        ys = [
+            bottom - int(plot_height * value / top_value)
+            for _label, value in self.points
+        ]
+        painter.setPen(QPen(line_color, 2))
+        for index in range(count - 1):
+            painter.drawLine(xs[index], ys[index], xs[index + 1], ys[index + 1])
+        painter.setBrush(line_color)
+        for index in range(count):
+            painter.drawEllipse(xs[index] - 3, ys[index] - 3, 6, 6)
+        # Value labels on every dot when there are few, first and last
+        # only when there are many — clutter helps nobody.
+        label_at = set(range(count)) if count <= 8 else {0, count - 1}
+        painter.setPen(text_color)
+        for index in label_at:
+            value = self.points[index][1]
+            text = f"{value:.1f}"
+            width = metrics.horizontalAdvance(text)
+            x = min(max(xs[index] - width // 2, left), right - width)
+            painter.drawText(QRect(x, ys[index] - 16, width, 14),
+                             Qt.AlignLeft, text)
+        # Date labels: first, middle, last (all of them when few).
+        date_at = set(range(count)) if count <= 5 else {
+            0, count // 2, count - 1,
+        }
+        for index in sorted(date_at):
+            text = self.points[index][0]
+            width = metrics.horizontalAdvance(text)
+            x = min(max(xs[index] - width // 2, left), right - width)
+            painter.drawText(
+                QRect(x, bottom + 4, width, 16), Qt.AlignLeft, text)
+
+
+def make_bento_tile(caption, hero=False):
+    """One bento tile (library 005): a rounded frame with a small
+    caption and one big value. Returns (frame, caption_label,
+    value_label); the caller writes the value (and, on Compare, the
+    caption, which is the model name). Sizes mean something: the hero
+    tile's value is bigger, and the caller gives it more grid space."""
+    frame = QFrame()
+    frame.setObjectName("bentoTile")
+    frame.setStyleSheet(
+        "QFrame#bentoTile { border: 1px solid gray; "
+        "border-radius: 12px; padding: 6px; }"
+    )
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(8, 6, 8, 6)
+    caption_label = QLabel(caption)
+    caption_font = caption_label.font()
+    caption_font.setPointSize(max(8, caption_font.pointSize() - 1))
+    caption_label.setFont(caption_font)
+    caption_label.setWordWrap(True)
+    layout.addWidget(caption_label)
+    value_label = QLabel("n/a")
+    value_label.setWordWrap(True)
+    value_font = value_label.font()
+    value_font.setBold(True)
+    value_font.setPointSize(
+        value_font.pointSize() + (8 if hero else 4)
+    )
+    value_label.setFont(value_font)
+    layout.addWidget(value_label)
+    layout.addStretch()
+    return frame, caption_label, value_label
+
+
+def _explain(text):
+    """A small grey explanation line under a field (R17): plain words
+    saying what the field is for. Disabled so the style paints it
+    greyed in either theme — it takes no input, so disabling it
+    changes nothing but the color."""
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setEnabled(False)
+    return label
+
+
+class SettingsDialog(QDialog):
+    """Settings (R18): the models folder, the Ollama address, the
+    default time budget, and the per-model usual template sets — in
+    the app, not env-only. Built from a load_app_settings dict;
+    result_values holds the new dict when the dialog is accepted.
+    A field whose variable is set in the environment shows the
+    environment's value, locked: the environment wins, always, and
+    the stored setting is kept untouched for when it goes away."""
+
+    def __init__(self, current, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.resize(520, 420)
+        self._current = dict(current)
+        self._template_sets = dict(current.get("template_sets") or {})
+        self.result_values = None
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Settings the app reads, set here instead of in the "
+            "environment."
+        ))
+        layout.addWidget(QLabel("Models folder:"))
+        folder_row = QHBoxLayout()
+        self.models_folder_input = QLineEdit()
+        self.models_folder_input.setPlaceholderText(
+            "Leave empty for where Ollama keeps its models"
+        )
+        folder_row.addWidget(self.models_folder_input)
+        self.browse_button = QPushButton("Browse")
+        self.browse_button.clicked.connect(self._browse_folder)
+        folder_row.addWidget(self.browse_button)
+        layout.addLayout(folder_row)
+        if _ENV_OLLAMA_MODELS is not None:
+            self.models_folder_input.setText(_ENV_OLLAMA_MODELS)
+            self.models_folder_input.setEnabled(False)
+            self.browse_button.setEnabled(False)
+            layout.addWidget(_explain(
+                "OLLAMA_MODELS is set outside the app, so this "
+                "setting is ignored while that is set."
+            ))
+        else:
+            self.models_folder_input.setText(
+                current.get("models_folder", "")
+            )
+            layout.addWidget(_explain(
+                "Where Ollama keeps its models. Takes effect when "
+                "this app starts Ollama; if Ollama is already "
+                "running, restart it for this to apply."
+            ))
+        layout.addWidget(QLabel("Ollama address:"))
+        self.ollama_host_input = QLineEdit()
+        self.ollama_host_input.setPlaceholderText(
+            "e.g. http://localhost:11434 (empty means the default)"
+        )
+        layout.addWidget(self.ollama_host_input)
+        if _ENV_OLLAMA_HOST is not None:
+            self.ollama_host_input.setText(_ENV_OLLAMA_HOST)
+            self.ollama_host_input.setEnabled(False)
+            layout.addWidget(_explain(
+                "OLLAMA_HOST is set outside the app, so this "
+                "setting is ignored while that is set."
+            ))
+        else:
+            self.ollama_host_input.setText(current.get("ollama_host", ""))
+            layout.addWidget(_explain(
+                "Where Ollama answers. Applies to new connections "
+                "right away."
+            ))
+        budget_row = QHBoxLayout()
+        budget_row.addWidget(QLabel("Default time budget:"))
+        self.budget_spin = QSpinBox()
+        self.budget_spin.setRange(0, 600)
+        self.budget_spin.setValue(current.get("default_budget_minutes", 0))
+        self.budget_spin.setSuffix(" minutes")
+        budget_row.addWidget(self.budget_spin)
+        budget_row.addStretch()
+        layout.addLayout(budget_row)
+        layout.addWidget(_explain(
+            "Minutes after which a template stops (0 means no "
+            "limit). Applies to new runs."
+        ))
+        layout.addWidget(QLabel("Usual templates per model:"))
+        self.template_sets_label = QLabel()
+        self.template_sets_label.setWordWrap(True)
+        layout.addWidget(self.template_sets_label)
+        self._refresh_template_sets_label()
+        forget_row = QHBoxLayout()
+        self.forget_sets_button = QPushButton("Forget all usual templates")
+        self.forget_sets_button.clicked.connect(self._forget_template_sets)
+        forget_row.addWidget(self.forget_sets_button)
+        forget_row.addStretch()
+        layout.addLayout(forget_row)
+        layout.addWidget(_explain(
+            "Ticking a model ticks its usual templates. A run saves "
+            "the templates it ran as that model's usual set."
+        ))
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.button(QDialogButtonBox.Ok).setText("Save")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _refresh_template_sets_label(self):
+        if not self._template_sets:
+            self.template_sets_label.setText(
+                "No usual templates saved yet."
+            )
+            return
+        templates, _warnings = load_templates()
+        names = {t["id"]: t["name"] for t in templates}
+        parts = []
+        for label in sorted(self._template_sets):
+            ids = self._template_sets[label]
+            shown = ", ".join(names.get(tid, tid) for tid in ids)
+            parts.append(f"{label}: {shown}")
+        self.template_sets_label.setText("; ".join(parts))
+
+    def _forget_template_sets(self):
+        self._template_sets = {}
+        self._refresh_template_sets_label()
+
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Pick the models folder",
+            self.models_folder_input.text() or os.path.expanduser("~"),
+        )
+        if folder:
+            self.models_folder_input.setText(folder)
+
+    def accept(self):
+        values = dict(self._current)
+        if self.models_folder_input.isEnabled():
+            values["models_folder"] = (
+                self.models_folder_input.text().strip()
+            )
+        if self.ollama_host_input.isEnabled():
+            values["ollama_host"] = (
+                self.ollama_host_input.text().strip().rstrip("/")
+            )
+        values["default_budget_minutes"] = self.budget_spin.value()
+        values["template_sets"] = dict(self._template_sets)
+        self.result_values = values
+        super().accept()
+
+
 class MainWindow(QMainWindow):
     # Tab order (R1): setup, run, models, then the v1-v9 tabs.
     TAB_SETUP = 0
@@ -4929,6 +5580,10 @@ class MainWindow(QMainWindow):
         self._run_total_steps = 0
         self._run_done_steps = 0
         self._run_current_text = ""
+        # R18: applying a usual template set ticks templates by code,
+        # which must not clear the label the set just set.
+        self._applying_template_set = False
+        self._applied_template_set = None
         self.results = {}
         self.result_order = []
         self.templates = []
@@ -5019,10 +5674,66 @@ class MainWindow(QMainWindow):
         profile_top.addWidget(self.profile_regen_button)
         profile_top.addStretch()
         profiles_layout.addLayout(profile_top)
+        # Two columns: the glance on the left (bento tiles and charts),
+        # the full profile text on the right. The left column is the
+        # answer in under six seconds; the right is the detail.
+        profile_columns = QHBoxLayout()
+        profile_left = QVBoxLayout()
+        # R14: the bento overview (library 005). One hero tile (latest
+        # overall score, two columns wide), four small tiles. Hidden
+        # when the model has no runs: no numbers, no tiles.
+        self.profile_tiles = QWidget()
+        tiles_grid = QGridLayout(self.profile_tiles)
+        tiles_grid.setSpacing(16)
+        tiles_grid.setContentsMargins(0, 0, 0, 0)
+        self.profile_hero_tile, _hero_cap, self.profile_hero_value = make_bento_tile(
+            "Latest overall score", hero=True
+        )
+        tiles_grid.addWidget(self.profile_hero_tile, 0, 0, 1, 2)
+        self.profile_best_tile, _best_cap, self.profile_best_value = make_bento_tile(
+            "Best overall score"
+        )
+        tiles_grid.addWidget(self.profile_best_tile, 0, 2)
+        self.profile_speed_tile, _speed_cap, self.profile_speed_value = make_bento_tile(
+            "Average decode speed"
+        )
+        tiles_grid.addWidget(self.profile_speed_tile, 1, 0)
+        self.profile_strong_tile, _strong_cap, self.profile_strong_value = (
+            make_bento_tile("Strongest")
+        )
+        tiles_grid.addWidget(self.profile_strong_tile, 1, 1)
+        self.profile_weak_tile, _weak_cap, self.profile_weak_value = make_bento_tile(
+            "Weakest"
+        )
+        tiles_grid.addWidget(self.profile_weak_tile, 1, 2)
+        profile_left.addWidget(self.profile_tiles)
+        # R16: the profile's charts — score bars per template, speed
+        # across runs. Each has its takeaway title above it. The bars
+        # scroll inside their own area: a model with many templates
+        # would otherwise push everything else off the tab.
+        self.profile_bars_title = QLabel("")
+        self.profile_bars_title.setWordWrap(True)
+        profile_left.addWidget(self.profile_bars_title)
+        self.profile_bars = BarChartWidget()
+        bars_scroll = QScrollArea()
+        bars_scroll.setWidgetResizable(True)
+        bars_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        bars_scroll.setFixedHeight(200)
+        bars_scroll.setWidget(self.profile_bars)
+        profile_left.addWidget(bars_scroll)
+        self.profile_speed_title = QLabel("")
+        self.profile_speed_title.setWordWrap(True)
+        profile_left.addWidget(self.profile_speed_title)
+        self.profile_speed_chart = LineChartWidget()
+        self.profile_speed_chart.setFixedHeight(150)
+        profile_left.addWidget(self.profile_speed_chart)
+        profile_left.addStretch()
+        profile_columns.addLayout(profile_left, 1)
         self.profile_view = QTextEdit()
         self.profile_view.setReadOnly(True)
         self.profile_view.setPlainText("Pick a model to see its profile.")
-        profiles_layout.addWidget(self.profile_view)
+        profile_columns.addWidget(self.profile_view, 1)
+        profiles_layout.addLayout(profile_columns)
 
         # ---- Compare tab ----
         compare_tab = QWidget()
@@ -5049,6 +5760,35 @@ class MainWindow(QMainWindow):
         self.compare_message = QLabel("")
         self.compare_message.setWordWrap(True)
         compare_layout.addWidget(self.compare_message)
+        # R14: the same bento treatment for two models side by side —
+        # one tile each, same size, because a comparison weighs both
+        # equally. Hidden until two models are picked.
+        self.compare_tiles = QWidget()
+        compare_tiles_row = QHBoxLayout(self.compare_tiles)
+        compare_tiles_row.setSpacing(16)
+        compare_tiles_row.setContentsMargins(0, 0, 0, 0)
+        self.compare_tile_a, self.compare_caption_a, self.compare_value_a = make_bento_tile("")
+        compare_tiles_row.addWidget(self.compare_tile_a)
+        self.compare_tile_b, self.compare_caption_b, self.compare_value_b = make_bento_tile("")
+        compare_tiles_row.addWidget(self.compare_tile_b)
+        compare_layout.addWidget(self.compare_tiles)
+        # R16: one chart on Compare — grouped bars, one pair per
+        # template, top bar the first model, bottom bar the second.
+        # The caption says which is which; the values are printed on
+        # the bars, so color never carries the meaning alone.
+        self.compare_chart_title = QLabel("")
+        self.compare_chart_title.setWordWrap(True)
+        compare_layout.addWidget(self.compare_chart_title)
+        self.compare_chart_caption = QLabel("")
+        self.compare_chart_caption.setWordWrap(True)
+        compare_layout.addWidget(self.compare_chart_caption)
+        self.compare_chart = BarChartWidget()
+        compare_scroll = QScrollArea()
+        compare_scroll.setWidgetResizable(True)
+        compare_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        compare_scroll.setFixedHeight(200)
+        compare_scroll.setWidget(self.compare_chart)
+        compare_layout.addWidget(compare_scroll)
         self.compare_table = QTableWidget(0, 3)
         self.compare_table.setHorizontalHeaderLabels(
             ["Template", "Model 1", "Model 2"])
@@ -5091,19 +5831,32 @@ class MainWindow(QMainWindow):
         provider_left.addLayout(provider_list_buttons)
         provider_columns.addLayout(provider_left)
 
+        # R17: the Providers tab rebuilt (library 012, 004; U20) —
+        # two sections, each field explained in plain words directly
+        # underneath it, and the model list comes from the provider.
         provider_right = QVBoxLayout()
+        connection_box = QGroupBox("Connection")
+        connection_layout = QVBoxLayout(connection_box)
         name_row = QHBoxLayout()
         name_row.addWidget(QLabel("Name:"))
         self.provider_name_input = QLineEdit()
         self.provider_name_input.setPlaceholderText("e.g. openai")
         name_row.addWidget(self.provider_name_input)
-        provider_right.addLayout(name_row)
+        connection_layout.addLayout(name_row)
+        connection_layout.addWidget(_explain(
+            "A short name for this provider, e.g. openai. "
+            "Shown in the model list."
+        ))
         url_row = QHBoxLayout()
         url_row.addWidget(QLabel("Base URL:"))
         self.provider_url_input = QLineEdit()
         self.provider_url_input.setPlaceholderText("e.g. https://api.openai.com/v1")
         url_row.addWidget(self.provider_url_input)
-        provider_right.addLayout(url_row)
+        connection_layout.addLayout(url_row)
+        connection_layout.addWidget(_explain(
+            "The provider's API address. It must start with "
+            "http:// or https://"
+        ))
         key_row = QHBoxLayout()
         key_row.addWidget(QLabel("API key:"))
         self.provider_key_input = QLineEdit()
@@ -5112,7 +5865,11 @@ class MainWindow(QMainWindow):
         key_row.addWidget(self.provider_key_input)
         self.provider_key_status = QLabel("No key saved")
         key_row.addWidget(self.provider_key_status)
-        provider_right.addLayout(key_row)
+        connection_layout.addLayout(key_row)
+        connection_layout.addWidget(_explain(
+            "Your key for this provider. Saved in providers.json, "
+            "never shown on screen."
+        ))
         provider_test_row = QHBoxLayout()
         self.provider_test_button = QPushButton("Test connection")
         self.provider_test_button.clicked.connect(self.test_provider_connection)
@@ -5121,11 +5878,32 @@ class MainWindow(QMainWindow):
         provider_test_row.addWidget(self.provider_test_button)
         provider_test_row.addWidget(self.provider_test_status)
         provider_test_row.addStretch()
-        provider_right.addLayout(provider_test_row)
-        provider_right.addWidget(QLabel("Models on this provider:"))
+        connection_layout.addLayout(provider_test_row)
+        fetched_row = QHBoxLayout()
+        fetched_row.addWidget(QLabel("Models this provider lists:"))
+        self.fetched_models_combo = QComboBox()
+        self.fetched_models_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToContents
+        )
+        self.fetched_models_combo.addItem(
+            "Test the connection to list models", None
+        )
+        self.fetched_models_combo.currentIndexChanged.connect(
+            self.on_fetched_model_picked
+        )
+        fetched_row.addWidget(self.fetched_models_combo)
+        fetched_row.addStretch()
+        connection_layout.addLayout(fetched_row)
+        connection_layout.addWidget(_explain(
+            "Pick one to fill the Model id below. The list comes from "
+            "the provider, so the id cannot be mistyped."
+        ))
+        provider_right.addWidget(connection_box)
+        models_box = QGroupBox("Models on this provider")
+        models_layout = QVBoxLayout(models_box)
         self.provider_models_list = QListWidget()
         self.provider_models_list.itemClicked.connect(self.on_provider_model_selected)
-        provider_right.addWidget(self.provider_models_list)
+        models_layout.addWidget(self.provider_models_list)
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("Model id:"))
         self.provider_model_id_input = QLineEdit()
@@ -5135,7 +5913,12 @@ class MainWindow(QMainWindow):
         self.provider_model_name_input = QLineEdit()
         self.provider_model_name_input.setPlaceholderText("optional")
         model_row.addWidget(self.provider_model_name_input)
-        provider_right.addLayout(model_row)
+        models_layout.addLayout(model_row)
+        models_layout.addWidget(_explain(
+            "The model id exactly as the provider lists it. "
+            "Display name is optional: a shorter name to show in the "
+            "model list."
+        ))
         price_row = QHBoxLayout()
         price_row.addWidget(QLabel("Price in per 1M:"))
         self.provider_price_in_input = QLineEdit()
@@ -5145,12 +5928,16 @@ class MainWindow(QMainWindow):
         self.provider_price_out_input = QLineEdit()
         self.provider_price_out_input.setPlaceholderText("$ optional")
         price_row.addWidget(self.provider_price_out_input)
-        provider_right.addLayout(price_row)
+        models_layout.addLayout(price_row)
+        models_layout.addWidget(_explain(
+            "Optional. Dollars per million tokens, used for cost "
+            "estimates. Leave empty when you do not know it."
+        ))
         caps_label = QLabel(
             "What this model can do (decides which templates it can run):"
         )
         caps_label.setWordWrap(True)
-        provider_right.addWidget(caps_label)
+        models_layout.addWidget(caps_label)
         caps_row = QHBoxLayout()
         self.provider_cap_boxes = {}
         for capability in CAPABILITIES:
@@ -5160,7 +5947,7 @@ class MainWindow(QMainWindow):
             self.provider_cap_boxes[capability] = box
             caps_row.addWidget(box)
         caps_row.addStretch()
-        provider_right.addLayout(caps_row)
+        models_layout.addLayout(caps_row)
         model_buttons = QHBoxLayout()
         self.provider_add_model_button = QPushButton("Add model")
         self.provider_add_model_button.clicked.connect(self.add_provider_model)
@@ -5172,7 +5959,8 @@ class MainWindow(QMainWindow):
         model_buttons.addWidget(self.provider_update_model_button)
         model_buttons.addWidget(self.provider_remove_model_button)
         model_buttons.addStretch()
-        provider_right.addLayout(model_buttons)
+        models_layout.addLayout(model_buttons)
+        provider_right.addWidget(models_box)
         provider_save_row = QHBoxLayout()
         self.provider_save_button = QPushButton("Save provider")
         self.provider_save_button.clicked.connect(self.save_provider)
@@ -5258,6 +6046,10 @@ class MainWindow(QMainWindow):
         # Ticking or unticking a model changes which templates any
         # ticked model can run, so the grey-outs refresh on every tick.
         self.model_list.itemChanged.connect(self.update_template_availability)
+        # R18: ticking a model with a saved usual set ticks those
+        # templates. Connected after the grey-outs, so the set only
+        # ever ticks templates a ticked model can run.
+        self.model_list.itemChanged.connect(self._on_model_ticked)
         model_box.addWidget(self.model_list)
         model_buttons = QHBoxLayout()
         self.select_all_button = QPushButton("Select all")
@@ -5281,7 +6073,15 @@ class MainWindow(QMainWindow):
         self.template_filter.textChanged.connect(self._apply_template_filter)
         template_box.addWidget(self.template_filter)
         self.template_list = QListWidget()
+        # R18: a hand-changed template tick means the applied usual
+        # set no longer matches, so its label goes away.
+        self.template_list.itemChanged.connect(self._on_template_ticked)
         template_box.addWidget(self.template_list)
+        # R18: which model's usual templates are ticked, when a set
+        # was applied. Empty the rest of the time.
+        self.template_set_label = QLabel("")
+        self.template_set_label.setWordWrap(True)
+        template_box.addWidget(self.template_set_label)
         template_buttons = QHBoxLayout()
         self.select_all_templates_button = QPushButton("Select all")
         self.select_all_templates_button.clicked.connect(self.select_all_templates)
@@ -5310,7 +6110,11 @@ class MainWindow(QMainWindow):
         budget_row.addWidget(QLabel("Stop a template after"))
         self.budget_spin = QSpinBox()
         self.budget_spin.setRange(0, 600)
-        self.budget_spin.setValue(0)
+        # R18: the default time budget comes from Settings (0 means
+        # no limit, which is also what a fresh install gets).
+        self.budget_spin.setValue(
+            load_app_settings()["default_budget_minutes"]
+        )
         self.budget_spin.setSuffix(" minutes")
         budget_row.addWidget(self.budget_spin)
         budget_row.addWidget(QLabel("(0 = no limit)"))
@@ -5543,6 +6347,9 @@ class MainWindow(QMainWindow):
         self.save_report_action.triggered.connect(self.save_report)
         self.save_report_action.setEnabled(False)
         file_menu.addAction(self.save_report_action)
+        settings_action = QAction("Settings", self)
+        settings_action.triggered.connect(self.show_settings)
+        file_menu.addAction(settings_action)
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
@@ -5614,6 +6421,30 @@ class MainWindow(QMainWindow):
             "model answers. You can send it to someone helping you.",
         )
 
+    def show_settings(self):
+        """The Settings window (R18): models folder, Ollama address,
+        default time budget, usual template sets. Saving writes the
+        settings and applies them to this window."""
+        dialog = SettingsDialog(load_app_settings(), self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.result_values
+        save_app_settings(values)
+        self._apply_settings(values)
+
+    def _apply_settings(self, values):
+        """Apply saved settings to the running window: the default
+        time budget, and the Ollama address when the environment did
+        not set it at startup. Clearing a saved address removes the
+        address this app set, so Ollama answers at the default again."""
+        self.budget_spin.setValue(values["default_budget_minutes"])
+        if _ENV_OLLAMA_HOST is not None:
+            return
+        if values["ollama_host"]:
+            os.environ["OLLAMA_HOST"] = values["ollama_host"]
+        else:
+            os.environ.pop("OLLAMA_HOST", None)
+
     # -- models and templates --------------------------------------------
 
     def refresh_templates(self):
@@ -5648,6 +6479,10 @@ class MainWindow(QMainWindow):
         # A refresh rebuilds the list from scratch, so the filter
         # text the user already typed applies to the new items too.
         self._apply_template_filter()
+        # R18: the ticks were rebuilt, not applied — any usual-set
+        # label no longer describes how they got there.
+        self._applied_template_set = None
+        self.template_set_label.setText("")
         return warnings
 
     def refresh_models(self):
@@ -5813,6 +6648,64 @@ class MainWindow(QMainWindow):
         finally:
             self.template_list.blockSignals(False)
 
+    def _on_model_ticked(self, item):
+        """R18: ticking a model with a saved usual set ticks exactly
+        those templates and says so. Only on a tick, never on an
+        untick — unticking must not touch the templates. Greyed-out
+        templates stay unticked: the set never ticks a template no
+        ticked model can run."""
+        if self.worker is not None:
+            return
+        if item.checkState() != Qt.Checked:
+            return
+        target = item.data(Qt.UserRole)
+        if not isinstance(target, dict):
+            return
+        template_sets = load_app_settings()["template_sets"]
+        wanted = template_sets.get(target["label"])
+        if not wanted:
+            return
+        wanted = set(wanted)
+        self._applying_template_set = True
+        try:
+            for row in range(self.template_list.count()):
+                template_item = self.template_list.item(row)
+                if not template_item.flags() & Qt.ItemIsEnabled:
+                    continue
+                template_item.setCheckState(
+                    Qt.Checked
+                    if template_item.data(Qt.UserRole) in wanted
+                    else Qt.Unchecked
+                )
+        finally:
+            self._applying_template_set = False
+        self._applied_template_set = (target["label"], wanted)
+        self.template_set_label.setText(
+            f"Usual templates for {target['label']}."
+        )
+
+    def _on_template_ticked(self, _item):
+        """R18: a hand-changed template tick means the applied usual
+        set no longer matches, so its label goes away. Ticks made
+        while applying a set do not count."""
+        if self._applying_template_set:
+            return
+        self._applied_template_set = None
+        self.template_set_label.setText("")
+
+    def _save_template_sets(self, targets, templates):
+        """R18: remember this run's templates as each ticked model's
+        usual set — ticking the model later ticks its usual templates.
+        Saved when a run actually starts, never for a cancelled
+        preview."""
+        values = load_app_settings()
+        template_sets = dict(values["template_sets"])
+        ids = [t["id"] for t in templates]
+        for target in targets:
+            template_sets[target["label"]] = ids
+        values["template_sets"] = template_sets
+        save_app_settings(values)
+
     def _set_all_checked(self, widget, state):
         # Greyed-out templates stay untouched: Select all must never
         # tick a template no ticked model can run.
@@ -5886,6 +6779,10 @@ class MainWindow(QMainWindow):
         if not self._show_run_preview(targets, templates):
             self.status_label.setText("Run cancelled.")
             return
+        # R18: this run's templates become each ticked model's usual
+        # set. Saved here, after the preview was accepted — a
+        # cancelled preview saves nothing.
+        self._save_template_sets(targets, templates)
         # The run lives on the Run tab: switch there so the user
         # watches it instead of the setup lists.
         self.tabs.setCurrentIndex(self.TAB_RUN)
@@ -5968,7 +6865,8 @@ class MainWindow(QMainWindow):
             return
         self.start_ollama_button.setEnabled(False)
         self.status_label.setText("Starting Ollama...")
-        self.starter = OllamaStarter()
+        models_folder = load_app_settings()["models_folder"] or None
+        self.starter = OllamaStarter(models_folder)
         self.starter.started_ok.connect(self.on_ollama_started)
         self.starter.failed.connect(self.on_ollama_start_failed)
         self.starter.start()
@@ -6505,6 +7403,7 @@ class MainWindow(QMainWindow):
         slug = self.profile_model_combo.currentData()
         if not slug:
             self.profile_view.setPlainText("No profiles yet. Run a test first.")
+            self._update_profile_glance(None)
             return
         path = os.path.join(get_results_dir(), slug, "PROFILE.md")
         try:
@@ -6514,6 +7413,46 @@ class MainWindow(QMainWindow):
             self.profile_view.setPlainText(
                 "No profile yet for this model. Press Regenerate to build one."
             )
+        self._update_profile_glance(
+            profile_numbers(get_results_dir(), slug)
+        )
+
+    def _update_profile_glance(self, numbers):
+        """The Profiles tab's glance (R14/R16): bento tiles and charts
+        from the profile numbers. Hidden when the model has no runs —
+        no numbers, no tiles, no charts."""
+        if numbers is None:
+            self.profile_tiles.setVisible(False)
+            self.profile_bars_title.setText("")
+            self.profile_bars.set_data([])
+            self.profile_speed_title.setText("")
+            self.profile_speed_chart.set_data([])
+            return
+        self.profile_tiles.setVisible(True)
+        self.profile_hero_value.setText(fmt_score(numbers["overall_latest"]))
+        self.profile_best_value.setText(fmt_score(numbers["overall_best"]))
+        speed = numbers["avg_speed"]
+        self.profile_speed_value.setText(
+            "n/a" if speed is None else f"{speed:.1f} tok/s"
+        )
+        self.profile_strong_value.setText(
+            ", ".join(numbers["strengths"])
+            if numbers["strengths"] else "None yet"
+        )
+        self.profile_weak_value.setText(
+            ", ".join(numbers["weaknesses"])
+            if numbers["weaknesses"] else "None yet"
+        )
+        self.profile_bars.set_data(numbers["template_scores"])
+        self.profile_bars_title.setText(self.profile_bars.takeaway_title())
+        speed_points = [
+            (_short_date(stamp), value)
+            for stamp, value in numbers["speed_points"]
+        ]
+        self.profile_speed_chart.set_data(speed_points)
+        self.profile_speed_title.setText(
+            self.profile_speed_chart.takeaway_title()
+        )
 
     def regenerate_profile(self):
         slug = self.profile_model_combo.currentData()
@@ -6566,6 +7505,7 @@ class MainWindow(QMainWindow):
         slug_b = self.compare_model_b.currentData()
         self.compare_table.setRowCount(0)
         if not slug_a or not slug_b:
+            self._update_compare_glance(None)
             if list_history_models(get_results_dir()):
                 self.compare_message.setText("Pick two models to compare.")
             else:
@@ -6574,17 +7514,20 @@ class MainWindow(QMainWindow):
                 )
             return
         if slug_a == slug_b:
+            self._update_compare_glance(None)
             self.compare_message.setText(
                 "Pick two different models to compare."
             )
             return
         compared = compare_models(get_results_dir(), slug_a, slug_b)
         if compared is None:
+            self._update_compare_glance(None)
             self.compare_message.setText(
                 "One of these models has no runs yet."
             )
             return
         self.compare_message.setText("")
+        self._update_compare_glance(compared)
         self.compare_table.setHorizontalHeaderLabels(
             ["Template", compared["name_a"], compared["name_b"]]
         )
@@ -6637,6 +7580,53 @@ class MainWindow(QMainWindow):
             speed_row, 2,
             NumericItem(compared["speed_b"],
                         fmt_toks(compared["speed_b"])),
+        )
+
+    def _update_compare_glance(self, compared):
+        """The Compare tab's glance (R14/R16): one tile per model and
+        the grouped score bars. Hidden until two models compare."""
+        if compared is None:
+            self.compare_tiles.setVisible(False)
+            self.compare_chart_title.setText("")
+            self.compare_chart_caption.setText("")
+            self.compare_chart.set_data([])
+            return
+        self.compare_tiles.setVisible(True)
+        for caption, value, name, overall, speed, key in (
+            (self.compare_caption_a, self.compare_value_a,
+             compared["name_a"], compared["overall_a"], compared["speed_a"],
+             "score_a"),
+            (self.compare_caption_b, self.compare_value_b,
+             compared["name_b"], compared["overall_b"], compared["speed_b"],
+             "score_b"),
+        ):
+            caption.setText(name)
+            best = None
+            for row in compared["rows"]:
+                score = row[key]
+                if score is not None and (best is None or score > best[1]):
+                    best = (row["name"], score)
+            lines = [f"{fmt_score(overall)} overall"]
+            lines.append(
+                "n/a" if speed is None else f"{speed:.1f} tok/s average"
+            )
+            if best is not None:
+                lines.append(f"Best: {best[0]} {best[1]:.0f}%")
+            value.setText("\n".join(lines))
+        rows = [
+            (row["name"], row["score_a"], row["score_b"])
+            for row in compared["rows"]
+            if row["score_a"] is not None or row["score_b"] is not None
+        ]
+        self.compare_chart.set_data(
+            rows, (compared["name_a"], compared["name_b"])
+        )
+        self.compare_chart_title.setText(
+            self.compare_chart.takeaway_title()
+        )
+        self.compare_chart_caption.setText(
+            f"Top bar: {compared['name_a']}. "
+            f"Bottom bar: {compared['name_b']}."
         )
 
     # -- providers -------------------------------------------------------
@@ -6723,6 +7713,14 @@ class MainWindow(QMainWindow):
         self.editing_model_index = None
         self._set_caps_form(["text"])
         self._refresh_provider_models_list()
+        # The fetched list belongs to the previous provider: a new
+        # form starts with no list until this provider is tested.
+        self.fetched_models_combo.blockSignals(True)
+        self.fetched_models_combo.clear()
+        self.fetched_models_combo.addItem(
+            "Test the connection to list models", None
+        )
+        self.fetched_models_combo.blockSignals(False)
 
     def _caps_from_form(self):
         """Capabilities from the checkboxes (Text on its own when
@@ -6888,10 +7886,33 @@ class MainWindow(QMainWindow):
         self.provider_test_worker.tested.connect(self.on_provider_tested)
         self.provider_test_worker.start()
 
-    def on_provider_tested(self, ok, message):
+    def on_provider_tested(self, ok, message, model_ids):
         self.provider_test_worker = None
         self.provider_test_button.setEnabled(True)
         self.provider_test_status.setText(message)
+        # R17: the fetched model list becomes a pick-list — the model
+        # list comes from the provider, not from typing. Nothing is
+        # picked by default: the first item is a prompt, not a model.
+        self.fetched_models_combo.blockSignals(True)
+        self.fetched_models_combo.clear()
+        if ok and model_ids:
+            self.fetched_models_combo.addItem(
+                "Pick a model to use its id", None
+            )
+            for model_id in model_ids:
+                self.fetched_models_combo.addItem(model_id, model_id)
+        else:
+            self.fetched_models_combo.addItem(
+                "Test the connection to list models", None
+            )
+        self.fetched_models_combo.blockSignals(False)
+
+    def on_fetched_model_picked(self, index):
+        """Picking a fetched model fills the Model id field with it —
+        the id comes from the provider, so it cannot be mistyped."""
+        model_id = self.fetched_models_combo.itemData(index)
+        if model_id:
+            self.provider_model_id_input.setText(model_id)
 
     def add_provider_model(self):
         if self.editing_provider is None:
@@ -7302,6 +8323,10 @@ def main():
     prune_old_logs()
     install_excepthook()
     log_event(f"OLLAMA SYSTEM TEST v{__version__} started")
+    # R18: the saved Ollama address applies to this process, unless
+    # the environment already sets it — the environment wins, always.
+    # Window or headless, before anything reads ollama_base().
+    apply_saved_settings_to_env()
     if args.headless:
         sys.exit(run_headless(args))
     if args.models or args.templates:

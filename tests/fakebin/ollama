@@ -51,6 +51,10 @@ def main():
         if calls:
             with open(calls, "a") as handle:
                 handle.write("serve\n")
+        envfile = os.environ.get("FAKE_OLLAMA_ENVFILE")
+        if envfile:
+            with open(envfile, "w") as handle:
+                handle.write(os.environ.get("OLLAMA_MODELS", "unset"))
         port = urlparse(os.environ.get("OLLAMA_HOST", "")).port or 11434
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         server.daemon_threads = True

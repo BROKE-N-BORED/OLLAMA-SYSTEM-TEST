@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v13
+# TEST-REPORT — OLLAMA SYSTEM TEST v14
 
 Verified 2026-11-14 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
@@ -8,6 +8,19 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v14 is the results-and-settings release (tasks R14, R16, R17, R18
+from the redesign list): the Profiles tab is a dashboard — one hero
+tile for the latest overall score, four small tiles, score bars per
+template, and a speed-across-runs line, each chart titled with its
+takeaway in plain words — with the full profile text beside them;
+Compare gets the same tiles for two models side by side and one
+grouped-bar chart; the Providers tab is rebuilt into Connection and
+Models sections with every field explained underneath it, and Test
+connection offers the provider's own model list as a pick-list; and
+File > Settings holds the models folder, the Ollama address, and the
+default time budget, while each model remembers its usual templates.
+No new templates, no template changes.
 
 v13 is the run release (tasks R11, R12, R13, R15 from the redesign
 list): pressing Run shows a preview first — what will run, how many
@@ -75,10 +88,26 @@ all runtime tests ran against the fake servers from v5/v6 (fake Ollama
 with /api/show, /api/chat with images and tools; fake OpenAI-compatible
 provider with image_url parts, tool-call SSE deltas, image generation,
 transcription, and speech). Test suite:
-tests/run_tests.py in this tree — **1146 passed, 0 failed** (final
-run; the v12 suite's 1088 checks are all carried over and green
-inside that count, plus 58 new v13 checks). The road to green: the
-first run from a fresh unzip came back 1139/7 — six status-column
+tests/run_tests.py in this tree — **1232 passed, 0 failed** (final
+run; the v13 suite's 1146 checks are all carried over and green
+inside that count, plus 86 new v14 checks). The road to green: the
+first run crashed at 1211 checks — the suite imported QAction from
+QtWidgets, where it does not live (it is in QtGui), and one File-menu
+check still expected the v7 menu without Settings (both test-only
+fixes; the app was right). The second run came back 1227/4: the
+geometry probe failed when something wiped the run's TMPDIR
+(/tmp/ost-v14) mid-run, and three starter checks failed because the
+suite regenerates tests/fakebin/ollama at startup from an embedded
+template — and the v14 env-file block had been added to the shipped
+fakebin but not to the template, so every run overwrote the new
+fakebin with the old one (root-caused by diffing the generated file
+against the zip; the template now matches the shipped file
+byte-for-byte, and a check pins it). The third launch died on import
+before a single check: a misplaced & in the launch command
+backgrounded the whole build chain, so the suite started while its
+own fresh unzip was still being built. Relaunched properly, with a
+watchdog keeping the TMPDIR alive, it is the green 1232 above. The
+v13 suite's own history follows: the first run from a fresh unzip came back 1139/7 — six status-column
 reads in the suite still pointed at column 3, which is the TTFT
 column now (test-only fix; the app was right), and one new preview
 string carried an em-dash, which the v11 AST pin caught (fixed in
@@ -115,6 +144,104 @@ test (it stamped its run files 09:00, which is only "later" before
 09:00) and four version pins still said v9. Both were fixed in the
 test, not the app, and the re-run from a fresh unzip is the green
 1016 that v11 carries.
+
+## What was verified (v14)
+
+### 1. Bento results overview (R14)
+
+- The Profiles tab is two columns: the glance on the left, the
+  full profile text on the right. The glance is five tiles — one
+  hero (latest overall score, two columns wide) and four small
+  ones (best score, decode speed, strongest and weakest
+  templates) — in a 3-column grid with 16 px gaps and 12 px
+  rounded corners, per library entry 005. The Compare tab gets
+  one tile per model, same size, because a comparison weighs both
+  equally. Tiles and charts read from one new helper,
+  profile_numbers, which build_profile also uses — the tiles, the
+  charts, and the markdown can never disagree about a model. The
+  suite pins the helper's numbers against fabricated runs and the
+  tiles' contents in a real window; with no runs, the tiles hide
+  and the charts clear.
+- GUI-driven under Xvfb at 1366x768: the tiles read at a glance,
+  the hero score is the biggest thing on the tab, and the Compare
+  tiles name both models with their overall scores, speeds, and
+  best templates.
+
+### 2. Charts (R16)
+
+- Two chart widgets, painted with plain Qt — no new dependency.
+  The bar chart draws horizontal score bars on a 0-based axis
+  with grid lines at 0, 25, 50, 75, and 100 and the value printed
+  at the end of each bar; the line chart draws decode speed across
+  runs with grid lines at intuitive steps (1, 2, 5, or 10 times a
+  power of ten) and the value on each dot. Each chart has a
+  takeaway title above it in plain words ("Strongest: Math 80%.
+  Weakest: Coding 40%."; "Speed is steady around 22.0 tok/s.").
+  Colors come from the widget palette, so dark mode works, and the
+  numbers are always printed next to the marks, so color never
+  carries the meaning alone. The Compare chart groups two bars
+  per template (top bar the first model, bottom bar the second)
+  with a caption saying which is which. The bars scroll inside
+  their own area when a model has many templates. The suite pins
+  the takeaway titles (empty, single, steady, rose, fell, even,
+  leader), the axis step, and that all three chart shapes paint
+  without error, with data and without.
+- GUI-driven: the bars and the line render in the window, and the
+  takeaway titles read above them.
+
+### 3. Providers tab rebuild (R17)
+
+- The tab is two sections now — Connection and Models on this
+  provider — and every field explains itself in plain words
+  directly underneath it. Test connection fetches the provider's
+  model list and offers it as a pick-list: picking one fills the
+  Model id field, so the id comes from the provider instead of
+  from typing. The list is capped at 200 ids, and the status says
+  so when the cap bites. The fetch is a new function,
+  provider_fetch_models, returning (ok, ids, message);
+  provider_test_connection keeps its (ok, message) shape by
+  delegating to it, and the worker warmup path is untouched. The
+  suite pins the fetch against the fake provider (list, bad key,
+  no base URL), the group boxes, the explanations, the pick-list
+  filling after a real test click, and the list resetting when a
+  new provider is started.
+- GUI-driven: the sections read as two groups, the explanations
+  sit under their fields, and picking a fetched model fills the
+  Model id.
+
+### 4. Settings window (R18)
+
+- File > Settings holds the models folder, the Ollama address,
+  and the default time budget — in the app, not env-only. The
+  models folder is passed to the Ollama this app starts; the
+  address applies to new connections right away; the budget
+  initializes the Run setup spin and applies to new runs. A field
+  whose variable is already set in the environment shows that
+  value, locked, and the stored setting is kept untouched for
+  when the variable goes away. Per-model template sets are
+  remembered: ticking a model ticks its usual templates, with a
+  label saying which set is active; a hand-changed template clears
+  the label; a run saves the templates it ran as each ticked
+  model's usual set. The Settings window lists the saved sets and
+  can forget them all. The suite pins the round-trip, the locked
+  fields, the address applying (and clearing) in the process, the
+  starter passing the models folder to a fake Ollama (and never
+  overriding OLLAMA_MODELS), and the set applying, clearing, and
+  saving through a real run.
+- GUI-driven: the Settings window opens from the File menu, its
+  fields show the saved values, and saving applies the budget to
+  the Run setup spin.
+
+### 5. QTest.qWait does not deliver worker signals here
+
+- The v14 probe caught a second timer quirk in this sandbox (the
+  first was the modal-dialog one in v13): QTest.qWait(2000) after
+  clicking Test connection left the status on "Testing..." — the
+  worker had finished, but its queued signal was never delivered
+  inside qWait's local loop. A processEvents + sleep polling loop
+  (the suite's wait_until) delivers it at once. The suite's
+  provider checks use wait_until, and GUI drives poll the same
+  way — never qWait for a worker thread's signal.
 
 ## What was verified (v13)
 

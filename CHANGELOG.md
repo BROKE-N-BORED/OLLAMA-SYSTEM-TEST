@@ -1,5 +1,43 @@
 # Changelog
 
+## v14 (2026-11-14)
+
+UI redesign, part 4 (tasks R14, R16, R17, R18) — results you can
+read at a glance, and settings inside the app. No new templates.
+
+- Results as a bento overview (R14). The Profiles tab is a
+  dashboard now: one hero tile (latest overall score), four small
+  tiles (best score, decode speed, strongest and weakest
+  templates), with the full profile text beside them. Compare gets
+  the same treatment for two models side by side — one tile each,
+  same size, because a comparison weighs both equally. The
+  profile's headline is readable in under six seconds; the text is
+  still there for the detail.
+- Charts (R16). Score bars per template and speed across runs,
+  painted with plain Qt — no new dependency. One chart per profile
+  (bars plus the speed line), one on Compare (grouped bars, top
+  bar the first model, bottom bar the second). Each chart has a
+  plain-language title stating the takeaway, and the numbers are
+  printed on the marks, so color never carries the meaning alone.
+  The bars scroll inside their own area when a model has many
+  templates.
+- Providers tab rebuild (R17). Two sections — Connection and
+  Models on this provider — and every field explains itself in
+  plain words directly underneath it. Test connection offers the
+  fetched model list as a pick-list: pick one and its id fills the
+  Model id field, so the id comes from the provider instead of
+  from typing.
+- Settings window (R18). File > Settings holds the models folder,
+  the Ollama address, and the default time budget — in the app,
+  not env-only. The models folder takes effect when this app
+  starts Ollama. A setting whose variable is already set in the
+  environment shows that value, locked: the environment wins,
+  always. Per-model template sets are remembered too: tick a
+  model's usual templates once and they follow the model, with a
+  label saying which set is active; a run saves the templates it
+  ran as that model's usual set. The Settings window lists the
+  saved sets and can forget them all.
+
 ## v13 (2026-11-14)
 
 UI redesign, part 3 (tasks R11, R12, R13, R15) — the run itself.

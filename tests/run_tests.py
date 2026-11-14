@@ -1,9 +1,8 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v13 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v14 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1088 v12 checks are carried over; the v13 checks
-cover the run preview (R11), honest run progress (R12), the calm run
-status and finish moment (R13), and answers + TTFT in the results
-(R15).
+answers per model. All 1146 v13 checks are carried over; the v14 checks
+cover the bento results overview (R14), charts (R16), the providers
+tab rebuild (R17), and the settings window (R18).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -222,6 +221,10 @@ def main():
         if calls:
             with open(calls, "a") as handle:
                 handle.write("serve\\n")
+        envfile = os.environ.get("FAKE_OLLAMA_ENVFILE")
+        if envfile:
+            with open(envfile, "w") as handle:
+                handle.write(os.environ.get("OLLAMA_MODELS", "unset"))
         port = urlparse(os.environ.get("OLLAMA_HOST", "")).port or 11434
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         server.daemon_threads = True
@@ -3066,6 +3069,16 @@ def main():
                        "fakebin/ollama", "fakebin-sleep/ollama"):
         check(f"suite ships {suite_file}",
               os.path.exists(os.path.join(VERIFY_DIR, suite_file)))
+    # The suite regenerates tests/fakebin/ollama at startup from its
+    # embedded template (write_fake_ollama), so the template — not
+    # just the shipped file — must carry the v14 env-file block, or
+    # the starter checks can never see it (run 2 root cause).
+    with open(os.path.join(VERIFY_DIR, "fakebin", "ollama"),
+              encoding="utf-8") as handle:
+        generated_fakebin = handle.read()
+    check("generated fakebin writes the env file",
+          "FAKE_OLLAMA_ENVFILE" in generated_fakebin
+          and "OLLAMA_MODELS" in generated_fakebin)
     import make_fixtures
     import make_templates
     check("make_fixtures points at the repo root",
@@ -3378,7 +3391,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 13", app.__version__ == "13",
+    check("__version__ is 14", app.__version__ == "14",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3392,8 +3405,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v13",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v13",
+    check("title bar shows OLLAMA SYSTEM TEST v14",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v14",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -3442,8 +3455,9 @@ def main():
           menu_names == ["File", "View", "Help"], str(menu_names))
     file_menu7 = bar7.actions()[0].menu()
     file_items = [a.text() for a in file_menu7.actions()]
-    check("File menu has Save report and Quit",
-          file_items == ["Save report", "Quit"], str(file_items))
+    check("File menu has Save report, Settings and Quit",
+          file_items == ["Save report", "Settings", "Quit"],
+          str(file_items))
     help_menu7 = bar7.actions()[2].menu()
     check("Help menu has How to Use, About and Debug report",
           [a.text() for a in help_menu7.actions()]
@@ -4806,10 +4820,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v13",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v13",
+        check("title bar shows v14",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v14",
               window9.windowTitle())
-        check("__version__ is 13", app.__version__ == "13", app.__version__)
+        check("__version__ is 14", app.__version__ == "14", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -5894,6 +5908,661 @@ def main():
             os.environ.pop("OST_RESULTS_DIR", None)
         else:
             os.environ["OST_RESULTS_DIR"] = prior_results13
+
+    # ---------- v14: bento overview (R14), charts (R16), providers
+    # rebuild (R17), settings window (R18) ----------
+    # Fabricated runs for two models: smart scores Math 100 then 80
+    # and Coding 40; partial scores Math 60 and Coding 80.
+    def write_run14(folder, model, template, name, score, speed,
+                    stamp):
+        path = os.path.join(
+            folder, f"{stamp.replace(':', '-')}-{template}.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "model": model, "template": template,
+                "template_name": name, "template_score": score,
+                "avg_decode_tok_s": speed, "timestamp": stamp,
+                "system_id": "sys1",
+            }, handle)
+
+    unit14 = os.path.join(SCRATCH, "results14-unit")
+    smart_dir14 = os.path.join(unit14, "fake-smart-2b", "sys1")
+    partial_dir14 = os.path.join(unit14, "fake-partial-3b", "sys1")
+    os.makedirs(smart_dir14, exist_ok=True)
+    os.makedirs(partial_dir14, exist_ok=True)
+    write_run14(smart_dir14, "fake-smart:2b", "math", "Math", 100.0,
+                20.0, "2026-11-13T10:00:00")
+    write_run14(smart_dir14, "fake-smart:2b", "coding", "Coding", 40.0,
+                18.0, "2026-11-13T11:00:00")
+    write_run14(smart_dir14, "fake-smart:2b", "math", "Math", 80.0,
+                22.0, "2026-11-14T09:00:00")
+    write_run14(partial_dir14, "fake-partial:3b", "math", "Math", 60.0,
+                10.0, "2026-11-13T10:00:00")
+    write_run14(partial_dir14, "fake-partial:3b", "coding", "Coding",
+                80.0, 9.0, "2026-11-13T11:00:00")
+    nums14 = app.profile_numbers(unit14, "fake-smart-2b")
+    check("profile_numbers latest overall is 60",
+          nums14 is not None and nums14["overall_latest"] == 60.0,
+          str(nums14["overall_latest"]) if nums14 else "None")
+    check("profile_numbers best overall is 70",
+          nums14 is not None and nums14["overall_best"] == 70.0,
+          str(nums14["overall_best"]) if nums14 else "None")
+    check("profile_numbers average speed is 20",
+          nums14 is not None and nums14["avg_speed"] == 20.0,
+          str(nums14["avg_speed"]) if nums14 else "None")
+    check("profile_numbers strengths are Math",
+          nums14 is not None and nums14["strengths"] == ["Math"],
+          str(nums14["strengths"]) if nums14 else "None")
+    check("profile_numbers weaknesses are Coding",
+          nums14 is not None and nums14["weaknesses"] == ["Coding"],
+          str(nums14["weaknesses"]) if nums14 else "None")
+    check("profile_numbers template scores best first",
+          nums14 is not None
+          and nums14["template_scores"] == [("Math", 80.0),
+                                            ("Coding", 40.0)],
+          str(nums14["template_scores"]) if nums14 else "None")
+    check("profile_numbers speed points oldest first",
+          nums14 is not None
+          and nums14["speed_points"]
+          == [("2026-11-13T10:00:00", 20.0),
+              ("2026-11-13T11:00:00", 18.0),
+              ("2026-11-14T09:00:00", 22.0)],
+          str(nums14["speed_points"]) if nums14 else "None")
+    check("profile_numbers counts 3 runs",
+          nums14 is not None and nums14["runs_count"] == 3,
+          str(nums14["runs_count"]) if nums14 else "None")
+    check("profile_numbers is None with no runs",
+          app.profile_numbers(unit14, "no-such-model") is None)
+    _name14, text14 = app.build_profile(unit14, "fake-smart-2b")
+    check("build_profile still renders the latest score",
+          "Latest overall score: 60%" in text14, text14)
+    check("build_profile still renders the run count",
+          "Runs: 3" in text14, text14)
+    check("build_profile verdict still names strengths",
+          "Best at: Math." in text14 and "Weakest at: Coding." in text14,
+          text14)
+    check("nice step of 20 is 5", app._nice_step(20) == 5.0,
+          str(app._nice_step(20)))
+    check("nice step of 22 is 10", app._nice_step(22) == 10.0,
+          str(app._nice_step(22)))
+    check("nice step of 2.5 is 1", app._nice_step(2.5) == 1.0,
+          str(app._nice_step(2.5)))
+    check("short date of an ISO stamp is Nov 13",
+          app._short_date("2026-11-13T10:00:00") == "Nov 13",
+          app._short_date("2026-11-13T10:00:00"))
+    check("short date of garbage is the first 10 chars",
+          app._short_date("not-a-date-at-all") == "not-a-date",
+          app._short_date("not-a-date-at-all"))
+    bars14 = app.BarChartWidget()
+    check("bars title with no data",
+          bars14.takeaway_title() == "No scored templates yet.",
+          bars14.takeaway_title())
+    bars14.set_data([("Math", 80.0), ("Coding", 40.0)])
+    check("bars title names strongest and weakest",
+          bars14.takeaway_title()
+          == "Strongest: Math 80%. Weakest: Coding 40%.",
+          bars14.takeaway_title())
+    bars14.set_data([("Math", 100.0), ("Coding", 100.0)])
+    check("bars title when all are equal",
+          bars14.takeaway_title() == "Every template at 100%.",
+          bars14.takeaway_title())
+    bars14.set_data([("Math", 80.0, 60.0), ("Coding", 40.0, 80.0)],
+                    ("A", "B"))
+    check("bars title when pairs are even",
+          bars14.takeaway_title()
+          == "A and B are even across the templates.",
+          bars14.takeaway_title())
+    bars14.set_data([("Math", 80.0, 60.0), ("Coding", 90.0, 80.0)],
+                    ("A", "B"))
+    check("bars title names the pair leader",
+          bars14.takeaway_title() == "A leads on 2 templates.",
+          bars14.takeaway_title())
+    line14 = app.LineChartWidget()
+    check("line title with no data",
+          line14.takeaway_title() == "No runs with speed yet.",
+          line14.takeaway_title())
+    line14.set_data([("Nov 13", 20.0)])
+    check("line title with one point",
+          line14.takeaway_title() == "One run so far: 20.0 tok/s.",
+          line14.takeaway_title())
+    line14.set_data([("Nov 13", 20.0), ("Nov 14", 21.0)])
+    check("line title when speed is steady",
+          line14.takeaway_title()
+          == "Speed is steady around 21.0 tok/s.",
+          line14.takeaway_title())
+    line14.set_data([("Nov 13", 10.0), ("Nov 14", 20.0)])
+    check("line title when speed rose",
+          line14.takeaway_title()
+          == "Speed rose from 10.0 to 20.0 tok/s.",
+          line14.takeaway_title())
+    line14.set_data([("Nov 13", 20.0), ("Nov 14", 10.0)])
+    check("line title when speed fell",
+          line14.takeaway_title()
+          == "Speed fell from 20.0 to 10.0 tok/s.",
+          line14.takeaway_title())
+    # The charts paint without error, with data and without.
+    from PySide6.QtWidgets import QGroupBox as QGroupBox14
+    bars14.set_data([("Math", 80.0), ("Coding", 40.0)])
+    bars14.show()
+    line14.set_data([("Nov 13", 10.0), ("Nov 14", 20.0)])
+    line14.show()
+    qt_app.processEvents()
+    check("bars chart paints with data",
+          not bars14.grab().isNull())
+    check("line chart paints with data",
+          not line14.grab().isNull())
+    bars14.set_data([])
+    line14.set_data([])
+    qt_app.processEvents()
+    check("bars chart paints with no data",
+          not bars14.grab().isNull())
+    check("line chart paints with no data",
+          not line14.grab().isNull())
+    bars14.set_data([("Math", 80.0, 60.0)], ("A", "B"))
+    qt_app.processEvents()
+    check("paired bars chart paints",
+          not bars14.grab().isNull())
+    bars14.close()
+    line14.close()
+
+    pserver14, _pt14 = fake_ollama.start_provider_server()
+    phost14, pport14 = pserver14.server_address
+    provider14 = {"name": "fake",
+                  "base_url": f"http://{phost14}:{pport14}/v1",
+                  "api_key": fake_ollama.PROVIDER_API_KEY}
+    try:
+        ok14, ids14, msg14 = app.provider_fetch_models(provider14)
+        check("fetch models returns the provider list",
+              ok14 and ids14 == ["fake-gpt-dumb", "fake-gpt-partial",
+                                 "fake-gpt-smart"],
+              f"{ok14} {ids14} {msg14}")
+        check("fetch models message names the count",
+              "3 models listed" in msg14, msg14)
+        ok14b, ids14b, msg14b = app.provider_fetch_models(
+            dict(provider14, api_key="wrong-key"))
+        check("fetch models with a bad key fails with no ids",
+              not ok14b and ids14b == []
+              and "rejected the key" in msg14b,
+              f"{ok14b} {ids14b} {msg14b}")
+        ok14c, ids14c, msg14c = app.provider_fetch_models(
+            dict(provider14, base_url=""))
+        check("fetch models with no base URL fails",
+              not ok14c and ids14c == [] and "No base URL" in msg14c,
+              f"{ok14c} {ids14c} {msg14c}")
+        ok14d, msg14d = app.provider_test_connection(provider14)
+        check("test connection keeps its (ok, message) shape",
+              ok14d and "Connected" in msg14d, f"{ok14d} {msg14d}")
+
+        # Settings round-trip. The keys live in the real QSettings,
+        # so the prior values are saved here and restored in the
+        # finally below, leaving no state behind.
+        from PySide6.QtCore import QSettings as QSettings14
+        settings14 = QSettings14("BrokeNBored", app.APP_NAME)
+        prior14 = {
+            key: settings14.value(key)
+            for key in ("models_folder", "ollama_host",
+                        "default_budget_minutes", "template_sets",
+                        "setup_dismissed", "setup_completed")
+        }
+        prior_env_host14 = app._ENV_OLLAMA_HOST
+        prior_env_models14 = app._ENV_OLLAMA_MODELS
+        prior_host14 = os.environ.get("OLLAMA_HOST")
+        prior_results14 = os.environ.get("OST_RESULTS_DIR")
+        prior_providers14 = os.environ.get("OST_PROVIDERS_FILE")
+        prior_caps14 = os.environ.get("OST_CAPABILITIES_FILE")
+        prior_path14 = os.environ.get("PATH")
+        prior_pid14 = os.environ.get("FAKE_OLLAMA_PIDFILE")
+        prior_calls14 = os.environ.get("FAKE_OLLAMA_CALLS")
+        prior_envfile14 = os.environ.get("FAKE_OLLAMA_ENVFILE")
+        prior_models_env14 = os.environ.get("OLLAMA_MODELS")
+        try:
+            saved14 = {
+                "models_folder": "/tmp/ost-v14-models",
+                "ollama_host": "http://127.0.0.1:11434",
+                "default_budget_minutes": 45,
+                "template_sets": {"fake-smart:2b": ["math"]},
+            }
+            app.save_app_settings(saved14)
+            check("settings round-trip",
+                  app.load_app_settings() == saved14,
+                  str(app.load_app_settings()))
+            settings14.setValue("template_sets", "{not json")
+            check("settings with bad template JSON reads empty sets",
+                  app.load_app_settings()["template_sets"] == {},
+                  str(app.load_app_settings()["template_sets"]))
+            for key in ("models_folder", "ollama_host",
+                        "default_budget_minutes", "template_sets"):
+                settings14.remove(key)
+            settings14.sync()
+            check("settings with no keys read as defaults",
+                  app.load_app_settings() == {
+                      "models_folder": "", "ollama_host": "",
+                      "default_budget_minutes": 0, "template_sets": {}},
+                  str(app.load_app_settings()))
+            # The budget spin starts from the saved default.
+            app.save_app_settings({
+                "models_folder": "", "ollama_host": "",
+                "default_budget_minutes": 45, "template_sets": {}})
+
+            results14 = os.path.join(SCRATCH, "results14")
+            shutil.copytree(unit14, results14, dirs_exist_ok=True)
+            os.environ["OST_RESULTS_DIR"] = results14
+            os.environ["OST_PROVIDERS_FILE"] = os.path.join(
+                SCRATCH, "providers14.json")
+            os.environ["OST_CAPABILITIES_FILE"] = os.path.join(
+                SCRATCH, "capabilities14.json")
+            server14, _t14 = fake_ollama.start_server()
+            host14, port14 = server14.server_address
+            os.environ["OLLAMA_HOST"] = f"http://{host14}:{port14}"
+            window14 = app.MainWindow()
+            window14.show()
+            wait_until(lambda: window14.model_list.count() == 4,
+                       timeout=10, app=qt_app)
+            try:
+                check("budget spin starts from the saved default",
+                      window14.budget_spin.value() == 45,
+                      str(window14.budget_spin.value()))
+                # R14/R16: the profile glance for the smart model.
+                window14.tabs.setCurrentIndex(window14.TAB_PROFILES)
+                for row14 in range(window14.profile_model_combo.count()):
+                    if (window14.profile_model_combo.itemData(row14)
+                            == "fake-smart-2b"):
+                        window14.profile_model_combo.setCurrentIndex(row14)
+                qt_app.processEvents()
+                check("hero tile shows the latest overall score",
+                      window14.profile_hero_value.text() == "60%",
+                      window14.profile_hero_value.text())
+                check("best tile shows the best overall score",
+                      window14.profile_best_value.text() == "70%",
+                      window14.profile_best_value.text())
+                check("speed tile shows the average speed",
+                      window14.profile_speed_value.text() == "20.0 tok/s",
+                      window14.profile_speed_value.text())
+                check("strongest tile names Math",
+                      window14.profile_strong_value.text() == "Math",
+                      window14.profile_strong_value.text())
+                check("weakest tile names Coding",
+                      window14.profile_weak_value.text() == "Coding",
+                      window14.profile_weak_value.text())
+                check("tiles show when the model has runs",
+                      window14.profile_tiles.isVisible())
+                check("bars chart holds the template scores",
+                      window14.profile_bars.rows
+                      == [("Math", 80.0), ("Coding", 40.0)],
+                      str(window14.profile_bars.rows))
+                check("bars title names strongest and weakest",
+                      window14.profile_bars_title.text()
+                      == "Strongest: Math 80%. Weakest: Coding 40%.",
+                      window14.profile_bars_title.text())
+                check("speed chart holds the run speeds",
+                      window14.profile_speed_chart.points
+                      == [("Nov 13", 20.0), ("Nov 13", 18.0),
+                          ("Nov 14", 22.0)],
+                      str(window14.profile_speed_chart.points))
+                check("speed title says steady around 22",
+                      window14.profile_speed_title.text()
+                      == "Speed is steady around 22.0 tok/s.",
+                      window14.profile_speed_title.text())
+                # No runs: no tiles, no charts.
+                empty14 = os.path.join(SCRATCH, "results14-empty")
+                os.makedirs(empty14, exist_ok=True)
+                os.environ["OST_RESULTS_DIR"] = empty14
+                window14.refresh_profiles()
+                qt_app.processEvents()
+                check("tiles hide when the model has no runs",
+                      not window14.profile_tiles.isVisible())
+                check("charts clear when the model has no runs",
+                      window14.profile_bars.rows == []
+                      and window14.profile_bars_title.text() == ""
+                      and window14.profile_speed_chart.points == [],
+                      str(window14.profile_bars.rows))
+                os.environ["OST_RESULTS_DIR"] = results14
+                window14.refresh_profiles()
+                window14.refresh_compare()
+                qt_app.processEvents()
+                # R14/R16 on Compare: two models side by side.
+                window14.tabs.setCurrentIndex(window14.TAB_COMPARE)
+                for combo14, slug14 in (
+                        (window14.compare_model_a, "fake-smart-2b"),
+                        (window14.compare_model_b, "fake-partial-3b")):
+                    for row14 in range(combo14.count()):
+                        if combo14.itemData(row14) == slug14:
+                            combo14.setCurrentIndex(row14)
+                qt_app.processEvents()
+                check("compare tile A names the model and numbers",
+                      window14.compare_caption_a.text() == "fake-smart:2b"
+                      and "60% overall" in window14.compare_value_a.text()
+                      and "20.0 tok/s average"
+                      in window14.compare_value_a.text()
+                      and "Best: Math 80%"
+                      in window14.compare_value_a.text(),
+                      window14.compare_value_a.text())
+                check("compare tile B names the model and numbers",
+                      window14.compare_caption_b.text() == "fake-partial:3b"
+                      and "70% overall" in window14.compare_value_b.text()
+                      and "9.5 tok/s average"
+                      in window14.compare_value_b.text()
+                      and "Best: Coding 80%"
+                      in window14.compare_value_b.text(),
+                      window14.compare_value_b.text())
+                check("compare chart title says the pair is even",
+                      window14.compare_chart_title.text()
+                      == "fake-smart:2b and fake-partial:3b are even "
+                      "across the templates.",
+                      window14.compare_chart_title.text())
+                check("compare chart caption says which bar is which",
+                      window14.compare_chart_caption.text()
+                      == "Top bar: fake-smart:2b. "
+                      "Bottom bar: fake-partial:3b.",
+                      window14.compare_chart_caption.text())
+                check("compare chart holds both models scores",
+                      window14.compare_chart.rows
+                      == [("Coding", 40.0, 80.0), ("Math", 80.0, 60.0)],
+                      str(window14.compare_chart.rows))
+                for row14 in range(window14.compare_model_b.count()):
+                    if (window14.compare_model_b.itemData(row14)
+                            == "fake-smart-2b"):
+                        window14.compare_model_b.setCurrentIndex(row14)
+                qt_app.processEvents()
+                check("compare glance hides for the same model twice",
+                      not window14.compare_tiles.isVisible()
+                      and window14.compare_chart.rows == [])
+                # R17: the rebuilt Providers tab.
+                window14.tabs.setCurrentIndex(window14.TAB_PROVIDERS)
+                qt_app.processEvents()
+                group_titles14 = sorted(
+                    g.title() for g in
+                    window14.findChildren(QGroupBox14))
+                check("providers tab has Connection and Models sections",
+                      group_titles14 == ["Connection",
+                                        "Models on this provider"],
+                      str(group_titles14))
+                label_texts14 = [
+                    label.text() for label in
+                    window14.findChildren(QLabel)]
+                check("every provider field explains itself",
+                      any("A short name for this provider" in t
+                          for t in label_texts14)
+                      and any("The provider's API address" in t
+                              for t in label_texts14)
+                      and any("Saved in providers.json" in t
+                              for t in label_texts14)
+                      and any("exactly as the provider lists it" in t
+                              for t in label_texts14)
+                      and any("Dollars per million tokens" in t
+                              for t in label_texts14),
+                      str([t for t in label_texts14 if t][:8]))
+                check("fetched combo starts with its prompt",
+                      window14.fetched_models_combo.count() == 1
+                      and window14.fetched_models_combo.itemText(0)
+                      == "Test the connection to list models",
+                      window14.fetched_models_combo.itemText(0))
+                window14.provider_name_input.setText("fake")
+                window14.provider_url_input.setText(
+                    f"http://{phost14}:{pport14}/v1")
+                window14.provider_key_input.setText(
+                    fake_ollama.PROVIDER_API_KEY)
+                window14.provider_test_button.click()
+                tested14 = wait_until(
+                    lambda: "Connected" in
+                    window14.provider_test_status.text(),
+                    timeout=30, app=qt_app)
+                check("test connection reports Connected", tested14,
+                      window14.provider_test_status.text())
+                check("fetched combo lists the provider models",
+                      [window14.fetched_models_combo.itemText(i)
+                       for i in range(
+                           window14.fetched_models_combo.count())]
+                      == ["Pick a model to use its id", "fake-gpt-dumb",
+                          "fake-gpt-partial", "fake-gpt-smart"],
+                      str([window14.fetched_models_combo.itemText(i)
+                           for i in range(
+                               window14.fetched_models_combo.count())]))
+                window14.fetched_models_combo.setCurrentIndex(2)
+                qt_app.processEvents()
+                check("picking a fetched model fills the Model id",
+                      window14.provider_model_id_input.text()
+                      == "fake-gpt-partial",
+                      window14.provider_model_id_input.text())
+                window14.provider_new_button.click()
+                qt_app.processEvents()
+                check("a new provider starts with no fetched list",
+                      window14.fetched_models_combo.count() == 1
+                      and window14.fetched_models_combo.itemText(0)
+                      == "Test the connection to list models")
+                # R18: the Settings window (driven without exec — a
+                # real modal dialog would hang the suite).
+                from PySide6.QtGui import QAction as QAction14
+                check("File menu has a Settings action",
+                      any(a.text() == "Settings" for a in
+                          window14.findChildren(QAction14)))
+                app._ENV_OLLAMA_HOST = None
+                app._ENV_OLLAMA_MODELS = None
+                app.save_app_settings({
+                    "models_folder": "/tmp/ost-v14-models",
+                    "ollama_host": "http://127.0.0.1:11434",
+                    "default_budget_minutes": 45,
+                    "template_sets": {"fake-smart:2b": ["math"]},
+                })
+                dialog14 = app.SettingsDialog(
+                    app.load_app_settings(), window14)
+                check("settings fields show the saved values",
+                      dialog14.models_folder_input.text()
+                      == "/tmp/ost-v14-models"
+                      and dialog14.ollama_host_input.text()
+                      == "http://127.0.0.1:11434"
+                      and dialog14.budget_spin.value() == 45,
+                      f"{dialog14.models_folder_input.text()} "
+                      f"{dialog14.ollama_host_input.text()} "
+                      f"{dialog14.budget_spin.value()}")
+                check("settings dialog names the saved usual set",
+                      "fake-smart:2b" in
+                      dialog14.template_sets_label.text()
+                      and "Math" in dialog14.template_sets_label.text(),
+                      dialog14.template_sets_label.text())
+                dialog14.models_folder_input.setText("/tmp/new-models")
+                dialog14.ollama_host_input.setText(
+                    "http://127.0.0.1:11555")
+                dialog14.budget_spin.setValue(30)
+                dialog14.accept()
+                check("settings accept returns the edited values",
+                      dialog14.result_values == {
+                          "models_folder": "/tmp/new-models",
+                          "ollama_host": "http://127.0.0.1:11555",
+                          "default_budget_minutes": 30,
+                          "template_sets": {"fake-smart:2b": ["math"]}},
+                      str(dialog14.result_values))
+                dialog14.close()
+                app._ENV_OLLAMA_HOST = "http://env-host:11434"
+                app._ENV_OLLAMA_MODELS = "/env/models"
+                dialog14b = app.SettingsDialog(
+                    app.load_app_settings(), window14)
+                check("environment-set fields are locked",
+                      not dialog14b.models_folder_input.isEnabled()
+                      and not dialog14b.ollama_host_input.isEnabled())
+                check("locked fields show the environment values",
+                      dialog14b.models_folder_input.text() == "/env/models"
+                      and dialog14b.ollama_host_input.text()
+                      == "http://env-host:11434")
+                dialog14b.accept()
+                check("locked fields keep the stored values on save",
+                      dialog14b.result_values["models_folder"]
+                      == "/tmp/ost-v14-models"
+                      and dialog14b.result_values["ollama_host"]
+                      == "http://127.0.0.1:11434",
+                      str(dialog14b.result_values))
+                dialog14b.close()
+                app._ENV_OLLAMA_HOST = None
+                app._ENV_OLLAMA_MODELS = None
+                # _apply_settings: the saved address reaches the
+                # process, and clearing it takes it back out.
+                window14._apply_settings({
+                    "models_folder": "", "ollama_host":
+                    "http://127.0.0.1:9",
+                    "default_budget_minutes": 15,
+                    "template_sets": {}})
+                check("applying settings sets the Ollama address",
+                      os.environ.get("OLLAMA_HOST")
+                      == "http://127.0.0.1:9"
+                      and window14.budget_spin.value() == 15,
+                      f"{os.environ.get('OLLAMA_HOST')} "
+                      f"{window14.budget_spin.value()}")
+                window14._apply_settings({
+                    "models_folder": "", "ollama_host": "",
+                    "default_budget_minutes": 0,
+                    "template_sets": {}})
+                check("clearing the saved address removes it",
+                      "OLLAMA_HOST" not in os.environ)
+                os.environ["OLLAMA_HOST"] = f"http://{host14}:{port14}"
+                app._ENV_OLLAMA_HOST = "http://env-host:11434"
+                os.environ["OLLAMA_HOST"] = "http://env-host:11434"
+                window14._apply_settings({
+                    "models_folder": "", "ollama_host":
+                    "http://127.0.0.1:9",
+                    "default_budget_minutes": 0,
+                    "template_sets": {}})
+                check("applying settings never overrides the env",
+                      os.environ.get("OLLAMA_HOST")
+                      == "http://env-host:11434",
+                      os.environ.get("OLLAMA_HOST"))
+                app._ENV_OLLAMA_HOST = None
+                os.environ["OLLAMA_HOST"] = f"http://{host14}:{port14}"
+                # R18: usual template sets follow the model.
+                window14.tabs.setCurrentIndex(window14.TAB_SETUP)
+                app.save_app_settings({
+                    "models_folder": "", "ollama_host": "",
+                    "default_budget_minutes": 0,
+                    "template_sets": {"fake-smart:2b": ["math"]},
+                })
+                set_checked_list(window14.model_list, {"fake-smart:2b"})
+                qt_app.processEvents()
+                ticked14 = {
+                    window14.template_list.item(r).data(Qt.UserRole)
+                    for r in range(window14.template_list.count())
+                    if window14.template_list.item(r).checkState()
+                    == Qt.Checked
+                }
+                check("ticking a model ticks its usual templates",
+                      ticked14 == {"math"}, str(ticked14))
+                check("the usual-set label names the model",
+                      window14.template_set_label.text()
+                      == "Usual templates for fake-smart:2b.",
+                      window14.template_set_label.text())
+                for r in range(window14.template_list.count()):
+                    item14 = window14.template_list.item(r)
+                    if (item14.data(Qt.UserRole) == "coding"
+                            and item14.flags() & Qt.ItemIsEnabled):
+                        item14.setCheckState(Qt.Checked)
+                qt_app.processEvents()
+                check("a hand-changed template clears the label",
+                      window14.template_set_label.text() == "",
+                      repr(window14.template_set_label.text()))
+                # A run saves the run's templates as the usual set.
+                app.save_app_settings({
+                    "models_folder": "", "ollama_host": "",
+                    "default_budget_minutes": 0,
+                    "template_sets": {"fake-smart:2b": ["coding"]},
+                })
+                set_checked_list(window14.model_list, {"fake-smart:2b"})
+                set_checked_templates(window14, {"math"})
+                window14.run_button.click()
+                ran14 = wait_until(
+                    lambda: window14.worker is None
+                    and window14.save_button.isEnabled(),
+                    timeout=120, app=qt_app)
+                check("v14 run completes", ran14)
+                check("a run saves its templates as the usual set",
+                      app.load_app_settings()["template_sets"].get(
+                          "fake-smart:2b") == ["math"],
+                      str(app.load_app_settings()["template_sets"]))
+                # R18: Start Ollama passes the saved models folder.
+                app.save_app_settings({
+                    "models_folder": "/tmp/ost-v14-models",
+                    "ollama_host": "", "default_budget_minutes": 0,
+                    "template_sets": {}})
+                os.environ["PATH"] = (FAKEBIN + os.pathsep
+                                      + ORIGINAL_PATH)
+                pidfile14 = os.path.join(VERIFY_DIR,
+                                         "fake-ollama14.pid")
+                envfile14 = os.path.join(VERIFY_DIR,
+                                         "fake-ollama14.env")
+                os.environ["FAKE_OLLAMA_PIDFILE"] = pidfile14
+                os.environ["FAKE_OLLAMA_ENVFILE"] = envfile14
+                if os.path.exists(envfile14):
+                    os.remove(envfile14)
+                os.environ["OLLAMA_HOST"] = (
+                    f"http://127.0.0.1:{free_port()}")
+                window14.start_ollama_button.click()
+                started14 = wait_until(
+                    lambda: window14.status_label.text()
+                    == "Ollama is running.",
+                    timeout=45, app=qt_app)
+                check("start Ollama with a saved models folder",
+                      started14, window14.status_label.text())
+                try:
+                    with open(envfile14, encoding="utf-8") as handle:
+                        env_contents14 = handle.read()
+                except OSError:
+                    env_contents14 = "missing"
+                check("the started Ollama gets the models folder",
+                      env_contents14 == "/tmp/ost-v14-models",
+                      env_contents14)
+                kill_pidfile(pidfile14)
+                os.environ["OLLAMA_MODELS"] = "/env/models"
+                os.environ["OLLAMA_HOST"] = (
+                    f"http://127.0.0.1:{free_port()}")
+                if os.path.exists(envfile14):
+                    os.remove(envfile14)
+                window14.start_ollama_button.click()
+                started14b = wait_until(
+                    lambda: os.path.exists(envfile14)
+                    and window14.status_label.text()
+                    == "Ollama is running.",
+                    timeout=45, app=qt_app)
+                check("start Ollama again with env models folder",
+                      started14b, window14.status_label.text())
+                try:
+                    with open(envfile14, encoding="utf-8") as handle:
+                        env_contents14b = handle.read()
+                except OSError:
+                    env_contents14b = "missing"
+                check("the starter never overrides OLLAMA_MODELS",
+                      env_contents14b == "/env/models",
+                      env_contents14b)
+                kill_pidfile(pidfile14)
+                del os.environ["OLLAMA_MODELS"]
+            finally:
+                window14.close()
+                window14.deleteLater()
+                qt_app.processEvents()
+                server14.shutdown()
+                server14.server_close()
+        finally:
+            app._ENV_OLLAMA_HOST = prior_env_host14
+            app._ENV_OLLAMA_MODELS = prior_env_models14
+            for key14, value14 in prior14.items():
+                if value14 is None:
+                    settings14.remove(key14)
+                else:
+                    settings14.setValue(key14, value14)
+            settings14.sync()
+            for env14, value14 in (
+                    ("OLLAMA_HOST", prior_host14),
+                    ("OST_RESULTS_DIR", prior_results14),
+                    ("OST_PROVIDERS_FILE", prior_providers14),
+                    ("OST_CAPABILITIES_FILE", prior_caps14),
+                    ("PATH", prior_path14),
+                    ("FAKE_OLLAMA_PIDFILE", prior_pid14),
+                    ("FAKE_OLLAMA_CALLS", prior_calls14),
+                    ("FAKE_OLLAMA_ENVFILE", prior_envfile14),
+                    ("OLLAMA_MODELS", prior_models_env14)):
+                if value14 is None:
+                    os.environ.pop(env14, None)
+                else:
+                    os.environ[env14] = value14
+    finally:
+        pserver14.shutdown()
+        pserver14.server_close()
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview

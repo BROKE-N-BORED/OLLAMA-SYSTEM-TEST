@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v13
+# OLLAMA SYSTEM TEST v14
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,19 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v14 is a results-and-settings release, no new templates: the Profiles
+tab is a dashboard now — one hero tile for the latest overall score,
+four small tiles for the best score, speed, and strongest and weakest
+templates, plus score bars per template and a speed-across-runs line,
+each chart titled with its takeaway in plain words. Compare gets the
+same tiles for two models side by side and one grouped-bar chart. The
+Providers tab is rebuilt into Connection and Models sections with
+every field explained underneath it, and Test connection offers the
+provider's own model list as a pick-list. File > Settings holds the
+models folder, the Ollama address, and the default time budget, and
+each model remembers its usual templates: tick a model and its usual
+templates tick with it.
 
 v13 is a run release, no new templates: pressing Run shows a preview
 first — what will run, how many steps, an upper-bound time estimate,
@@ -186,20 +199,32 @@ remembered next time.
    are removed, and the model's profile rebuilds from the runs that
    are left. Deleting asks to confirm first, and it is disabled while
    a run is in progress.
-7. The Profiles tab shows each model's profile: latest and best scores,
-   strengths and weaknesses, and a verdict written from its numbers.
-   Profiles render as formatted text — headings, bold, lists — not raw
-   markdown. Profiles rebuild themselves after every run. Press
-   Regenerate to rebuild one from the run files on disk at any time.
-8. The Compare tab puts two models side by side: pick two models and
-   it shows their latest score on each template they ran, plus their
-   overall score and speed. Picking the same model twice shows a
-   message instead of a duplicated table.
-9. Shortcuts: Ctrl+R runs, Ctrl+S saves the report, Esc cancels a
-   run. The File menu has Save report and Quit; Help has How to Use,
-   the full manual in its own window; About, which shows the version
-   (also in the title bar); and Debug report, which saves a scrubbed
-   copy of the app's log (see below).
+7. The Profiles tab shows each model's profile: a hero tile for the
+   latest overall score, small tiles for the best score, decode
+   speed, and strongest and weakest templates, score bars per
+   template, and a speed-across-runs line — each chart titled with
+   its takeaway in plain words — with the full profile text beside
+   them. Profiles render as formatted text — headings, bold, lists
+   — not raw markdown. Profiles rebuild themselves after every run.
+   Press Regenerate to rebuild one from the run files on disk at
+   any time.
+8. The Compare tab puts two models side by side: one tile each with
+   its overall score, speed, and best template, grouped score bars
+   (top bar the first model, bottom bar the second), and a table of
+   their latest score on each template they ran, plus their overall
+   score and speed. Picking the same model twice shows a message
+   instead of a duplicated table.
+9. File > Settings holds the models folder, the Ollama address, and
+   the default time budget. Each model remembers its usual
+   templates: tick a model and its usual templates tick with it,
+   with a label saying which set is active; a run saves the
+   templates it ran as that model's usual set. The Settings window
+   lists the saved sets and can forget them all.
+10. Shortcuts: Ctrl+R runs, Ctrl+S saves the report, Esc cancels a
+   run. The File menu has Save report, Settings, and Quit; Help has
+   How to Use, the full manual in its own window; About, which
+   shows the version (also in the title bar); and Debug report,
+   which saves a scrubbed copy of the app's log (see below).
 
 ## Run it without the window (headless)
 
@@ -262,11 +287,13 @@ the app talks to `{base URL}/chat/completions` and
 To add one: press New provider, fill in the name (your own label, e.g.
 `openai`), the base URL (e.g. `https://api.openai.com/v1`), and the
 API key, then press Test connection to check it answers (that costs
-no tokens). Add the models you want to test by their id (e.g.
-`gpt-4o-mini`), with a display name and prices per 1M tokens if you
-want cost shown, and tick the capabilities the model has (see
-Capability screening above). Press Save provider when you are done —
-the models appear in the Run setup list, unticked like everything else.
+no tokens). Testing also lists the provider's models: pick one and
+its id fills the Model id field for you. Add the models you want to
+test by their id (e.g. `gpt-4o-mini`), with a display name and prices
+per 1M tokens if you want cost shown, and tick the capabilities the
+model has (see Capability screening above). Press Save provider when
+you are done — the models appear in the Run setup list, unticked like
+everything else.
 
 Your API keys live in `providers.json` next to the app. That file
 holds your keys: never share it, never upload it, never send it to
