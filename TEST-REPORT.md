@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v11
+# TEST-REPORT — OLLAMA SYSTEM TEST v12
 
 Verified 2026-11-13 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
@@ -8,6 +8,14 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v12 is the layout release (tasks R1, R3, R6, R7 from the redesign
+list): the one crowded Benchmark tab is now three tabs (Run setup,
+Run, Models), one job each, with the status line under the tabs; a
+How to Use index on the Help menu; single instance, so a second
+launch brings the running copy forward; and a first-run setup
+checklist that goes away once its three steps are done and never
+comes back. No new templates, no template changes.
 
 v11 is the first UI-redesign release (tasks R2, R4, R5, R8, R9, R10
 from the redesign list): a debug log layer (scrubbed log files, a
@@ -52,24 +60,101 @@ all runtime tests ran against the fake servers from v5/v6 (fake Ollama
 with /api/show, /api/chat with images and tools; fake OpenAI-compatible
 provider with image_url parts, tool-call SSE deltas, image generation,
 transcription, and speech). Test suite:
-tests/run_tests.py in this tree — **1051 passed, 0 failed** (final
-run; the v10 suite's 1016 checks are all carried over and green
-inside that count, plus 35 new v11 checks). The road to green: the
-first full run crashed at 347 on a test bug (a profile-regenerate
-check split rendered text on "## Weaknesses", which setMarkdown
-strips); the second run came back 1049/2 (the Help-menu check still
-expected About alone, and an em-dash in a new debug-report string
-tripped the v11 AST pin — both fixed, the second in the app); the
-third run crashed at 829 on a load-flake subprocess timeout (the
-headless unknown-model command runs in 2.6 s on its own); the
-fourth run was killed by a VM restart at 218. The fifth run from a
-fresh unzip is the green 1051 above. The v10 suite's own history
-follows: its first full run came back 1010/6 — two
-profile-regenerate checks failed on a time-of-day bug in the test
-(it stamped its run files 09:00, which is only "later" before
+tests/run_tests.py in this tree — **1088 passed, 0 failed** (final
+run; the v11 suite's 1051 checks are all carried over and green
+inside that count, plus 37 new v12 checks). The road to green: the
+first two full runs never finished — the coordinator running them
+died on a transport error (run 1 reached 915 PASS, run 2 reached 218
+PASS, neither printed a summary). The third run from a fresh unzip
+came back 1075/8: seven install.sh checks failed when pip's temp
+ran out of room on the shared 512 MB /tmp (the 84 MB wheel unpack
+hit ENOSPC under load), and the installed-list check failed because
+this PySide6 build sets ItemIsUserCheckable on a bare list item by
+default. Both were fixed in place — the install tests now point
+pip's temp at the workspace scratch dir, and the installed list
+clears the checkbox flag on its items — and the fourth run from a
+fresh unzip is the green 1088 above. The v11 suite's own history
+follows: its first full run crashed at 347 on a test bug (a
+profile-regenerate check split rendered text on "## Weaknesses",
+which setMarkdown strips); the second run came back 1049/2 (the
+Help-menu check still expected About alone, and an em-dash in a new
+debug-report string tripped the v11 AST pin — both fixed, the
+second in the app); the third run crashed at 829 on a load-flake
+subprocess timeout (the headless unknown-model command runs in 2.6 s
+on its own); the fourth run was killed by a VM restart at 218. The
+fifth run from a fresh unzip is the green 1051 above. The v10
+suite's own history follows: its first full run came back 1010/6 —
+two profile-regenerate checks failed on a time-of-day bug in the
+test (it stamped its run files 09:00, which is only "later" before
 09:00) and four version pins still said v9. Both were fixed in the
 test, not the app, and the re-run from a fresh unzip is the green
 1016 that v11 carries.
+
+## What was verified (v12)
+
+### 1. The Benchmark tab is three tabs (R1)
+
+- Run setup holds the pick lists (full height, no 180px cap), the
+  time-budget control, and Run. Run holds the progress bar, the
+  results table, the detail view, Cancel, and Save/Export. Models
+  holds the installed-models list, the pull box, Refresh, and Start
+  Ollama. The status line sits under the tabs and stays visible on
+  every tab. The app switches to the Run tab when a run starts.
+  Nothing was removed, only reorganized — the suite checks every
+  control still exists on its new tab.
+- The Models tab's installed list is read-only: its items carry no
+  checkbox flag (this PySide6 build sets ItemIsUserCheckable on a
+  bare QListWidgetItem by default, so the app clears it — otherwise
+  Space would sprout a checkbox on a list that has none). Probed
+  directly: a bare item's flags include the bit, and clearing it
+  leaves the list plain. The suite pins it.
+- GUI-driven under Xvfb at 1366x768: all seven tabs screenshotted
+  and read — the setup lists show all 19 templates without
+  scrolling, the Models list shows the four fake models with no
+  checkboxes, the status line reads on every tab.
+
+### 2. How to Use index (R3)
+
+- Help > How to Use opens the full manual in its own window —
+  first time, picking models and templates, running a test, reading
+  the results, past runs, pulling a model, providers, saving and
+  sharing, what to do when something goes wrong, shortcuts —
+  rendered as markdown (headings, lists, code spans). It stays
+  open beside the app; opening it again brings the same window
+  forward instead of a second copy. The suite checks the menu
+  action, the section list, and that no em-dash or bare & appears
+  in the text; the GUI drive read the rendered window.
+
+### 3. Single instance (R6)
+
+- A second launch while the app is running brings the running
+  copy forward instead of starting a second one that could write
+  the same results dir. The suite proves the handshake: a second
+  copy is refused while the window holds the lock, and the knock
+  reaches the running window. Headless runs are exempt — cron
+  must not be blocked.
+
+### 4. First-run setup checklist (R7)
+
+- The top of the Run setup tab shows three live steps — Ollama is
+  running, at least one model pulled, first benchmark run done —
+  each with what to do when it is open. The first two steps tick
+  honestly from live state; the third ticks when a run finishes.
+  It goes away once all three are done, or when dismissed, and
+  never reappears after either. GUI-driven with fresh settings:
+  the panel shows with steps 1-2 ticked and step 3 open, and the
+  Hide button removes it. The suite covers the dismiss/completion
+  persistence.
+
+### 5. Install-test hardening (verification fix)
+
+- The suite's install.sh end-to-end tests ran pip with TMPDIR=/tmp
+  (a 512 MB tmpfs shared with every other thread's suite) and the
+  84 MB wheel unpack died with ENOSPC under load, failing seven
+  checks on an install.sh byte-identical to v11's green run. The
+  tests now point pip's temp at the workspace scratch dir (the
+  same reason the scratch copy itself lives under tests/). No
+  product change — install.sh is untouched.
 
 ## What was verified (v10)
 

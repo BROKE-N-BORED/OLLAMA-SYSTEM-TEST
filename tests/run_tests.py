@@ -1,9 +1,8 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v11 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v12 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1016 v10 checks are carried over; the v11 checks
-cover the debug log layer (R2), markdown profiles (R4), the
-remove-provider confirmation (R5), the save-report collision fix (R8),
-the pick-list lock during a run (R9), and the em-dash sweep (R10).
+answers per model. All 1051 v11 checks are carried over; the v12 checks
+cover the tab split (R1), the How to Use index (R3), single instance
+(R6), and the first-run setup checklist (R7).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -766,9 +765,10 @@ def main():
     check("start Ollama button present", window.start_ollama_button is not None)
     check("pull input and button present",
           window.pull_input is not None and window.pull_button is not None)
-    check("five tabs incl Compare and Providers", window.tabs.count() == 5
-          and [window.tabs.tabText(i) for i in range(5)] ==
-          ["Benchmark", "Past runs", "Profiles", "Compare", "Providers"],
+    check("seven tabs incl Run setup, Run and Models", window.tabs.count() == 7
+          and [window.tabs.tabText(i) for i in range(7)] ==
+          ["Run setup", "Run", "Models", "Past runs", "Profiles",
+           "Compare", "Providers"],
           str([window.tabs.tabText(i) for i in range(window.tabs.count())]))
 
     from PySide6.QtWidgets import QLabel, QPushButton
@@ -1189,7 +1189,7 @@ def main():
     check("first speed file bytes unchanged", file_hash(first_speed) == hash_before)
 
     # ---------- history tab ----------
-    window.tabs.setCurrentIndex(1)
+    window.tabs.setCurrentIndex(3)
     wait_until(lambda: window.history_model_combo.count() == 3, timeout=10, app=qt_app)
     check("history lists 3 models", window.history_model_combo.count() == 3,
           str(window.history_model_combo.count()))
@@ -1224,7 +1224,7 @@ def main():
     window.grab().save(os.path.join(VERIFY_DIR, "screenshot-history.png"))
 
     # ---------- profiles tab (GUI) ----------
-    window.tabs.setCurrentIndex(2)
+    window.tabs.setCurrentIndex(4)
     wait_until(lambda: window.profile_model_combo.count() == 3, timeout=10, app=qt_app)
     check("profiles lists 3 models", window.profile_model_combo.count() == 3,
           str(window.profile_model_combo.count()))
@@ -1299,7 +1299,7 @@ def main():
     check("regenerate leaves run files untouched", file_hash(coding_file) == coding_hash)
 
     # ---------- pull: success ----------
-    window.tabs.setCurrentIndex(0)
+    window.tabs.setCurrentIndex(2)
     window.pull_input.setText("fake-new:1b")
     window.pull_button.click()
     moved = wait_until(
@@ -2301,7 +2301,7 @@ def main():
     from PySide6.QtWidgets import QLineEdit
     check("key field is a password field",
           windowP.provider_key_input.echoMode() == QLineEdit.Password)
-    windowP.tabs.setCurrentIndex(4)
+    windowP.tabs.setCurrentIndex(6)
     qt_app.processEvents()
     windowP.provider_name_input.setText("fake-provider")
     windowP.provider_url_input.setText(f"http://{phost}:{pport}/v1")
@@ -2376,7 +2376,7 @@ def main():
     check("provider models start UNCHECKED", not checked_names(windowP.model_list))
     check("model list counts locals and providers",
           windowP.model_list.count() == 7)
-    windowP.tabs.setCurrentIndex(4)
+    windowP.tabs.setCurrentIndex(6)
     qt_app.processEvents()
     windowP.grab().save(os.path.join(VERIFY_DIR, "screenshot-providers.png"))
 
@@ -2406,7 +2406,7 @@ def main():
     windowP.provider_name_input.setText("renamed-in-form")
     windowP.tabs.setCurrentIndex(0)
     qt_app.processEvents()
-    windowP.tabs.setCurrentIndex(4)
+    windowP.tabs.setCurrentIndex(6)
     qt_app.processEvents()
     check("switching tabs keeps an unsaved edit",
           windowP.provider_name_input.text() == "renamed-in-form",
@@ -2626,7 +2626,7 @@ def main():
           windowP.detail_view.toPlainText()[:200])
 
     # ---------- Qt app: remove model and provider via the UI ----------
-    windowP.tabs.setCurrentIndex(4)
+    windowP.tabs.setCurrentIndex(6)
     qt_app.processEvents()
     dead_item = None
     for row in range(windowP.provider_list.count()):
@@ -2649,7 +2649,7 @@ def main():
         wait_until(lambda: windowP.model_list.count() == 4, timeout=10, app=qt_app)
         check("removed provider models leave the model list",
               windowP.model_list.count() == 4, str(windowP.model_list.count()))
-    windowP.tabs.setCurrentIndex(4)
+    windowP.tabs.setCurrentIndex(6)
     qt_app.processEvents()
     fake_item = None
     for row in range(windowP.provider_list.count()):
@@ -2682,7 +2682,7 @@ def main():
                   str(fake_entry["models"]))
 
     # ---------- v5: provider capability ticks + media run ----------
-    windowP.tabs.setCurrentIndex(4)
+    windowP.tabs.setCurrentIndex(6)
     qt_app.processEvents()
     windowP.provider_new_button.click()
     qt_app.processEvents()
@@ -3252,7 +3252,7 @@ def main():
               "not run: test audio not found" in detail6p, detail6p)
 
         # History tab: the run files say "not run" too.
-        window6.tabs.setCurrentIndex(1)
+        window6.tabs.setCurrentIndex(3)
         wait_until(lambda: window6.history_model_combo.count() == 2,
                    timeout=10, app=qt_app)
         check("history lists 2 models after the not-run run",
@@ -3328,8 +3328,13 @@ def main():
         ignore=shutil.ignore_patterns(
             "tests", ".venv", "results", "__pycache__", ".github",
             "providers.json", "capabilities.json"))
+    # pip's temp defaults to TMPDIR (/tmp, a 512 MB tmpfs shared with
+    # every other thread's suite): point it at the workspace scratch
+    # dir, or the 84 MB wheel unpack dies with ENOSPC under load.
+    install_env = dict(os.environ)
+    install_env["TMPDIR"] = SCRATCH
     install = subprocess.run(
-        ["sh", "install.sh"], cwd=install_good,
+        ["sh", "install.sh"], cwd=install_good, env=install_env,
         capture_output=True, text=True, timeout=600)
     check("install.sh exits 0 in a scratch copy",
           install.returncode == 0,
@@ -3366,7 +3371,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 11", app.__version__ == "11",
+    check("__version__ is 12", app.__version__ == "12",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3380,8 +3385,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v11",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v11",
+    check("title bar shows OLLAMA SYSTEM TEST v12",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v12",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -3433,9 +3438,9 @@ def main():
     check("File menu has Save report and Quit",
           file_items == ["Save report", "Quit"], str(file_items))
     help_menu7 = bar7.actions()[2].menu()
-    check("Help menu has About and Debug report",
+    check("Help menu has How to Use, About and Debug report",
           [a.text() for a in help_menu7.actions()]
-          == ["About", "Debug report"],
+          == ["How to Use", "About", "Debug report"],
           str([a.text() for a in help_menu7.actions()]))
     check("About shows __version__",
           f"v{app.__version__}" in window7.about_text(),
@@ -3867,6 +3872,7 @@ def main():
     install_env = dict(os.environ)
     install_env["HOME"] = test_home
     install_env["PIP_NO_INDEX"] = "1"
+    install_env["TMPDIR"] = SCRATCH
     reinstall = subprocess.run(
         ["sh", "install.sh"], cwd=install_good,
         env=install_env, capture_output=True, text=True, timeout=600)
@@ -4176,9 +4182,9 @@ def main():
         check("v8 window lists 4 local + 3 provider models",
               window8.model_list.count() == 7,
               str(window8.model_list.count()))
-        check("window has 5 tabs with Compare after Profiles",
-              window8.tabs.count() == 5
-              and window8.tabs.tabText(3) == "Compare",
+        check("window has 7 tabs with Compare after Profiles",
+              window8.tabs.count() == 7
+              and window8.tabs.tabText(5) == "Compare",
               str([window8.tabs.tabText(i)
                    for i in range(window8.tabs.count())]))
         check("budget control defaults to 0 (no limit)",
@@ -4374,7 +4380,7 @@ def main():
               and nobudget_math8.get("template_score") == 100.0,
               str(nobudget_math8.get("total")))
         # The history list marks the budget-stopped run.
-        window8.tabs.setCurrentIndex(1)
+        window8.tabs.setCurrentIndex(3)
         wait_until(lambda: window8.history_model_combo.count() >= 1,
                    timeout=10, app=qt_app)
         for i in range(window8.history_model_combo.count()):
@@ -4435,7 +4441,7 @@ def main():
                   and len(os.listdir(audio_dir8)) == 2,
                   str(os.listdir(audio_dir8))
                   if audio_dir8 and os.path.isdir(audio_dir8) else "missing")
-        window8.tabs.setCurrentIndex(1)
+        window8.tabs.setCurrentIndex(3)
         window8.refresh_history()
         qt_app.processEvents()
         expected_size8 = app.store_size(RESULTS_DIR)
@@ -4547,7 +4553,7 @@ def main():
         wait_until(lambda: window8.worker is not None, timeout=10,
                    app=qt_app)
         time.sleep(0.5)
-        window8.tabs.setCurrentIndex(1)
+        window8.tabs.setCurrentIndex(3)
         qt_app.processEvents()
         check("delete is disabled while a run is in progress",
               not window8.delete_run_button.isEnabled())
@@ -4556,7 +4562,7 @@ def main():
         server8slow.shutdown()
         server8slow.server_close()
         os.environ["OLLAMA_HOST"] = f"http://{host8}:{port8}"
-        window8.tabs.setCurrentIndex(1)
+        window8.tabs.setCurrentIndex(3)
         qt_app.processEvents()
         if window8.history_list.count():
             window8.history_list.setCurrentRow(0)
@@ -4656,7 +4662,7 @@ def main():
         qt_app.processEvents()
 
         # Compare: two models side by side.
-        window8.tabs.setCurrentIndex(3)
+        window8.tabs.setCurrentIndex(5)
         qt_app.processEvents()
         compare_slugs8 = [
             window8.compare_model_a.itemData(i)
@@ -4768,10 +4774,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v11",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v11",
+        check("title bar shows v12",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v12",
               window9.windowTitle())
-        check("__version__ is 11", app.__version__ == "11", app.__version__)
+        check("__version__ is 12", app.__version__ == "12", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -5065,7 +5071,8 @@ def main():
     check("debug report is written under logs/",
           os.path.exists(report11) and report11.startswith(LOGS_DIR))
     check("debug report names the version",
-          "OLLAMA SYSTEM TEST v11" in report_text11, report_text11[:200])
+          f"OLLAMA SYSTEM TEST v{app.__version__}" in report_text11,
+          report_text11[:200])
     check("debug report carries no saved key",
           fake_key11 not in report_text11
           and "[key]" in report_text11)
@@ -5249,6 +5256,312 @@ def main():
           "—" not in app.UNREACHABLE_HINT, app.UNREACHABLE_HINT)
     check("fmt_duration None is n/a", app.fmt_duration(None) == "n/a")
     check("fmt_tokens None is n/a", app.fmt_tokens(None) == "n/a")
+
+    # ---------- v12: tab split (R1), How to Use (R3),
+    # single instance (R6), setup checklist (R7) ----------
+    # The checklist keys live in the real QSettings under the default
+    # HOME — so the prior values are saved here and restored in the
+    # finally, leaving no state behind. The results dir is a fresh
+    # scratch dir, so the checklist starts with no run done.
+    from PySide6.QtCore import QSettings, Qt
+    from PySide6.QtWidgets import QTextEdit
+    settings12 = QSettings("BrokeNBored", app.APP_NAME)
+    prior_dismissed12 = settings12.value("setup_dismissed")
+    prior_completed12 = settings12.value("setup_completed")
+    settings12.remove("setup_dismissed")
+    settings12.remove("setup_completed")
+    settings12.sync()
+    prior_results12 = os.environ.get("OST_RESULTS_DIR")
+    results12 = os.path.join(SCRATCH, "results12")
+    os.makedirs(results12, exist_ok=True)
+    os.environ["OST_RESULTS_DIR"] = results12
+    server12, _t12 = fake_ollama.start_server()
+    host12, port12 = server12.server_address
+    ollama_url12 = f"http://{host12}:{port12}"
+    os.environ["OLLAMA_HOST"] = ollama_url12
+    window12 = app.MainWindow()
+    window12.show()
+    wait_until(lambda: window12.model_list.count() == 4, timeout=10,
+               app=qt_app)
+    try:
+        # R7 first: the checklist needs a window with no run yet,
+        # and the R1 run below would complete it.
+        check("checklist shows on a fresh window",
+              window12.checklist_frame.isVisible())
+        check("checklist step 1 ticked when Ollama is running",
+              window12.checklist_step1.text() == "✓ Ollama is running.",
+              window12.checklist_step1.text())
+        check("checklist step 2 ticked with a model pulled",
+              window12.checklist_step2.text()
+              == "✓ At least one model is pulled.",
+              window12.checklist_step2.text())
+        check("checklist step 3 open with no run yet",
+              window12.checklist_step3.text().startswith(
+                  "○ Run your first test"),
+              window12.checklist_step3.text())
+        window12.checklist_dismiss.click()
+        qt_app.processEvents()
+        check("dismissing the checklist hides it for good",
+              not window12.checklist_frame.isVisible()
+              and settings12.value("setup_dismissed", False, type=bool))
+        window12.refresh_checklist()
+        qt_app.processEvents()
+        check("dismissed checklist stays hidden on refresh",
+              not window12.checklist_frame.isVisible())
+        settings12.remove("setup_dismissed")
+        settings12.sync()
+        window12.refresh_checklist()
+        qt_app.processEvents()
+        check("checklist shows again once dismissal is cleared",
+              window12.checklist_frame.isVisible())
+        os.environ["OLLAMA_HOST"] = "http://127.0.0.1:1"
+        window12.refresh_models()
+        qt_app.processEvents()
+        check("checklist steps open when Ollama is down",
+              window12.checklist_step1.text().startswith("○ Start Ollama")
+              and window12.checklist_step2.text().startswith(
+                  "○ Pull a model"),
+              window12.checklist_step1.text() + " / "
+              + window12.checklist_step2.text())
+        os.environ["OLLAMA_HOST"] = ollama_url12
+        window12.refresh_models()
+        wait_until(lambda: window12.model_list.count() == 4, timeout=10,
+                   app=qt_app)
+        check("checklist steps tick again when Ollama returns",
+              window12.checklist_step1.text() == "✓ Ollama is running."
+              and window12.checklist_step2.text()
+              == "✓ At least one model is pulled.")
+        with open(os.path.join(results12, "fake-run.json"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("{}")
+        window12.refresh_checklist()
+        qt_app.processEvents()
+        check("checklist hides once all three steps are done",
+              not window12.checklist_frame.isVisible()
+              and settings12.value("setup_completed", False, type=bool))
+        os.remove(os.path.join(results12, "fake-run.json"))
+        os.environ["OLLAMA_HOST"] = "http://127.0.0.1:1"
+        window12.refresh_models()
+        qt_app.processEvents()
+        check("completed checklist never reappears",
+              not window12.checklist_frame.isVisible())
+        os.environ["OLLAMA_HOST"] = ollama_url12
+        window12.refresh_models()
+        wait_until(lambda: window12.model_list.count() == 4, timeout=10,
+                   app=qt_app)
+
+        # R1: one job per tab.
+        setup_tab12 = window12.tabs.widget(window12.TAB_SETUP)
+        run_tab12 = window12.tabs.widget(window12.TAB_RUN)
+        models_tab12 = window12.tabs.widget(window12.TAB_MODELS)
+        check("setup tab holds the pick lists, Run and the budget",
+              window12.model_list.parentWidget() is setup_tab12
+              and window12.template_list.parentWidget() is setup_tab12
+              and window12.run_button.parentWidget() is setup_tab12
+              and window12.budget_spin.parentWidget() is setup_tab12)
+        check("run tab holds the table, progress and result buttons",
+              window12.table.parentWidget() is run_tab12
+              and window12.progress_bar.parentWidget() is run_tab12
+              and window12.cancel_button.parentWidget() is run_tab12
+              and window12.save_button.parentWidget() is run_tab12
+              and window12.export_csv_button.parentWidget() is run_tab12
+              and window12.export_html_button.parentWidget() is run_tab12)
+        check("models tab holds pull, the installed list and Refresh",
+              window12.pull_input.parentWidget() is models_tab12
+              and window12.pull_button.parentWidget() is models_tab12
+              and window12.pull_bar.parentWidget() is models_tab12
+              and window12.installed_list.parentWidget() is models_tab12
+              and window12.refresh_button.parentWidget() is models_tab12
+              and window12.start_ollama_button.parentWidget()
+              is models_tab12)
+        check("status label lives under the tabs, not inside one",
+              window12.status_label.parent() is window12.centralWidget()
+              and window12.status_label.parent() is not window12.tabs)
+        status_visible12 = True
+        for tab_index12 in range(window12.tabs.count()):
+            window12.tabs.setCurrentIndex(tab_index12)
+            qt_app.processEvents()
+            status_visible12 = (
+                status_visible12 and window12.status_label.isVisible()
+            )
+        check("status label stays visible on every tab",
+              status_visible12)
+        window12.tabs.setCurrentIndex(0)
+        qt_app.processEvents()
+        check("pick lists show their full height, no 180px cap",
+              window12.model_list.maximumHeight() >= 10000
+              and window12.template_list.maximumHeight() >= 10000,
+              f"{window12.model_list.maximumHeight()}, "
+              f"{window12.template_list.maximumHeight()}")
+        installed12 = [window12.installed_list.item(r).text()
+                       for r in range(window12.installed_list.count())]
+        check("models tab lists the installed Ollama models",
+              len(installed12) == 4
+              and "fake-smart:2b [vision, tools, long_context]"
+              in installed12,
+              str(installed12))
+        check("installed list is read-only, no checkboxes",
+              all(not (window12.installed_list.item(r).flags()
+                       & Qt.ItemIsUserCheckable)
+                  for r in range(window12.installed_list.count())))
+
+        # R3: the How to Use index.
+        help_texts12 = []
+        for action in window12.menuBar().actions():
+            if action.text() == "Help":
+                help_texts12 = [a.text() for a in action.menu().actions()]
+        check("Help menu has a How to Use action",
+              "How to Use" in help_texts12, str(help_texts12))
+        how_sections12 = ["First time", "Picking models and templates",
+                          "Running a test", "Reading the results",
+                          "Past runs", "Pulling a model", "Providers",
+                          "Saving and sharing", "If something goes wrong",
+                          "Shortcuts"]
+        check("How to Use covers every part of the app",
+              all(s in app.HOW_TO_USE_TEXT for s in how_sections12))
+        check("How to Use text has no em-dash or bare &",
+              "—" not in app.HOW_TO_USE_TEXT
+              and " & " not in app.HOW_TO_USE_TEXT)
+        window12.show_how_to_use()
+        qt_app.processEvents()
+        dialog12 = window12._how_to_use_dialog
+        check("How to Use opens its own window",
+              dialog12 is not None and dialog12.isVisible()
+              and dialog12.windowTitle() == "How to Use")
+        dialog_text12 = ""
+        if dialog12 is not None:
+            for child in dialog12.findChildren(QTextEdit):
+                dialog_text12 += child.toPlainText()
+        check("How to Use window shows the manual",
+              "First time" in dialog_text12
+              and "If something goes wrong" in dialog_text12,
+              dialog_text12[:120])
+        window12.show_how_to_use()
+        qt_app.processEvents()
+        check("How to Use opens once, not a window per click",
+              window12._how_to_use_dialog is dialog12)
+        if dialog12 is not None:
+            dialog12.close()
+            qt_app.processEvents()
+
+        # R1: a run switches to the Run tab.
+        window12.tabs.setCurrentIndex(0)
+        set_checked_list(window12.model_list, {"fake-smart:2b"})
+        set_checked_templates(window12, {"math"})
+        window12.start_run()
+        check("starting a run switches to the Run tab",
+              window12.tabs.currentIndex() == window12.TAB_RUN,
+              str(window12.tabs.currentIndex()))
+        done12 = wait_until(lambda: window12.worker is None, timeout=120,
+                            app=qt_app)
+        check("v12 run completes", done12)
+        check("results stay on the Run tab after the run",
+              window12.tabs.currentIndex() == window12.TAB_RUN)
+
+        # R6: single instance.
+        server_in12, first_in12 = app.acquire_single_instance(
+            "ost-v12-inproc-probe")
+        check("first acquire takes the name",
+              first_in12 and server_in12 is not None)
+        server_in2_12, first_in2_12 = app.acquire_single_instance(
+            "ost-v12-inproc-probe")
+        check("second acquire is refused while the first holds it",
+              not first_in2_12 and server_in2_12 is None)
+        if server_in12 is not None:
+            server_in12.close()
+        server_in3_12, first_in3_12 = app.acquire_single_instance(
+            "ost-v12-inproc-probe")
+        check("the name frees up when the first copy closes",
+              first_in3_12 and server_in3_12 is not None)
+        if server_in3_12 is not None:
+            server_in3_12.close()
+
+        # A second PROCESS holding the name refuses this one.
+        probe12 = os.path.join(SCRATCH, "single-instance-probe.py")
+        with open(probe12, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import sys, time\n"
+                "from PySide6.QtCore import QCoreApplication\n"
+                "from PySide6.QtNetwork import QLocalServer\n"
+                "app = QCoreApplication(sys.argv)\n"
+                "QLocalServer.removeServer('ost-v12-subprocess-probe')\n"
+                "server = QLocalServer()\n"
+                "assert server.listen('ost-v12-subprocess-probe')\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(20)\n"
+            )
+        proc12 = subprocess.Popen(
+            [sys.executable, "-u", probe12],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ready12 = False
+        try:
+            import select
+            readable12, _w12, _x12 = select.select(
+                [proc12.stdout], [], [], 30)
+            if readable12:
+                ready12 = proc12.stdout.readline().strip() == "ready"
+        except Exception:
+            ready12 = False
+        check("subprocess probe holds the single-instance name", ready12)
+        if ready12:
+            _srv_sub12, first_sub12 = app.acquire_single_instance(
+                "ost-v12-subprocess-probe")
+            check("acquire is refused while another process holds it",
+                  not first_sub12)
+        else:
+            check("acquire is refused while another process holds it",
+                  False, "probe never became ready")
+        proc12.kill()
+        proc12.wait(timeout=10)
+        _srv_sub2_12, first_sub2_12 = app.acquire_single_instance(
+            "ost-v12-subprocess-probe")
+        check("the name frees up when the other process exits",
+              first_sub2_12)
+        if _srv_sub2_12 is not None:
+            _srv_sub2_12.close()
+
+        # A knock on the window's server reaches the window.
+        server_win12, first_win12 = app.acquire_single_instance(
+            "ost-v12-window-probe")
+        check("window probe server listens", first_win12)
+        if server_win12 is not None:
+            window12b = app.MainWindow(instance_server=server_win12)
+            window12b.show()
+            qt_app.processEvents()
+            knocked12 = []
+            server_win12.newConnection.connect(
+                lambda: knocked12.append(True))
+            _srv_knock12, first_knock12 = app.acquire_single_instance(
+                "ost-v12-window-probe")
+            check("a second copy is refused while the window holds it",
+                  not first_knock12)
+            knocked12_done = wait_until(lambda: bool(knocked12),
+                                        timeout=10, app=qt_app)
+            check("the knock reaches the running window",
+                  knocked12_done)
+            window12b.close()
+            window12b.deleteLater()
+            qt_app.processEvents()
+            server_win12.close()
+    finally:
+        window12.close()
+        window12.deleteLater()
+        qt_app.processEvents()
+        server12.shutdown()
+        server12.server_close()
+        if prior_dismissed12 is None:
+            settings12.remove("setup_dismissed")
+        else:
+            settings12.setValue("setup_dismissed", prior_dismissed12)
+        if prior_completed12 is None:
+            settings12.remove("setup_completed")
+        else:
+            settings12.setValue("setup_completed", prior_completed12)
+        settings12.sync()
+        if prior_results12 is None:
+            os.environ.pop("OST_RESULTS_DIR", None)
+        else:
+            os.environ["OST_RESULTS_DIR"] = prior_results12
 
     QMessageBox.question = _suite_real_question
 

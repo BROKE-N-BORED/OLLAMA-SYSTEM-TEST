@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v11
+# OLLAMA SYSTEM TEST v12
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -9,8 +9,21 @@ weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
 
+v12 is a layout release, no new templates: the one crowded Benchmark
+tab is now three tabs, one job each — Run setup (pick models and
+templates, press Run), Run (progress, results table, details), and
+Models (installed models, pull a new one, Refresh, Start Ollama).
+The status line sits under the tabs so it is visible everywhere, and
+the app switches to the Run tab when a run starts. Help now has a
+How to Use index — the full manual in its own window. A first run
+gets a setup checklist at the top of Run setup (Ollama running, a
+model pulled, first run done); it goes away once those are done and
+never comes back. And the app opens once only: clicking the icon
+again brings the running copy forward instead of starting a second
+one.
+
 v9 is a polish release, no new templates: filter boxes above the
-model and template lists on the Benchmark tab, so you can type to
+model and template lists on the Run setup tab, so you can type to
 find one instead of scrolling (ticked items keep their ticks while
 filtered, and the grey-outs keep working); a dark theme on the View
 menu, remembered across restarts; the README's prompt count fixed
@@ -101,7 +114,7 @@ remembered next time.
 
 ## How to use it
 
-1. Tick the models you want to test. Nothing is ticked to start with —
+1. On the Run setup tab, tick the models you want to test. Nothing is ticked to start with —
    tick only what you want. Select all is there if you want everything.
    Local Ollama models are listed by name; provider models are listed
    as "provider / model", for example `openai / gpt-4o-mini`. Models
@@ -115,7 +128,7 @@ remembered next time.
    light up again. With nothing ticked, everything shows enabled.
    The filter box above the list narrows it as you type, and the
    grey-outs keep working while a filter is on.
-3. Press Run. Each model runs each template in turn, one at a time.
+3. Press Run. The app switches to the Run tab and each model runs each template in turn, one at a time.
    A full run (all templates, all models) takes a while — each model
    answers 103 prompts (90 scored tasks, plus the extra turns in the
    multi-turn and role-following templates, plus 3 speed runs), and
@@ -133,7 +146,7 @@ remembered next time.
    the default): when set and a template's jobs run past it, that
    template's jobs stop with "time budget reached" and the run
    carries on with the next template.
-4. The table shows, for each model: overall score, average decode speed,
+4. On the Run tab, the table shows, for each model: overall score, average decode speed,
    and status. Click a model to see its per-template scores, which
    tasks passed or failed, and — for provider models — the tokens used
    and the estimated cost. Templates a model was not eligible for show
@@ -160,9 +173,10 @@ remembered next time.
    overall score and speed. Picking the same model twice shows a
    message instead of a duplicated table.
 9. Shortcuts: Ctrl+R runs, Ctrl+S saves the report, Esc cancels a
-   run. The File menu has Save report and Quit; Help has About, which
-   shows the version (also in the title bar), and Debug report, which
-   saves a scrubbed copy of the app's log (see below).
+   run. The File menu has Save report and Quit; Help has How to Use,
+   the full manual in its own window; About, which shows the version
+   (also in the title bar); and Debug report, which saves a scrubbed
+   copy of the app's log (see below).
 
 ## Run it without the window (headless)
 
@@ -229,7 +243,7 @@ no tokens). Add the models you want to test by their id (e.g.
 `gpt-4o-mini`), with a display name and prices per 1M tokens if you
 want cost shown, and tick the capabilities the model has (see
 Capability screening above). Press Save provider when you are done —
-the models appear in the Benchmark list, unticked like everything else.
+the models appear in the Run setup list, unticked like everything else.
 
 Your API keys live in `providers.json` next to the app. That file
 holds your keys: never share it, never upload it, never send it to
@@ -270,7 +284,7 @@ typing their id on the Providers tab, not pulled.
 
 ## Pull a model from the app
 
-Type a model name in the "Pull a model" box (for example `qwen3:4b`)
+On the Models tab, type a model name in the "Pull a model" box (for example `qwen3:4b`)
 and press Pull. The download runs in the background with a live
 progress bar and a status line showing what is downloading and how many
 megabytes are in so far. When it finishes, the new model appears in the

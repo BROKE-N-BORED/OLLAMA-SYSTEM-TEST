@@ -102,11 +102,14 @@ try:
         QCoreApplication, QSettings, Qt, QThread, QTimer, Signal,
     )
     from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
         QComboBox,
+        QDialog,
         QFileDialog,
+        QFrame,
         QHBoxLayout,
         QHeaderView,
         QLabel,
@@ -138,7 +141,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "11"
+__version__ = "12"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -156,6 +159,161 @@ START_OLLAMA_TIMEOUT_MSG = "Ollama could not be started. Run ollama serve in a t
 START_OLLAMA_MISSING_MSG = "Ollama is not installed. Install it first, then try again."
 NO_MODELS_MESSAGE = "No models installed yet. Pull one with ollama pull, then press Refresh."
 NO_TEMPLATES_MESSAGE = "No test templates found in the templates folder."
+# The name the single-instance guard listens on (U27). A second copy
+# of the app connects here, tells the running copy to show itself,
+# and exits without opening a window.
+SINGLE_INSTANCE_NAME = "ollama-system-test"
+# The How to Use index (U22), shown from Help > How to Use in a
+# dialog that renders it as markdown. Plain words, no em-dashes,
+# no bare &.
+HOW_TO_USE_TEXT = """\
+# How to Use OLLAMA SYSTEM TEST
+
+## What this app does
+
+This app tests the AI models on your PC. It runs each model through
+test templates (coding, math, reasoning, vision, and more), scores the
+answers, measures the speed, and builds a profile for each model: its
+strengths, its weaknesses, and a plain verdict from the numbers. It
+tests Ollama models on this PC and cloud provider models the same way.
+
+## First time
+
+1. Start Ollama. If Ollama is not running, press Start Ollama on the
+   Models tab, or run `ollama serve` in a terminal.
+2. Pull a model. On the Models tab, type a model name (for example
+   `qwen3:0.6b`) and press Pull.
+3. Pick what to run. On the Run setup tab, tick a model and a test
+   template, then press Run.
+4. Read the results on the Run tab. The table shows each model's
+   overall score and speed. Click a model to see its details.
+
+The setup checklist at the top of the Run setup tab walks through
+these steps. It goes away once they are all done, and you can dismiss
+it at any time.
+
+## Picking models and templates
+
+Nothing is ticked to start with. Tick the models and the test
+templates you want, then press Run. Each model runs each template in
+turn.
+
+A template no ticked model can run is greyed out and cannot be
+ticked. For example, a vision test needs a model that can see images.
+Press Screen models to check what each installed model can do.
+
+Use the filter boxes to find a model or a template by name. Ticked
+items keep their ticks while filtered.
+
+The "Stop a template after __ minutes" box sets a time budget for one
+template. At 0 there is no limit. When a budget runs out, that
+template stops with "time budget reached" and the run carries on.
+
+## Running a test
+
+Press Run. The app checks Ollama is answering first (provider-only
+runs skip this check), then runs each model through each template in
+turn. Every template run is saved to its own file under `results` as
+soon as it finishes, and nothing is ever overwritten.
+
+While a run is in progress the pick lists lock, so the ticks on
+screen always match the run. Press Cancel (or Esc) to stop after the
+current task. Results so far stay in the table.
+
+A full run over many models and templates can take a long time. The
+Run tab shows the progress and the current model and template.
+
+## Reading the results
+
+The Run tab table shows one row per model: overall score, average
+decode speed in tokens per second, and status. Click a column header
+to sort. Click a model to see its details below the table: the score
+on each template, the tokens used, and (for provider models) the
+estimated cost.
+
+The Profiles tab shows each model's profile: latest and best scores,
+strengths and weaknesses, and a verdict written from its numbers.
+Profiles rebuild themselves after every run. Press Regenerate to
+rebuild one from the run files on disk.
+
+The Compare tab puts two models side by side: pick two models and it
+shows their latest score on each template they ran, plus their
+overall score and speed.
+
+## Past runs
+
+The Past runs tab holds every run you have ever done, grouped by
+model and by system. Pick a model to browse its runs, and pick a run
+to see its scores. The tab shows how much disk the results store
+uses. To remove a run, pick it and press Delete run. Deleting asks
+to confirm first, and it is disabled while a run is in progress.
+
+## Pulling a model
+
+On the Models tab, type a model name and press Pull. The bar shows
+the download progress. Pulling a model does not run any test; it just
+downloads it so you can test it. Press Refresh to re-read the models
+Ollama has installed.
+
+## Providers (cloud models)
+
+The Providers tab adds cloud providers (OpenAI-compatible APIs).
+Press New provider, fill in the name, the base URL, and the API key,
+then press Save provider. Keys live in `providers.json` next to the
+app. That file holds your keys: never share it or upload it anywhere.
+
+Press Test connection to check a provider answers. Add the provider's
+models with their prices (per million tokens) to get cost estimates
+before a run. A run with provider models shows its estimated cost
+first and asks to confirm when it is over $1.00, or when no prices
+are saved and the cost is unknown.
+
+Removing a provider asks to confirm first. Its key and saved models
+go with it.
+
+## Saving and sharing
+
+Save report writes the current results to the `results` folder as a
+text file and a JSON file. Export CSV and Export HTML write the same
+results as a spreadsheet file or a web page, wherever you choose.
+
+## If something goes wrong
+
+- "Ollama is not running": press Start Ollama in the app, or start
+  Ollama yourself, then press Refresh.
+- "could not reach Ollama. Start it, then press Refresh": Ollama
+  stopped answering. Start it again, press Refresh, and Run again.
+- "provider X did not answer": the provider could not be reached.
+  Check the base URL on the Providers tab, or try Test connection.
+- "provider X rejected the key": the API key is wrong or revoked.
+  Paste a fresh key on the Providers tab and press Save provider.
+- A model row says "failed": that model could not run. The test
+  carries on with the rest. Try that model on its own with
+  `ollama run <name>` (local) or Test connection (provider).
+- A task says "not run": the test image or audio clip that task needs
+  is missing from the `images` or `audio` folder. Put the file back
+  (or re-download the Release zip, which carries them) and run again.
+  A "not run" task is not the model's fault and never counts toward
+  its score.
+- A template says "time budget reached": the per-template time budget
+  ran out before that template's jobs finished. The jobs that ran
+  still count toward the score. Raise the budget, or leave it at 0
+  for no limit, and run again.
+- A template shows "not eligible for this model": the model cannot
+  run that test (no vision, no tools, and so on). It is not a
+  failure. Tick a model that has the capability to run it.
+- Debug report: Help > Debug report saves a scrubbed copy of the
+  app's recent log. It holds the app's log only (no keys, no model
+  answers), so it is safe to send to someone helping you. If the app
+  crashes, it writes a crash report to the `logs` folder before it
+  closes.
+
+## Shortcuts
+
+- Ctrl+R: start a run.
+- Ctrl+S: save the report.
+- Esc: cancel a running run.
+"""
 # A task whose test file is missing never ran: it is recorded with
 # passed None and one of these details, never as a failure.
 NOT_RUN_IMAGE = "not run: test image not found"
@@ -260,6 +418,19 @@ def get_results_dir():
     return os.environ.get(
         "OST_RESULTS_DIR", os.path.join(APP_DIR, "results")
     )
+
+
+def any_run_exists():
+    """True when at least one benchmark run has ever been saved: any
+    .json file anywhere under the results folder. A saved report
+    counts too — it can only exist after a run."""
+    results_dir = get_results_dir()
+    if not os.path.isdir(results_dir):
+        return False
+    for _root, _dirs, files in os.walk(results_dir):
+        if any(name.endswith(".json") for name in files):
+            return True
+    return False
 
 
 def get_providers_file():
@@ -4501,8 +4672,24 @@ TABLE_COLUMNS = (
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    # Tab order (R1): setup, run, models, then the v1-v9 tabs.
+    TAB_SETUP = 0
+    TAB_RUN = 1
+    TAB_MODELS = 2
+    TAB_HISTORY = 3
+    TAB_PROFILES = 4
+    TAB_COMPARE = 5
+    TAB_PROVIDERS = 6
+
+    def __init__(self, instance_server=None):
         super().__init__()
+        # Single-instance guard (U27): the server main() acquired,
+        # kept alive here; a second copy's knock raises this window.
+        self._instance_server = instance_server
+        if instance_server is not None:
+            instance_server.newConnection.connect(self._on_instance_connection)
+        # The How to Use window (U22), if open: one copy only.
+        self._how_to_use_dialog = None
         self.setWindowTitle(f"{APP_NAME} v{__version__}")
         icon_path = os.path.join(APP_DIR, "ost-icon.png")
         if os.path.exists(icon_path):
@@ -4546,166 +4733,11 @@ class MainWindow(QMainWindow):
         self.sys_id = system_id(self.machine)
 
         tabs = QTabWidget()
-        self.setCentralWidget(tabs)
         self.tabs = tabs
 
-        # ---- Benchmark tab ----
-        bench_tab = QWidget()
-        tabs.addTab(bench_tab, "Benchmark")
-        layout = QVBoxLayout(bench_tab)
-
-        intro = QLabel(
-            "Nothing is ticked to start with. Tick the models and the test "
-            "templates you want, then press Run. Each model runs each template "
-            "in turn; every template run is saved to its own file under results, "
-            "and nothing is ever overwritten. A template no ticked model can "
-            "run is greyed out and cannot be ticked."
-        )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-
-        pick_row = QHBoxLayout()
-        model_box = QVBoxLayout()
-        model_box.addWidget(QLabel("Models (local and provider):"))
-        self.model_filter = QLineEdit()
-        self.model_filter.setPlaceholderText("Filter models...")
-        self.model_filter.setClearButtonEnabled(True)
-        self.model_filter.textChanged.connect(self._apply_model_filter)
-        model_box.addWidget(self.model_filter)
-        self.model_list = QListWidget()
-        self.model_list.setMaximumHeight(180)
-        # Ticking or unticking a model changes which templates any
-        # ticked model can run, so the grey-outs refresh on every tick.
-        self.model_list.itemChanged.connect(self.update_template_availability)
-        model_box.addWidget(self.model_list)
-        model_buttons = QHBoxLayout()
-        self.select_all_button = QPushButton("Select all")
-        self.select_all_button.clicked.connect(self.select_all_models)
-        self.clear_button = QPushButton("Clear")
-        self.clear_button.clicked.connect(self.clear_models)
-        self.screen_button = QPushButton("Screen models")
-        self.screen_button.clicked.connect(self.screen_models)
-        model_buttons.addWidget(self.select_all_button)
-        model_buttons.addWidget(self.clear_button)
-        model_buttons.addWidget(self.screen_button)
-        model_buttons.addStretch()
-        model_box.addLayout(model_buttons)
-        pick_row.addLayout(model_box)
-
-        template_box = QVBoxLayout()
-        template_box.addWidget(QLabel("Test templates:"))
-        self.template_filter = QLineEdit()
-        self.template_filter.setPlaceholderText("Filter templates...")
-        self.template_filter.setClearButtonEnabled(True)
-        self.template_filter.textChanged.connect(self._apply_template_filter)
-        template_box.addWidget(self.template_filter)
-        self.template_list = QListWidget()
-        self.template_list.setMaximumHeight(180)
-        template_box.addWidget(self.template_list)
-        template_buttons = QHBoxLayout()
-        self.select_all_templates_button = QPushButton("Select all")
-        self.select_all_templates_button.clicked.connect(self.select_all_templates)
-        self.clear_templates_button = QPushButton("Clear")
-        self.clear_templates_button.clicked.connect(self.clear_templates)
-        template_buttons.addWidget(self.select_all_templates_button)
-        template_buttons.addWidget(self.clear_templates_button)
-        template_buttons.addStretch()
-        template_box.addLayout(template_buttons)
-        pick_row.addLayout(template_box)
-        layout.addLayout(pick_row)
-
-        run_buttons = QHBoxLayout()
-        self.run_button = QPushButton("Run")
-        self.run_button.clicked.connect(self.start_run)
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.cancel_run)
-        self.cancel_button.setEnabled(False)
-        self.save_button = QPushButton("Save report")
-        self.save_button.clicked.connect(self.save_report)
-        self.save_button.setEnabled(False)
-        self.export_csv_button = QPushButton("Export CSV")
-        self.export_csv_button.clicked.connect(self.export_csv)
-        self.export_csv_button.setEnabled(False)
-        self.export_html_button = QPushButton("Export HTML")
-        self.export_html_button.clicked.connect(self.export_html)
-        self.export_html_button.setEnabled(False)
-        self.refresh_button = QPushButton("Refresh")
-        self.refresh_button.clicked.connect(self.refresh_models)
-        self.start_ollama_button = QPushButton("Start Ollama")
-        self.start_ollama_button.clicked.connect(self.start_ollama)
-        run_buttons.addWidget(self.run_button)
-        run_buttons.addWidget(self.cancel_button)
-        run_buttons.addWidget(self.save_button)
-        run_buttons.addWidget(self.export_csv_button)
-        run_buttons.addWidget(self.export_html_button)
-        run_buttons.addWidget(self.refresh_button)
-        run_buttons.addWidget(self.start_ollama_button)
-        run_buttons.addStretch()
-        layout.addLayout(run_buttons)
-
-        # Opt-in per-template time budget. Default 0 = no limit: a
-        # limit needs a concrete reason, and here the user sets it.
-        # When set and a template's jobs run past it, that template's
-        # jobs stop with "time budget reached" and the run carries on
-        # with the next template.
-        budget_row = QHBoxLayout()
-        budget_row.addWidget(QLabel("Stop a template after"))
-        self.budget_spin = QSpinBox()
-        self.budget_spin.setRange(0, 600)
-        self.budget_spin.setValue(0)
-        self.budget_spin.setSuffix(" minutes")
-        budget_row.addWidget(self.budget_spin)
-        budget_row.addWidget(QLabel("(0 = no limit)"))
-        budget_row.addStretch()
-        layout.addLayout(budget_row)
-
-        # ---- Pull a model ----
-        pull_row = QHBoxLayout()
-        pull_row.addWidget(QLabel("Pull a model:"))
-        self.pull_input = QLineEdit()
-        self.pull_input.setPlaceholderText("model name, e.g. qwen3:4b")
-        self.pull_input.returnPressed.connect(self.start_pull)
-        self.pull_button = QPushButton("Pull")
-        self.pull_button.clicked.connect(self.start_pull)
-        pull_row.addWidget(self.pull_input)
-        pull_row.addWidget(self.pull_button)
-        layout.addLayout(pull_row)
-        self.pull_bar = QProgressBar()
-        self.pull_bar.setRange(0, 100)
-        self.pull_bar.setValue(0)
-        layout.addWidget(self.pull_bar)
-        self.pull_status = QLabel("")
-        self.pull_status.setWordWrap(True)
-        layout.addWidget(self.pull_status)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
-        self.status_label = QLabel("Ready.")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-
-        self.table = QTableWidget(0, len(TABLE_COLUMNS))
-        self.table.setHorizontalHeaderLabels(TABLE_COLUMNS)
-        self.table.setSortingEnabled(True)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        # Columns size to their contents, so the "Avg decode tok/s"
-        # header is never clipped; Status stretches with the spare width.
-        header = self.table.horizontalHeader()
-        for col in range(len(TABLE_COLUMNS) - 1):
-            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(len(TABLE_COLUMNS) - 1, QHeaderView.Stretch)
-        self.table.cellClicked.connect(self.on_table_clicked)
-        layout.addWidget(self.table)
-
-        layout.addWidget(QLabel("Details for the selected model:"))
-        self.detail_view = QTextEdit()
-        self.detail_view.setReadOnly(True)
-        self.detail_view.setMaximumHeight(190)
-        self.detail_view.setPlainText("Run a test, then click a model to see its scores.")
-        layout.addWidget(self.detail_view)
+        self._build_setup_tab(tabs)
+        self._build_run_tab(tabs)
+        self._build_models_tab(tabs)
 
         # ---- Past runs tab ----
         history_tab = QWidget()
@@ -4938,6 +4970,18 @@ class MainWindow(QMainWindow):
         providers_layout.addLayout(provider_columns)
         tabs.currentChanged.connect(self.on_tab_changed)
 
+        # The status line lives under the tabs, not inside one: it
+        # is the one thing that must stay visible on every tab.
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.addWidget(tabs)
+        self.status_label = QLabel("Ready.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setIndent(4)
+        central_layout.addWidget(self.status_label)
+        self.setCentralWidget(central)
+
         self.refresh_templates()
         self.refresh_models()
         self.refresh_history()
@@ -4946,6 +4990,298 @@ class MainWindow(QMainWindow):
         self.refresh_providers()
         self._build_menu_bar()
         self._build_shortcuts()
+
+    def _build_setup_tab(self, tabs):
+        """The Run setup tab (R1): pick models and templates, set the
+        budget, press Run. One job only — the running run lives on
+        the Run tab, pulling on the Models tab."""
+        setup_tab = QWidget()
+        tabs.addTab(setup_tab, "Run setup")
+        layout = QVBoxLayout(setup_tab)
+
+        # The first-run checklist (R7): three live steps, dismissed
+        # or completed means gone for good.
+        self.checklist_frame = QFrame()
+        self.checklist_frame.setFrameStyle(QFrame.StyledPanel)
+        checklist_layout = QVBoxLayout(self.checklist_frame)
+        checklist_layout.addWidget(QLabel("Get set up:"))
+        self.checklist_step1 = QLabel()
+        self.checklist_step2 = QLabel()
+        self.checklist_step3 = QLabel()
+        for step in (self.checklist_step1, self.checklist_step2,
+                     self.checklist_step3):
+            step.setWordWrap(True)
+            checklist_layout.addWidget(step)
+        dismiss_row = QHBoxLayout()
+        self.checklist_dismiss = QPushButton("Hide this checklist")
+        self.checklist_dismiss.clicked.connect(self._dismiss_checklist)
+        dismiss_row.addWidget(self.checklist_dismiss)
+        dismiss_row.addStretch()
+        checklist_layout.addLayout(dismiss_row)
+        layout.addWidget(self.checklist_frame)
+
+        intro = QLabel(
+            "Nothing is ticked to start with. Tick the models and the test "
+            "templates you want, then press Run. Each model runs each template "
+            "in turn; every template run is saved to its own file under results, "
+            "and nothing is ever overwritten. A template no ticked model can "
+            "run is greyed out and cannot be ticked."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        pick_row = QHBoxLayout()
+        model_box = QVBoxLayout()
+        model_box.addWidget(QLabel("Models (local and provider):"))
+        self.model_filter = QLineEdit()
+        self.model_filter.setPlaceholderText("Filter models...")
+        self.model_filter.setClearButtonEnabled(True)
+        self.model_filter.textChanged.connect(self._apply_model_filter)
+        model_box.addWidget(self.model_filter)
+        self.model_list = QListWidget()
+        # Ticking or unticking a model changes which templates any
+        # ticked model can run, so the grey-outs refresh on every tick.
+        self.model_list.itemChanged.connect(self.update_template_availability)
+        model_box.addWidget(self.model_list)
+        model_buttons = QHBoxLayout()
+        self.select_all_button = QPushButton("Select all")
+        self.select_all_button.clicked.connect(self.select_all_models)
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.clicked.connect(self.clear_models)
+        self.screen_button = QPushButton("Screen models")
+        self.screen_button.clicked.connect(self.screen_models)
+        model_buttons.addWidget(self.select_all_button)
+        model_buttons.addWidget(self.clear_button)
+        model_buttons.addWidget(self.screen_button)
+        model_buttons.addStretch()
+        model_box.addLayout(model_buttons)
+        pick_row.addLayout(model_box)
+
+        template_box = QVBoxLayout()
+        template_box.addWidget(QLabel("Test templates:"))
+        self.template_filter = QLineEdit()
+        self.template_filter.setPlaceholderText("Filter templates...")
+        self.template_filter.setClearButtonEnabled(True)
+        self.template_filter.textChanged.connect(self._apply_template_filter)
+        template_box.addWidget(self.template_filter)
+        self.template_list = QListWidget()
+        template_box.addWidget(self.template_list)
+        template_buttons = QHBoxLayout()
+        self.select_all_templates_button = QPushButton("Select all")
+        self.select_all_templates_button.clicked.connect(self.select_all_templates)
+        self.clear_templates_button = QPushButton("Clear")
+        self.clear_templates_button.clicked.connect(self.clear_templates)
+        template_buttons.addWidget(self.select_all_templates_button)
+        template_buttons.addWidget(self.clear_templates_button)
+        template_buttons.addStretch()
+        template_box.addLayout(template_buttons)
+        pick_row.addLayout(template_box)
+        layout.addLayout(pick_row)
+
+        run_row = QHBoxLayout()
+        self.run_button = QPushButton("Run")
+        self.run_button.clicked.connect(self.start_run)
+        run_row.addWidget(self.run_button)
+        run_row.addStretch()
+        layout.addLayout(run_row)
+
+        # Opt-in per-template time budget. Default 0 = no limit: a
+        # limit needs a concrete reason, and here the user sets it.
+        # When set and a template's jobs run past it, that template's
+        # jobs stop with "time budget reached" and the run carries on
+        # with the next template.
+        budget_row = QHBoxLayout()
+        budget_row.addWidget(QLabel("Stop a template after"))
+        self.budget_spin = QSpinBox()
+        self.budget_spin.setRange(0, 600)
+        self.budget_spin.setValue(0)
+        self.budget_spin.setSuffix(" minutes")
+        budget_row.addWidget(self.budget_spin)
+        budget_row.addWidget(QLabel("(0 = no limit)"))
+        budget_row.addStretch()
+        layout.addLayout(budget_row)
+
+    def _build_run_tab(self, tabs):
+        """The Run tab (R1): the running run and its results. The app
+        switches here when a run starts."""
+        run_tab = QWidget()
+        tabs.addTab(run_tab, "Run")
+        layout = QVBoxLayout(run_tab)
+
+        run_buttons = QHBoxLayout()
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.cancel_run)
+        self.cancel_button.setEnabled(False)
+        self.save_button = QPushButton("Save report")
+        self.save_button.clicked.connect(self.save_report)
+        self.save_button.setEnabled(False)
+        self.export_csv_button = QPushButton("Export CSV")
+        self.export_csv_button.clicked.connect(self.export_csv)
+        self.export_csv_button.setEnabled(False)
+        self.export_html_button = QPushButton("Export HTML")
+        self.export_html_button.clicked.connect(self.export_html)
+        self.export_html_button.setEnabled(False)
+        run_buttons.addWidget(self.cancel_button)
+        run_buttons.addWidget(self.save_button)
+        run_buttons.addWidget(self.export_csv_button)
+        run_buttons.addWidget(self.export_html_button)
+        run_buttons.addStretch()
+        layout.addLayout(run_buttons)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.table = QTableWidget(0, len(TABLE_COLUMNS))
+        self.table.setHorizontalHeaderLabels(TABLE_COLUMNS)
+        self.table.setSortingEnabled(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # Columns size to their contents, so the "Avg decode tok/s"
+        # header is never clipped; Status stretches with the spare width.
+        header = self.table.horizontalHeader()
+        for col in range(len(TABLE_COLUMNS) - 1):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(len(TABLE_COLUMNS) - 1, QHeaderView.Stretch)
+        self.table.cellClicked.connect(self.on_table_clicked)
+        layout.addWidget(self.table, stretch=2)
+
+        layout.addWidget(QLabel("Details for the selected model:"))
+        self.detail_view = QTextEdit()
+        self.detail_view.setReadOnly(True)
+        self.detail_view.setPlainText("Run a test, then click a model to see its scores.")
+        layout.addWidget(self.detail_view, stretch=1)
+
+    def _build_models_tab(self, tabs):
+        """The Models tab (R1): what is installed, pulling a new
+        model, Refresh, and Start Ollama."""
+        models_tab = QWidget()
+        tabs.addTab(models_tab, "Models")
+        layout = QVBoxLayout(models_tab)
+
+        intro = QLabel(
+            "Models installed on this PC. Pull a new one below, or "
+            "press Refresh to re-read the list."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        layout.addWidget(QLabel("Installed on this PC:"))
+        # Read-only: no checkboxes, nothing to tick here — ticking
+        # happens on the Run setup tab.
+        self.installed_list = QListWidget()
+        layout.addWidget(self.installed_list)
+
+        model_buttons = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_models)
+        self.start_ollama_button = QPushButton("Start Ollama")
+        self.start_ollama_button.clicked.connect(self.start_ollama)
+        model_buttons.addWidget(self.refresh_button)
+        model_buttons.addWidget(self.start_ollama_button)
+        model_buttons.addStretch()
+        layout.addLayout(model_buttons)
+
+        pull_row = QHBoxLayout()
+        pull_row.addWidget(QLabel("Pull a model:"))
+        self.pull_input = QLineEdit()
+        self.pull_input.setPlaceholderText("model name, e.g. qwen3:4b")
+        self.pull_input.returnPressed.connect(self.start_pull)
+        self.pull_button = QPushButton("Pull")
+        self.pull_button.clicked.connect(self.start_pull)
+        pull_row.addWidget(self.pull_input)
+        pull_row.addWidget(self.pull_button)
+        layout.addLayout(pull_row)
+        self.pull_bar = QProgressBar()
+        self.pull_bar.setRange(0, 100)
+        self.pull_bar.setValue(0)
+        layout.addWidget(self.pull_bar)
+        self.pull_status = QLabel("")
+        self.pull_status.setWordWrap(True)
+        layout.addWidget(self.pull_status)
+
+    def refresh_checklist(self):
+        """The first-run checklist (R7): three live steps. Dismissed
+        or completed means gone for good — it never reappears."""
+        settings = QSettings("BrokeNBored", APP_NAME)
+        if settings.value("setup_dismissed", False, type=bool):
+            self.checklist_frame.hide()
+            return
+        if settings.value("setup_completed", False, type=bool):
+            self.checklist_frame.hide()
+            return
+        ollama_up = ollama_reachable()
+        have_model = self.installed_list.count() > 0
+        have_run = any_run_exists()
+        if ollama_up and have_model and have_run:
+            settings.setValue("setup_completed", True)
+            self.checklist_frame.hide()
+            return
+        self.checklist_step1.setText(
+            "✓ Ollama is running." if ollama_up
+            else "○ Start Ollama: press Start Ollama on the Models tab."
+        )
+        self.checklist_step2.setText(
+            "✓ At least one model is pulled." if have_model
+            else "○ Pull a model: type a model name on the Models tab "
+                 "and press Pull."
+        )
+        self.checklist_step3.setText(
+            "✓ First benchmark run done." if have_run
+            else "○ Run your first test: tick a model and a template "
+                 "below, then press Run."
+        )
+        self.checklist_frame.show()
+
+    def _dismiss_checklist(self):
+        """Hide the setup checklist for good (R7)."""
+        settings = QSettings("BrokeNBored", APP_NAME)
+        settings.setValue("setup_dismissed", True)
+        self.checklist_frame.hide()
+
+    def _on_instance_connection(self):
+        """A second copy knocked (U27): bring this window forward."""
+        while self._instance_server.hasPendingConnections():
+            client = self._instance_server.nextPendingConnection()
+            client.disconnectFromServer()
+            client.deleteLater()
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def show_how_to_use(self):
+        """The How to Use index (U22): the full manual in its own
+        window, rendered as markdown. It stays open beside the app
+        so the manual can be read while working; opening it again
+        brings the same window forward."""
+        if self._how_to_use_dialog is not None:
+            self._how_to_use_dialog.show()
+            self._how_to_use_dialog.raise_()
+            self._how_to_use_dialog.activateWindow()
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("How to Use")
+        dialog.resize(640, 520)
+        layout = QVBoxLayout(dialog)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setMarkdown(HOW_TO_USE_TEXT)
+        layout.addWidget(text)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+        dialog.destroyed.connect(self._clear_how_to_use_dialog)
+        self._how_to_use_dialog = dialog
+        dialog.show()
+
+    def _clear_how_to_use_dialog(self):
+        self._how_to_use_dialog = None
 
     def closeEvent(self, event):
         # Save the window's size and position so the next launch
@@ -4956,7 +5292,7 @@ class MainWindow(QMainWindow):
 
     def _build_menu_bar(self):
         """A minimal menu bar: File (Save report, Quit), View (Dark
-        mode), Help (About, Debug report)."""
+        mode), Help (How to Use, About, Debug report)."""
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("File")
         self.save_report_action = QAction("Save report", self)
@@ -4974,6 +5310,9 @@ class MainWindow(QMainWindow):
         self.dark_mode_action.triggered.connect(self._toggle_dark_mode)
         view_menu.addAction(self.dark_mode_action)
         help_menu = menu_bar.addMenu("Help")
+        how_to_use_action = QAction("How to Use", self)
+        how_to_use_action.triggered.connect(self.show_how_to_use)
+        help_menu.addAction(how_to_use_action)
         about_action = QAction("About", self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
@@ -5107,6 +5446,20 @@ class MainWindow(QMainWindow):
         targets = [
             ollama_target(name, cache.get(name)) for name in ollama_names
         ]
+        # The Models tab's read-only list: Ollama models only, with
+        # their capabilities. Provider models live on the Providers tab.
+        # This PySide6 build sets ItemIsUserCheckable on a bare item by
+        # default, and Space would sprout a checkbox on a read-only
+        # list — clear the flag so the list stays read-only.
+        self.installed_list.clear()
+        for name in ollama_names:
+            installed_item = QListWidgetItem(
+                name + format_capabilities(cache.get(name) or set())
+            )
+            installed_item.setFlags(
+                installed_item.flags() & ~Qt.ItemIsUserCheckable
+            )
+            self.installed_list.addItem(installed_item)
         for provider in providers:
             for model_entry in provider["models"]:
                 targets.append(provider_target(provider, model_entry))
@@ -5117,6 +5470,7 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(NO_MODELS_MESSAGE)
             self.run_button.setEnabled(False)
             self.update_template_availability()
+            self.refresh_checklist()
             return
         for target in targets:
             item = QListWidgetItem(
@@ -5136,6 +5490,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(NO_TEMPLATES_MESSAGE)
             self.run_button.setEnabled(False)
             self.update_template_availability()
+            self.refresh_checklist()
             return
         self.run_button.setEnabled(True)
         if ollama_error is not None:
@@ -5154,6 +5509,7 @@ class MainWindow(QMainWindow):
                 status += f" (+{len(warnings) - 2} more)"
         self.status_label.setText(status)
         self.update_template_availability()
+        self.refresh_checklist()
 
     def screen_models(self):
         """Re-screen every Ollama model from scratch: drop the cached
@@ -5285,6 +5641,9 @@ class MainWindow(QMainWindow):
         # (or when no prices are saved, so the cost is unknown).
         if not self._confirm_provider_cost(targets, templates):
             return
+        # The run lives on the Run tab: switch there so the user
+        # watches it instead of the setup lists.
+        self.tabs.setCurrentIndex(self.TAB_RUN)
         # Sorting stays OFF while the run builds the table: a live sort
         # moves rows mid-update and later setItem calls land on the wrong
         # model. It goes back on when the run finishes.
@@ -5544,6 +5903,8 @@ class MainWindow(QMainWindow):
         self.refresh_profiles_for_run()
         self.refresh_compare()
         self._update_delete_button()
+        # A finished run completes the checklist's third step.
+        self.refresh_checklist()
 
     def refresh_profiles_for_run(self):
         """Rebuild the profiles of every model this run touched."""
@@ -6550,6 +6911,35 @@ def run_headless(args):
     return 0
 
 
+def acquire_single_instance(name):
+    """Single-instance guard (U27). Returns (server, is_first).
+
+    First try to connect: if a copy is already listening, send it a
+    "show" nudge and return (None, False) — the caller exits without
+    opening a window. Otherwise take the name and return
+    (server, True); the caller keeps the server alive on the window
+    and raises it whenever a second copy knocks.
+
+    A crashed run leaves its socket behind, so the name is removed
+    before listening or the listen fails. If listening fails anyway,
+    the app still starts (as the first copy, with no server) rather
+    than refusing to open at all.
+    """
+    socket = QLocalSocket()
+    socket.connectToServer(name)
+    if socket.waitForConnected(500):
+        socket.write(b"show")
+        socket.flush()
+        socket.waitForBytesWritten(500)
+        socket.disconnectFromServer()
+        return None, False
+    QLocalServer.removeServer(name)
+    server = QLocalServer()
+    if server.listen(name):
+        return server, True
+    return None, True
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="ollama_system_test.py",
@@ -6591,11 +6981,16 @@ def main():
               "opening the window.", file=sys.stderr)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    # Single instance (U27): a second copy nudges the running one
+    # and exits. Headless runs skip this — cron must not be blocked.
+    instance_server, is_first = acquire_single_instance(SINGLE_INSTANCE_NAME)
+    if not is_first:
+        return 0
     # The saved theme applies before the window is built, so a
     # dark-mode user never sees a light flash.
     settings = QSettings("BrokeNBored", APP_NAME)
     apply_theme(settings.value("dark_mode", False, type=bool))
-    window = MainWindow()
+    window = MainWindow(instance_server=instance_server)
     window.show()
     sys.exit(app.exec())
 

@@ -1,5 +1,40 @@
 # Changelog
 
+## v12 (2026-11-13)
+
+UI redesign, part 2 (tasks R1, R3, R6, R7) — the layout release.
+No new templates.
+
+- The Benchmark tab is three tabs now (R1). One crowded tab held
+  the pick lists, twelve buttons, the pull box, the progress bar,
+  the results table, and the detail view, with the lists capped at
+  180px. Now Run setup holds the pick lists (full height, no cap),
+  the budget, and Run; Run holds the progress bar, the results
+  table, the detail view, Cancel, and Save/Export; Models holds
+  the installed-models list, the pull box, Refresh, and Start
+  Ollama. The status line sits under the tabs so it is visible on
+  every tab, and the app switches to the Run tab when a run starts.
+  Nothing was removed, only reorganized.
+- How to Use index (R3). Help > How to Use opens the full manual in
+  its own window — first time, picking models and templates,
+  running a test, reading the results, past runs, pulling a model,
+  providers, saving and sharing, what to do when something goes
+  wrong, shortcuts — rendered as markdown. It stays open beside the
+  app so the manual can be read while working; opening it again
+  brings the same window forward.
+- Single instance (R6). Clicking the icon while the app is already
+  running brings the running copy forward instead of starting a
+  second one that could write the same results dir. Headless runs
+  are exempt — cron must not be blocked.
+- First-run setup checklist (R7). The top of the Run setup tab
+  shows three live steps — Ollama is running, at least one model
+  pulled, first benchmark run done — each with what to do when it
+  is open. It goes away once all three are done, or when dismissed,
+  and never reappears after either.
+- The Models tab's installed list is read-only: no checkboxes, and
+  Space cannot add one (this PySide6 build sets a checkbox flag on
+  plain list items by default, so the list clears it).
+
 ## v11 (2026-11-13)
 
 UI redesign, part 1 (tasks R2, R4, R5, R8, R9, R10) — the first six
