@@ -1,10 +1,9 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v10 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v11 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1005 v9 checks are carried over (the v9 sections
-sit at the end: search/filter on the model + template lists, dark mode,
-README fixes + repo hygiene); the v10 checks cover the real speech
-clips, transcript normalization, and the fixture generator keeping
-existing clips.
+answers per model. All 1016 v10 checks are carried over; the v11 checks
+cover the debug log layer (R2), markdown profiles (R4), the
+remove-provider confirmation (R5), the save-report collision fix (R8),
+the pick-list lock during a run (R9), and the em-dash sweep (R10).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -26,6 +25,7 @@ about 7 minutes. Exit code 0 = every check passed. Prints PASS/FAIL
 per check.
 """
 
+import ast
 import csv
 from datetime import datetime, timedelta
 import hashlib
@@ -51,6 +51,7 @@ RESULTS_DIR = os.path.join(VERIFY_DIR, "results-test")
 TEMPLATES_TEST_DIR = os.path.join(VERIFY_DIR, "templates-test")
 PROVIDERS_FILE = os.path.join(VERIFY_DIR, "providers-test.json")
 CAPABILITIES_FILE = os.path.join(VERIFY_DIR, "capabilities-test.json")
+LOGS_DIR = os.path.join(VERIFY_DIR, "logs-test")
 FAKEBIN = os.path.join(VERIFY_DIR, "fakebin")
 FAKEBIN_SLEEP = os.path.join(VERIFY_DIR, "fakebin-sleep")
 ORIGINAL_PATH = os.environ["PATH"]
@@ -58,6 +59,7 @@ ORIGINAL_PATH = os.environ["PATH"]
 os.environ["OST_RESULTS_DIR"] = RESULTS_DIR
 os.environ["OST_PROVIDERS_FILE"] = PROVIDERS_FILE
 os.environ["OST_CAPABILITIES_FILE"] = CAPABILITIES_FILE
+os.environ["OST_LOGS_DIR"] = LOGS_DIR
 sys.path.insert(0, PKG_DIR)
 sys.path.insert(0, VERIFY_DIR)
 
@@ -266,10 +268,10 @@ def main():
     check("tok_s 200/20s = 10.0", app.tok_s(200, 20_000_000_000) == 10.0)
     check("tok_s zero duration is None", app.tok_s(200, 0) is None)
     check("fmt_bytes 2GB", app.fmt_bytes(2_000_000_000) == "2.0 GB")
-    check("fmt_bytes None is dash", app.fmt_bytes(None) == "—")
+    check("fmt_bytes None is n/a", app.fmt_bytes(None) == "n/a")
     check("fmt_duration 0.5s is ms", app.fmt_duration(0.5) == "500 ms")
     check("fmt_score 100", app.fmt_score(100.0) == "100%")
-    check("fmt_score None is dash", app.fmt_score(None) == "—")
+    check("fmt_score None is n/a", app.fmt_score(None) == "n/a")
     runs = [
         {"decode_tok_s": 10.0, "prompt_tok_s": 20.0, "ttft_s": 0.5, "load_s": 2.0},
         {"decode_tok_s": 12.0, "prompt_tok_s": 22.0, "ttft_s": 0.7, "load_s": 0.0},
@@ -954,7 +956,7 @@ def main():
         check("broken status",
               table_text(window, broken_row, 3) == "failed: model exploded",
               table_text(window, broken_row, 3))
-        check("broken score is dash", table_text(window, broken_row, 1) == "—")
+        check("broken score is n/a", table_text(window, broken_row, 1) == "n/a")
     order = [table_text(window, r, 0) for r in range(window.table.rowCount())]
     check("table sorted best score first, failed last",
           order == ["fake-smart:2b", "fake-partial:3b", "fake-dumb:1b", "fake-broken:1b"],
@@ -1140,7 +1142,7 @@ def main():
               "- Coding" in prof.split("## Strengths")[1].split("## Weaknesses")[0],
               prof)
         check("smart profile no weaknesses",
-              "None yet — no template under 50%." in prof, prof)
+              "None yet: no template under 50%." in prof, prof)
 
     # ---------- save report ----------
     window.save_button.click()
@@ -1283,9 +1285,16 @@ def main():
           "Latest overall score: 88%" in prof_text, prof_text[:500])
     check("regenerated profile best still 100%",
           "Best overall score: 100%" in prof_text, prof_text[:500])
+    # The view renders markdown now (v11 R4), so the plain text has
+    # no "##" markers and no "- " bullets — the Weaknesses section is
+    # the text between the rendered headings.
+    weaknesses_text11 = (
+        prof_text.split("Weaknesses", 1)[1].split("Verdict", 1)[0]
+        if "Weaknesses" in prof_text else ""
+    )
     check("regenerated profile weaknesses Coding and Math",
-          "- Coding" in prof_text.split("## Weaknesses")[1]
-          and "- Math" in prof_text.split("## Weaknesses")[1], prof_text)
+          "Coding" in weaknesses_text11
+          and "Math" in weaknesses_text11, prof_text)
     check("regenerated profile verdict Strong", "Strong on this PC" in prof_text, prof_text)
     check("regenerate leaves run files untouched", file_hash(coding_file) == coding_hash)
 
@@ -1673,7 +1682,7 @@ def main():
     check("fmt_cost small", app.fmt_cost(0.003444) == "$0.0034")
     check("fmt_cost dollars", app.fmt_cost(1.5) == "$1.50")
     check("fmt_cost zero", app.fmt_cost(0) == "$0.00")
-    check("fmt_cost None is dash", app.fmt_cost(None) == "—")
+    check("fmt_cost None is n/a", app.fmt_cost(None) == "n/a")
     check("fmt_tokens commas", app.fmt_tokens(5600) == "5,600")
     target = app.provider_target(sample_providers[0], sample_providers[0]["models"][0])
     check("provider target label and kind",
@@ -2423,7 +2432,7 @@ def main():
               table_text(windowP, prow, 3) == "done", table_text(windowP, prow, 3))
         toks = table_text(windowP, prow, 2)
         check("provider row has a measured speed",
-              toks != "—" and float(toks) > 100, toks)
+              toks != "n/a" and float(toks) > 100, toks)
     detail = windowP.detail_view.toPlainText()
     check("detail shows 1,580 prompt tokens", "1,580 in" in detail, detail[:300])
     check("detail shows 15,800 completion tokens", "15,800 out" in detail, detail[:300])
@@ -3210,8 +3219,8 @@ def main():
         check("no transcribe call was made while the clips were missing",
               pserver6.transcribe_count == transcribe_before,
               f"delta {pserver6.transcribe_count - transcribe_before}")
-        check("smart overall is a dash, not 0%",
-              table_text(window6, row_for(window6, "fake-smart:2b"), 1) == "—",
+        check("smart overall is n/a, not 0%",
+              table_text(window6, row_for(window6, "fake-smart:2b"), 1) == "n/a",
               table_text(window6, row_for(window6, "fake-smart:2b"), 1))
         check("provider row shows 100%",
               table_text(window6,
@@ -3357,7 +3366,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 10", app.__version__ == "10",
+    check("__version__ is 11", app.__version__ == "11",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3371,8 +3380,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v10",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v10",
+    check("title bar shows OLLAMA SYSTEM TEST v11",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v11",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -3424,8 +3433,9 @@ def main():
     check("File menu has Save report and Quit",
           file_items == ["Save report", "Quit"], str(file_items))
     help_menu7 = bar7.actions()[2].menu()
-    check("Help menu has About",
-          [a.text() for a in help_menu7.actions()] == ["About"],
+    check("Help menu has About and Debug report",
+          [a.text() for a in help_menu7.actions()]
+          == ["About", "Debug report"],
           str([a.text() for a in help_menu7.actions()]))
     check("About shows __version__",
           f"v{app.__version__}" in window7.about_text(),
@@ -4060,7 +4070,7 @@ def main():
     check("CSV export marks the not-run template",
           "not run" in csv8, csv8)
     check("CSV export marks a template one model never ran",
-          "—" in csv8, csv8)
+          "n/a" in csv8, csv8)
     html8 = app.render_export_html(sample8)
     check("HTML export renders a table with both models",
           "<table>" in html8 and "model-a" in html8 and "model-b" in html8,
@@ -4249,7 +4259,7 @@ def main():
               len(question_calls8) == 1, str(len(question_calls8)))
         if question_calls8:
             check("unknown-price dialog says cost unknown plainly",
-                  "no prices saved — cost unknown" in question_calls8[0],
+                  "no prices saved: cost unknown" in question_calls8[0],
                   question_calls8[0])
         check("answering No to the unknown-price run starts nothing",
               window8.worker is None)
@@ -4634,12 +4644,12 @@ def main():
         window8x.export_csv()
         check("export with no results says so plainly",
               window8x.status_label.text()
-              == "Nothing to export yet — run a test first.",
+              == "Nothing to export yet. Run a test first.",
               window8x.status_label.text())
         window8x.export_html()
         check("HTML export with no results says so plainly",
               window8x.status_label.text()
-              == "Nothing to export yet — run a test first.",
+              == "Nothing to export yet. Run a test first.",
               window8x.status_label.text())
         window8x.close()
         window8x.deleteLater()
@@ -4758,10 +4768,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v10",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v10",
+        check("title bar shows v11",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v11",
               window9.windowTitle())
-        check("__version__ is 10", app.__version__ == "10", app.__version__)
+        check("__version__ is 11", app.__version__ == "11", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -5005,6 +5015,240 @@ def main():
         qt_app.setStyleSheet("")
         server9.shutdown()
         server9.server_close()
+
+    # ---------- v11: debug log layer (R2) ----------
+    # A saved key that matches NO pattern, so only the exact-match
+    # scrub can catch it.
+    fake_key11 = "my-plain-test-key-987654321"
+    with open(PROVIDERS_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"providers": [{
+            "name": "scrub-test", "base_url": "http://127.0.0.1:9",
+            "api_key": fake_key11, "models": [],
+        }]}, handle)
+    check("scrub removes a saved key",
+          fake_key11 not in app.scrub_text(f"key is {fake_key11} here")
+          and "[key]" in app.scrub_text(f"key is {fake_key11} here"))
+    check("scrub removes an sk- key",
+          "sk-abcdefghij12345678" not in app.scrub_text(
+              "leaked sk-abcdefghij12345678 here"))
+    check("scrub removes a token assignment",
+          "supersecret42" not in app.scrub_text("token=supersecret42"))
+    check("scrub removes an api_key assignment",
+          "hunter2value" not in app.scrub_text("api_key: hunter2value"))
+    check("scrub removes a Bearer token",
+          "abcdef123456" not in app.scrub_text("Bearer abcdef123456"))
+    shutil.rmtree(LOGS_DIR, ignore_errors=True)
+    app._LOG_RING.clear()
+    app.log_event("v11 test event")
+    today11 = datetime.now().strftime("%Y-%m-%d")
+    log_file11 = os.path.join(LOGS_DIR, f"ost-{today11}.log")
+    check("log_event writes to the ring buffer",
+          any("v11 test event" in line for line in app._LOG_RING))
+    check("log_event writes to today's log file",
+          os.path.exists(log_file11)
+          and "v11 test event" in open(log_file11, encoding="utf-8").read())
+    for i in range(250):
+        app.log_event(f"ring fill {i}")
+    check("ring buffer caps at 200 lines", len(app._LOG_RING) == 200,
+          str(len(app._LOG_RING)))
+    old_log11 = os.path.join(LOGS_DIR, "ost-2020-01-01.log")
+    with open(old_log11, "w", encoding="utf-8") as handle:
+        handle.write("old\n")
+    app.prune_old_logs()
+    check("prune removes a log older than 30 days",
+          not os.path.exists(old_log11))
+    check("prune keeps today's log", os.path.exists(log_file11))
+    app.log_event(f"a line carrying the key {fake_key11}")
+    report11 = app.write_debug_report()
+    with open(report11, encoding="utf-8") as handle:
+        report_text11 = handle.read()
+    check("debug report is written under logs/",
+          os.path.exists(report11) and report11.startswith(LOGS_DIR))
+    check("debug report names the version",
+          "OLLAMA SYSTEM TEST v11" in report_text11, report_text11[:200])
+    check("debug report carries no saved key",
+          fake_key11 not in report_text11
+          and "[key]" in report_text11)
+    try:
+        raise ValueError("boom-test-11")
+    except ValueError:
+        _exc_type11, _exc_value11, _exc_tb11 = sys.exc_info()
+    crash_before11 = {f for f in os.listdir(LOGS_DIR)
+                      if f.startswith("crash-")}
+    app._ost_excepthook(_exc_type11, _exc_value11, _exc_tb11)
+    crash_after11 = {f for f in os.listdir(LOGS_DIR)
+                     if f.startswith("crash-")}
+    new_crash11 = crash_after11 - crash_before11
+    check("excepthook writes a crash file", len(new_crash11) == 1,
+          str(new_crash11))
+    if new_crash11:
+        crash_text11 = open(
+            os.path.join(LOGS_DIR, sorted(new_crash11)[0]),
+            encoding="utf-8").read()
+        check("crash file holds the traceback",
+              "ValueError" in crash_text11 and "boom-test-11" in crash_text11,
+              crash_text11[:300])
+    check("excepthook logs the crash to the ring",
+          any("Crash:" in line for line in app._LOG_RING))
+    saved_hook11 = sys.excepthook
+    app.install_excepthook()
+    check("install_excepthook installs the hook",
+          sys.excepthook is app._ost_excepthook)
+    sys.excepthook = saved_hook11
+
+    # ---------- v11: window checks (R4, R5, R8, R9, R10) ----------
+    server11, _t11 = fake_ollama.start_server()
+    host11, port11 = server11.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host11}:{port11}"
+    window11 = app.MainWindow()
+    window11.show()
+    qt_app.processEvents()
+    help_texts11 = []
+    for action in window11.menuBar().actions():
+        if action.text() == "Help":
+            help_texts11 = [a.text() for a in action.menu().actions()]
+    check("Help menu has a Debug report action",
+          "Debug report" in help_texts11, str(help_texts11))
+    check("compare picker placeholder is plain words",
+          window11.compare_model_a.itemText(0) == "Pick a model",
+          window11.compare_model_a.itemText(0))
+    window11.refresh_models()
+    wait_until(lambda: window11.model_list.count() == 4, timeout=10,
+               app=qt_app)
+    set_checked_list(window11.model_list, {"fake-smart:2b"})
+    set_checked_templates(window11, {"math"})
+    window11.start_run()
+    check("pick lists lock during a run",
+          not window11.model_list.isEnabled()
+          and not window11.template_list.isEnabled())
+    done11 = wait_until(lambda: window11.worker is None, timeout=120,
+                        app=qt_app)
+    check("v11 run completes", done11)
+    check("pick lists unlock when the run ends",
+          window11.model_list.isEnabled()
+          and window11.template_list.isEnabled())
+    reports_before11 = (
+        {f for f in os.listdir(RESULTS_DIR)
+         if f.startswith("bench-results-")}
+        if os.path.exists(RESULTS_DIR) else set()
+    )
+    window11.save_report()
+    window11.save_report()
+    qt_app.processEvents()
+    reports_after11 = (
+        {f for f in os.listdir(RESULTS_DIR)
+         if f.startswith("bench-results-")}
+        if os.path.exists(RESULTS_DIR) else set()
+    )
+    new_reports11 = reports_after11 - reports_before11
+    check("two saves in one minute produce two reports",
+          len(new_reports11) == 4, str(new_reports11))
+    md_dir11 = os.path.join(RESULTS_DIR, "fake-markdown_1b")
+    os.makedirs(md_dir11, exist_ok=True)
+    with open(os.path.join(md_dir11, "PROFILE.md"), "w",
+              encoding="utf-8") as handle:
+        handle.write("# Fake Markdown\n\n**Bold** and plain.\n\n- one\n- two\n")
+    window11.refresh_profiles()
+    md_index11 = None
+    for i in range(window11.profile_model_combo.count()):
+        if window11.profile_model_combo.itemData(i) == "fake-markdown_1b":
+            md_index11 = i
+    check("profiles lists the markdown test model", md_index11 is not None)
+    if md_index11 is not None:
+        window11.profile_model_combo.setCurrentIndex(md_index11)
+        window11.on_profile_model_changed()
+        qt_app.processEvents()
+        md_text11 = window11.profile_view.toPlainText()
+        check("profile renders markdown, not raw text",
+              "Fake Markdown" in md_text11
+              and "#" not in md_text11 and "**" not in md_text11,
+              md_text11[:200])
+        check("profile view renders a heading",
+              "<h1" in window11.profile_view.toHtml(),
+              window11.profile_view.toHtml()[:300])
+    with open(PROVIDERS_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"providers": [{
+            "name": "del-me", "base_url": "http://127.0.0.1:9",
+            "api_key": "test-key-not-real", "models": [],
+        }]}, handle)
+    window11.refresh_providers()
+    del_index11 = None
+    for i in range(window11.provider_list.count()):
+        if window11.provider_list.item(i).text() == "del-me":
+            del_index11 = i
+    check("providers lists the removable test provider",
+          del_index11 is not None)
+    if del_index11 is not None:
+        window11.provider_list.setCurrentRow(del_index11)
+        question_calls11 = []
+        real_question11 = QMessageBox.question
+
+        def _mock_question11(parent, title, text, buttons=None, default=None):
+            question_calls11.append((title, default))
+            return QMessageBox.No
+
+        QMessageBox.question = _mock_question11
+        try:
+            window11.remove_provider()
+        finally:
+            QMessageBox.question = real_question11
+        kept11, _warns11 = app.load_providers(PROVIDERS_FILE)
+        check("answering No keeps the provider",
+              any(p["name"] == "del-me" for p in kept11))
+        check("remove confirm defaults to No",
+              bool(question_calls11)
+              and question_calls11[0][1] == QMessageBox.No,
+              str(question_calls11))
+
+        def _mock_yes11(parent, title, text, buttons=None, default=None):
+            return QMessageBox.Yes
+
+        QMessageBox.question = _mock_yes11
+        try:
+            window11.remove_provider()
+        finally:
+            QMessageBox.question = real_question11
+        gone11, _warns11 = app.load_providers(PROVIDERS_FILE)
+        check("answering Yes removes the provider",
+              not any(p["name"] == "del-me" for p in gone11))
+    window11.close()
+    window11.deleteLater()
+    qt_app.processEvents()
+    server11.shutdown()
+    server11.server_close()
+    if os.path.exists(PROVIDERS_FILE):
+        os.remove(PROVIDERS_FILE)
+
+    # ---------- v11: em-dash sweep (R10) ----------
+    app_src11 = open(os.path.join(PKG_DIR, "ollama_system_test.py"),
+                     encoding="utf-8").read()
+    tree11 = ast.parse(app_src11)
+    docstring_ids11 = set()
+    for node in ast.walk(tree11):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                             ast.AsyncFunctionDef)):
+            if (node.body and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)):
+                docstring_ids11.add(id(node.body[0].value))
+    dash_strings11 = []
+    amp_strings11 = []
+    for node in ast.walk(tree11):
+        if (isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in docstring_ids11):
+            if "—" in node.value:
+                dash_strings11.append((node.lineno, node.value[:60]))
+            if " & " in node.value:
+                amp_strings11.append((node.lineno, node.value[:60]))
+    check("no em-dash in any non-docstring string",
+          not dash_strings11, str(dash_strings11[:3]))
+    check("no bare & in any non-docstring string",
+          not amp_strings11, str(amp_strings11[:3]))
+    check("UNREACHABLE_HINT has no em-dash",
+          "—" not in app.UNREACHABLE_HINT, app.UNREACHABLE_HINT)
+    check("fmt_duration None is n/a", app.fmt_duration(None) == "n/a")
+    check("fmt_tokens None is n/a", app.fmt_tokens(None) == "n/a")
 
     QMessageBox.question = _suite_real_question
 

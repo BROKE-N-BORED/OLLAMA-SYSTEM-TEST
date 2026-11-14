@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v10
+# TEST-REPORT — OLLAMA SYSTEM TEST v11
 
 Verified 2026-11-13 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
@@ -8,6 +8,16 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v11 is the first UI-redesign release (tasks R2, R4, R5, R8, R9, R10
+from the redesign list): a debug log layer (scrubbed log files, a
+debug report on the Help menu, and a crash handler that writes a
+scrubbed report instead of dying silently); profiles render as
+formatted markdown instead of raw text; removing a provider asks
+first and defaults to No; saving twice in one minute no longer
+overwrites the first report; the pick lists lock while a run is
+going; and every visible em-dash is gone (n/a, periods, and plain
+words in their place). No new templates, no template changes.
 
 v10 is the real-speech release (task T12) — the last open repo-audit
 task. No new templates: the three transcribe tasks finally have
@@ -42,14 +52,24 @@ all runtime tests ran against the fake servers from v5/v6 (fake Ollama
 with /api/show, /api/chat with images and tools; fake OpenAI-compatible
 provider with image_url parts, tool-call SSE deltas, image generation,
 transcription, and speech). Test suite:
-tests/run_tests.py in this tree — **1016 passed, 0 failed** (final
-run; the v9 suite's 1005 checks are all carried over and green inside
-that count, plus 11 new v10 checks). The first full run of this suite
-came back 1010/6 — two profile-regenerate checks failed on a
-time-of-day bug in the test (it stamped its run files 09:00, which is
-only "later" before 09:00) and four version pins still said v9. Both
-were fixed in the test, not the app, and the re-run from a fresh unzip
-is the green 1016 above.
+tests/run_tests.py in this tree — **1051 passed, 0 failed** (final
+run; the v10 suite's 1016 checks are all carried over and green
+inside that count, plus 35 new v11 checks). The road to green: the
+first full run crashed at 347 on a test bug (a profile-regenerate
+check split rendered text on "## Weaknesses", which setMarkdown
+strips); the second run came back 1049/2 (the Help-menu check still
+expected About alone, and an em-dash in a new debug-report string
+tripped the v11 AST pin — both fixed, the second in the app); the
+third run crashed at 829 on a load-flake subprocess timeout (the
+headless unknown-model command runs in 2.6 s on its own); the
+fourth run was killed by a VM restart at 218. The fifth run from a
+fresh unzip is the green 1051 above. The v10 suite's own history
+follows: its first full run came back 1010/6 — two
+profile-regenerate checks failed on a time-of-day bug in the test
+(it stamped its run files 09:00, which is only "later" before
+09:00) and four version pins still said v9. Both were fixed in the
+test, not the app, and the re-run from a fresh unzip is the green
+1016 that v11 carries.
 
 ## What was verified (v10)
 

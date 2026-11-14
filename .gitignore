@@ -11,6 +11,9 @@ capabilities.json
 # Run results and profiles live on the machine, not in the repo.
 results/
 
+# Debug logs and crash reports live on the machine, not in the repo.
+logs/
+
 # The private install folder from install.sh.
 .venv/
 
@@ -30,4 +33,5 @@ tests/saved-report.json
 tests/sample-run-file.json
 tests/providers-test.json
 tests/capabilities-test.json
+tests/logs-test/
 tests/_v6_scratch/

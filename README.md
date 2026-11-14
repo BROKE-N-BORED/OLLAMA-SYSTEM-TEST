@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v9
+# OLLAMA SYSTEM TEST v11
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -152,15 +152,17 @@ remembered next time.
    a run is in progress.
 7. The Profiles tab shows each model's profile: latest and best scores,
    strengths and weaknesses, and a verdict written from its numbers.
-   Profiles rebuild themselves after every run. Press Regenerate to
-   rebuild one from the run files on disk at any time.
+   Profiles render as formatted text — headings, bold, lists — not raw
+   markdown. Profiles rebuild themselves after every run. Press
+   Regenerate to rebuild one from the run files on disk at any time.
 8. The Compare tab puts two models side by side: pick two models and
    it shows their latest score on each template they ran, plus their
    overall score and speed. Picking the same model twice shows a
    message instead of a duplicated table.
 9. Shortcuts: Ctrl+R runs, Ctrl+S saves the report, Esc cancels a
    run. The File menu has Save report and Quit; Help has About, which
-   shows the version (also in the title bar).
+   shows the version (also in the title bar), and Debug report, which
+   saves a scrubbed copy of the app's log (see below).
 
 ## Run it without the window (headless)
 
@@ -408,7 +410,7 @@ else you run. These are your own models on your own machine.
 
 - "Ollama is not running": press Start Ollama in the app, or start
   Ollama yourself, then press Refresh.
-- "could not reach Ollama — start it, then press Refresh": Ollama
+- "could not reach Ollama. Start it, then press Refresh": Ollama
   stopped answering. Start it again, press Refresh, and Run again.
 - "provider X did not answer": the provider could not be reached.
   Check the base URL on the Providers tab, or try Test connection.
@@ -435,6 +437,12 @@ else you run. These are your own models on your own machine.
   Tick a model that has the capability to run it.
 - Press Cancel any time to stop the run. Results so far stay in the table,
   and every finished template run is already saved.
+- Debug report: Help > Debug report saves a scrubbed report of the
+  app's recent log to the `logs` folder next to the app (one log file
+  per day, kept for 30 days). It holds the app's own log only — no
+  API keys and no model answers — so it is safe to send to someone
+  helping you. If the app crashes, it writes a crash report to the
+  same folder before it closes.
 
 ## Running the tests
 

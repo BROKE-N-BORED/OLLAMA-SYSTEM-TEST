@@ -1,5 +1,44 @@
 # Changelog
 
+## v11 (2026-11-13)
+
+UI redesign, part 1 (tasks R2, R4, R5, R8, R9, R10) — the first six
+tasks of the redesign list, highest priority first. No new templates.
+
+- Debug log layer (R2). The app that diagnoses Ollama dying now
+  keeps a log of its own: timestamped lines in `logs/ost-YYYY-MM-DD.log`
+  (one file per day, pruned after 30 days), a last-200 ring buffer in
+  memory, and a crash hook that writes a scrubbed crash report before
+  the app closes. Help > Debug report saves a scrubbed report of the
+  recent log — version, platform, whether Ollama answers, the ring
+  buffer, and the tail of today's log. Nothing secret ever reaches a
+  log or a report: saved keys are matched exactly and key-shaped
+  text (sk- keys, api_key/token assignments, Bearer headers) is
+  replaced with [key] before anything is written.
+- Profiles render as markdown (R4). The Profiles tab showed the raw
+  PROFILE.md file — headings as `#`, bold as `**`. It now renders
+  the markdown: headings, bold, and lists, the way the profile was
+  written to be read.
+- Removing a provider asks first (R5). One click used to delete a
+  provider, its API key, and all its saved models with no warning.
+  It now asks to confirm, defaulting to No — the same rule the run
+  deletion already followed.
+- Save report never overwrites (R8). The report stamp had minutes
+  only, so two saves in one minute wrote the same two files. The
+  stamp now has seconds, and a second save in the same second gets
+  -2, -3 — the same rule the run files already use. The CSV/HTML
+  export defaults got the seconds stamp too.
+- The pick lists lock during a run (R9). The buttons locked, but the
+  model and template lists stayed live — ticks could disagree with
+  what was running. Both lists now lock when a run starts and unlock
+  when it ends, whatever the reason it ends.
+- Em-dash sweep (R10). No em-dash remains in any visible string:
+  the missing-number placeholder is now "n/a", the status hints use
+  plain sentences, and the compare picker says "Pick a model". The
+  suite pins it with an AST scan of every string literal in the app
+  (docstrings and comments excluded — the rule is about what the
+  user sees).
+
 ## v10 (2026-11-13)
 
 Real speech clips (task T12) — the last open repo-audit task. No new

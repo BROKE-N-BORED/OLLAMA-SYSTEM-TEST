@@ -91,9 +91,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta
 
 try:
     from PySide6.QtCore import (
@@ -130,13 +132,13 @@ except ImportError:
         "This app needs PySide6 to open its window, and it is not installed.",
         file=sys.stderr,
     )
-    print("Run install.sh first — it installs PySide6 for you.", file=sys.stderr)
+    print("Run install.sh first. It installs PySide6 for you.", file=sys.stderr)
     sys.exit(1)
 
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "10"
+__version__ = "11"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -149,7 +151,7 @@ OLLAMA_DOWN_MESSAGE = "Ollama is not running. Start it first, then open this aga
 OLLAMA_DOWN_RUN_MESSAGE = "Ollama is not running. Press Start Ollama, then Run again."
 OLLAMA_DIED_MESSAGE = "Ollama stopped responding. Start Ollama, then press Refresh and Run again."
 UNREACHABLE = "could not reach Ollama"
-UNREACHABLE_HINT = "could not reach Ollama — start it, then press Refresh"
+UNREACHABLE_HINT = "could not reach Ollama. Start it, then press Refresh"
 START_OLLAMA_TIMEOUT_MSG = "Ollama could not be started. Run ollama serve in a terminal to see the error."
 START_OLLAMA_MISSING_MSG = "Ollama is not installed. Install it first, then try again."
 NO_MODELS_MESSAGE = "No models installed yet. Pull one with ollama pull, then press Refresh."
@@ -291,6 +293,188 @@ def ensure_media_dirs():
     folders already exist."""
     os.makedirs(get_images_dir(), exist_ok=True)
     os.makedirs(get_audio_dir(), exist_ok=True)
+
+
+# -- debug log layer (R2) ------------------------------------------------
+# The app that diagnoses Ollama dying keeps a log of its own:
+# timestamped lines in logs/ost-YYYY-MM-DD.log (one file per day,
+# pruned after 30 days), a last-200 ring buffer in memory, and a
+# scrubbed debug report on demand. Logging never crashes the app and
+# never writes a key: every line is scrubbed before it is stored or
+# reported.
+
+LOG_KEEP_DAYS = 30      # daily log files older than this are pruned
+LOG_RING_SIZE = 200     # lines kept in memory for the debug report
+LOG_TAIL_LINES = 100    # lines of today's log file in the debug report
+
+# Secret-shaped text is replaced with [key] before anything is logged
+# or reported. The patterns cover the shapes the app itself writes
+# (sk- keys, api_key/token assignments, Bearer headers) plus every key
+# actually saved in providers.json, matched exactly.
+_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)\S+"),
+    re.compile(r"(?i)(token\s*[:=]\s*)\S+"),
+    re.compile(r"(?i)(bearer\s+)\S+"),
+    re.compile(r"(?i)(authorization:\s*)\S+"),
+)
+
+
+def get_logs_dir():
+    return os.environ.get(
+        "OST_LOGS_DIR", os.path.join(APP_DIR, "logs")
+    )
+
+
+_LOG_RING = deque(maxlen=LOG_RING_SIZE)
+
+
+def _saved_keys():
+    """Every API key saved in providers.json, best effort. A missing
+    or broken file means no keys, never a crash."""
+    try:
+        providers, _warnings = load_providers()
+    except Exception:
+        return []
+    keys = []
+    for provider in providers:
+        key = provider.get("api_key")
+        if key:
+            keys.append(key)
+    return keys
+
+
+def scrub_text(text):
+    """Replace anything secret-shaped in text with [key]. Saved keys
+    are matched exactly first; the patterns catch the rest."""
+    if not text:
+        return text
+    for key in _saved_keys():
+        if len(key) >= 8:
+            text = text.replace(key, "[key]")
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(
+            lambda match: (
+                match.group(1) + "[key]" if match.lastindex else "[key]"
+            ),
+            text,
+        )
+    return text
+
+
+def log_event(message):
+    """One timestamped line to the ring buffer and today's log file.
+    Never raises: a logging failure must not break the run it logs."""
+    line = (
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+        f"{scrub_text(str(message))}"
+    )
+    _LOG_RING.append(line)
+    try:
+        folder = get_logs_dir()
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(
+            folder, f"ost-{datetime.now().strftime('%Y-%m-%d')}.log"
+        )
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+def prune_old_logs():
+    """Delete daily log files older than LOG_KEEP_DAYS. Best effort."""
+    try:
+        folder = get_logs_dir()
+        if not os.path.isdir(folder):
+            return
+        cutoff = datetime.now() - timedelta(days=LOG_KEEP_DAYS)
+        for name in os.listdir(folder):
+            if not (name.startswith("ost-") and name.endswith(".log")):
+                continue
+            try:
+                stamp = datetime.strptime(name[4:-4], "%Y-%m-%d")
+            except ValueError:
+                continue
+            if stamp < cutoff:
+                os.remove(os.path.join(folder, name))
+    except OSError:
+        pass
+
+
+def write_debug_report():
+    """Build a scrubbed debug report in logs/ and return its path.
+    Contents: version, platform, Python, whether Ollama answers, the
+    in-memory ring buffer, and the tail of today's log file. No keys,
+    no answers, no model output — only the app's own log."""
+    folder = get_logs_dir()
+    os.makedirs(folder, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    path = os.path.join(folder, f"debug-report-{stamp}.txt")
+    lines = [
+        f"OLLAMA SYSTEM TEST v{__version__} debug report",
+        f"Made: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"System: {platform.system()} {platform.release()} "
+        f"({platform.machine()})",
+        f"Python: {platform.python_version()}",
+    ]
+    try:
+        lines.append(
+            "Ollama: " + ("answering" if ollama_reachable() else "not answering")
+        )
+    except Exception:
+        lines.append("Ollama: check failed")
+    lines.append("")
+    lines.append("Recent events (newest last):")
+    if _LOG_RING:
+        lines.extend(_LOG_RING)
+    else:
+        lines.append("(no events logged yet)")
+    lines.append("")
+    lines.append("Today's log file (last lines):")
+    log_path = os.path.join(
+        folder, f"ost-{datetime.now().strftime('%Y-%m-%d')}.log"
+    )
+    try:
+        with open(log_path, encoding="utf-8") as handle:
+            tail = handle.readlines()[-LOG_TAIL_LINES:]
+        if tail:
+            lines.extend(line.rstrip("\n") for line in tail)
+        else:
+            lines.append("(no log lines yet)")
+    except OSError:
+        lines.append("(no log file yet)")
+    text = scrub_text("\n".join(lines) + "\n")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return path
+
+
+def _ost_excepthook(exc_type, exc_value, exc_tb):
+    """Crash hook: the traceback goes to the log and to a scrubbed
+    crash file, then the normal hook runs (the app still exits the
+    way it would have). KeyboardInterrupt is left alone."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    log_event("Crash:\n" + text)
+    try:
+        folder = get_logs_dir()
+        os.makedirs(folder, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        path = os.path.join(folder, f"crash-{stamp}.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(scrub_text(text))
+    except OSError:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def install_excepthook():
+    """Install the crash hook, once. Called from main()."""
+    if sys.excepthook is not _ost_excepthook:
+        sys.excepthook = _ost_excepthook
 
 
 # The dark theme (T14): dark backgrounds with light text throughout,
@@ -450,7 +634,7 @@ def ns_to_s(value_ns):
 
 def fmt_bytes(size):
     if size is None:
-        return "—"
+        return "n/a"
     if size >= 1_000_000_000:
         return f"{size / 1_000_000_000:.1f} GB"
     if size >= 1_000_000:
@@ -462,7 +646,7 @@ def fmt_bytes(size):
 
 def fmt_duration(seconds):
     if seconds is None:
-        return "—"
+        return "n/a"
     if seconds < 1:
         return f"{seconds * 1000:.0f} ms"
     return f"{seconds:.2f} s"
@@ -470,19 +654,19 @@ def fmt_duration(seconds):
 
 def fmt_toks(value):
     if value is None:
-        return "—"
+        return "n/a"
     return f"{value:.1f}"
 
 
 def fmt_score(value):
     if value is None:
-        return "—"
+        return "n/a"
     return f"{value:.0f}%"
 
 
 def fmt_tokens(count):
     if count is None:
-        return "—"
+        return "n/a"
     return f"{count:,}"
 
 
@@ -506,7 +690,7 @@ def estimate_cost(prompt_tokens, completion_tokens,
 def fmt_cost(value):
     """Dollars: 2 places for real money, 4 for fractions of a cent."""
     if value is None:
-        return "—"
+        return "n/a"
     if value == 0:
         return "$0.00"
     if value < 0.01:
@@ -1309,8 +1493,8 @@ def provider_test_connection(provider):
         return False, f"provider {name} answered, but not with JSON."
     models = data.get("data") if isinstance(data, dict) else None
     if isinstance(models, list):
-        return True, f"Connected — {name} answered, {len(models)} models listed."
-    return True, f"Connected — {name} answered."
+        return True, f"Connected: {name} answered, {len(models)} models listed."
+    return True, f"Connected: {name} answered."
 
 
 def provider_chat_once(provider, model_id, messages, num_predict,
@@ -2714,7 +2898,7 @@ def _not_run_suffix(count):
 def render_run_summary(run_data):
     """Plain-text summary of one run file, for the history view."""
     lines = [
-        f"{run_data.get('model', '?')} — {run_data.get('template_name', run_data.get('template', '?'))}",
+        f"{run_data.get('model', '?')}: {run_data.get('template_name', run_data.get('template', '?'))}",
         f"Run: {run_data.get('timestamp', '?')}",
         f"System: {run_data.get('system_id', '?')}",
         f"Provider: {run_data.get('provider', 'ollama')}",
@@ -2724,7 +2908,7 @@ def render_run_summary(run_data):
     if score is None and not_run:
         lines.append(
             f"Score: not run ({not_run} "
-            f"{'task' if not_run == 1 else 'tasks'} not run — "
+            f"{'task' if not_run == 1 else 'tasks'} not run: "
             "test file missing)"
         )
     elif score is None:
@@ -2935,7 +3119,7 @@ def build_profile(results_dir, model_slug):
         for name in strengths:
             lines.append(f"- {name}")
     else:
-        lines.append("None yet — no template at 80% or better.")
+        lines.append("None yet: no template at 80% or better.")
     lines.append("")
     lines.append("## Weaknesses")
     lines.append("")
@@ -2943,7 +3127,7 @@ def build_profile(results_dir, model_slug):
         for name in weaknesses:
             lines.append(f"- {name}")
     else:
-        lines.append("None yet — no template under 50%.")
+        lines.append("None yet: no template under 50%.")
     lines.append("")
     lines.append("## Verdict")
     lines.append("")
@@ -3040,7 +3224,7 @@ def render_text_report(results):
                 lines.append(
                     f"  {run.get('template_name', template_id)}: not run "
                     f"({not_run} {'task' if not_run == 1 else 'tasks'} "
-                    "not run — test file missing)"
+                    "not run: test file missing)"
                 )
             elif score is None and budget_stopped:
                 lines.append(
@@ -3064,7 +3248,7 @@ def render_text_report(results):
                 )
                 if budget_stopped:
                     line += (
-                        f" — time budget reached "
+                        f", time budget reached "
                         f"({budget_stopped} "
                         f"{'task' if budget_stopped == 1 else 'tasks'} stopped)"
                     )
@@ -3103,7 +3287,7 @@ def export_table(results):
     Columns are Model, Overall score, Avg decode tok/s, Status, then
     one column per template that any result ran (in the order the
     templates first appear). A model that did not run a template
-    shows "—" in that column. No answers and no API keys — only the
+    shows "n/a" in that column. No answers and no API keys — only the
     scores, speeds, and statuses the results table shows.
     """
     columns = ["Model", "Overall score", "Avg decode tok/s", "Status"]
@@ -3127,7 +3311,7 @@ def export_table(results):
             by_name[run.get("template_name", run.get("template", "?"))] = run
         for name in template_names:
             run = by_name.get(name)
-            row.append(template_score_text(run) if run is not None else "—")
+            row.append(template_score_text(run) if run is not None else "n/a")
         rows.append(row)
     return columns, rows
 
@@ -3153,7 +3337,7 @@ def render_export_html(results):
         "<html>",
         "<head>",
         '<meta charset="utf-8">',
-        "<title>OLLAMA SYSTEM TEST — results</title>",
+        "<title>OLLAMA SYSTEM TEST results</title>",
         "<style>",
         "body { font-family: sans-serif; }",
         "table { border-collapse: collapse; }",
@@ -3163,7 +3347,7 @@ def render_export_html(results):
         "</style>",
         "</head>",
         "<body>",
-        "<h1>OLLAMA SYSTEM TEST — results</h1>",
+        "<h1>OLLAMA SYSTEM TEST results</h1>",
         f"<p>Exported {html.escape(stamp)}.</p>",
         "<table>",
         "<tr>" + "".join(
@@ -4114,6 +4298,7 @@ class BenchWorker(QThread):
                 self.run_finished.emit("cancelled")
                 return
             except OllamaUnreachable as exc:
+                log_event(f"Ollama stopped responding during the run: {exc}")
                 result["status"] = f"failed: {exc}"
                 self.model_done.emit(label, result)
                 self.run_finished.emit("ollama_down")
@@ -4559,7 +4744,7 @@ class MainWindow(QMainWindow):
         self.delete_run_button = QPushButton("Delete run")
         self.delete_run_button.clicked.connect(self.delete_selected_run)
         self.delete_run_button.setEnabled(False)
-        self.store_size_label = QLabel("Results use —")
+        self.store_size_label = QLabel("Results use n/a")
         history_bottom.addWidget(self.delete_run_button)
         history_bottom.addWidget(self.store_size_label)
         history_bottom.addStretch()
@@ -4634,7 +4819,7 @@ class MainWindow(QMainWindow):
         providers_intro = QLabel(
             "Cloud providers, tested with the same templates as your local "
             "models. Providers and their API keys live in providers.json "
-            "next to the app — that file holds your keys, never share it "
+            "next to the app. That file holds your keys, never share it "
             "or upload it anywhere. Provider tests cost real API money; "
             "the details view shows the tokens and the cost."
         )
@@ -4771,7 +4956,7 @@ class MainWindow(QMainWindow):
 
     def _build_menu_bar(self):
         """A minimal menu bar: File (Save report, Quit), View (Dark
-        mode), Help (About)."""
+        mode), Help (About, Debug report)."""
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("File")
         self.save_report_action = QAction("Save report", self)
@@ -4792,6 +4977,9 @@ class MainWindow(QMainWindow):
         about_action = QAction("About", self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
+        debug_action = QAction("Debug report", self)
+        debug_action.triggered.connect(self.show_debug_report)
+        help_menu.addAction(debug_action)
 
     def _toggle_dark_mode(self, checked):
         """The View menu's Dark mode toggle: restyle the whole window
@@ -4832,6 +5020,18 @@ class MainWindow(QMainWindow):
     def show_about(self):
         QMessageBox.about(self, f"About {APP_NAME}", self.about_text())
 
+    def show_debug_report(self):
+        """Build the scrubbed debug report and tell the user where it
+        is. The report holds the app's own log only — no keys, no
+        answers, no model output."""
+        path = write_debug_report()
+        QMessageBox.information(
+            self, "Debug report",
+            f"Debug report saved:\n{path}\n\n"
+            "It holds the app's recent log only. No API keys and no "
+            "model answers. You can send it to someone helping you.",
+        )
+
     # -- models and templates --------------------------------------------
 
     def refresh_templates(self):
@@ -4853,7 +5053,7 @@ class MainWindow(QMainWindow):
                 label = f"{template['name']} (no scoring)"
             capability = template.get("capability", "text")
             if capability != "text":
-                label += f" — needs {capability.replace('_', ' ')}"
+                label += f" (needs {capability.replace('_', ' ')})"
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(
@@ -5103,6 +5303,11 @@ class MainWindow(QMainWindow):
         self.clear_button.setEnabled(False)
         self.select_all_templates_button.setEnabled(False)
         self.clear_templates_button.setEnabled(False)
+        # The pick lists lock too: ticks must not change under a run,
+        # or the screen disagrees with what ran. They unlock in
+        # on_run_finished, whatever the reason the run ends.
+        self.model_list.setEnabled(False)
+        self.template_list.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setValue(0)
         self.worker = BenchWorker(
@@ -5116,6 +5321,9 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(self.on_progress)
         self.worker.run_finished.connect(self.on_run_finished)
         self.worker.start()
+        log_event(
+            f"Run started: {len(targets)} models, {len(templates)} templates"
+        )
 
     def cancel_run(self):
         if self.worker is not None:
@@ -5151,7 +5359,7 @@ class MainWindow(QMainWindow):
                 )
             else:
                 lines.append(
-                    f"  {entry['label']}: no prices saved — cost unknown"
+                    f"  {entry['label']}: no prices saved: cost unknown"
                 )
         if estimate["unknown"]:
             lines.append("")
@@ -5164,8 +5372,8 @@ class MainWindow(QMainWindow):
         elif estimate["total"] > COST_CONFIRM_THRESHOLD_USD:
             lines.append("")
             lines.append(
-                f"Estimated total: about {fmt_cost(estimate['total'])} — "
-                f"over the {fmt_cost(COST_CONFIRM_THRESHOLD_USD)} "
+                f"Estimated total: about {fmt_cost(estimate['total'])}. "
+                f"That is over the {fmt_cost(COST_CONFIRM_THRESHOLD_USD)} "
                 "confirmation threshold."
             )
             needs_confirm = True
@@ -5177,7 +5385,7 @@ class MainWindow(QMainWindow):
             else:
                 cost_text = f"about {fmt_cost(estimate['total'])}"
             self.status_label.setText(
-                f"Estimated provider cost: {cost_text} — starting the run."
+                f"Estimated provider cost: {cost_text}. Starting the run."
             )
             return True
         lines.append("")
@@ -5247,6 +5455,7 @@ class MainWindow(QMainWindow):
         self.pull_bar.setRange(0, 100)
         self.pull_bar.setValue(100)
         self.pull_status.setText(f"Pulled {name}.")
+        log_event(f"Pulled {name}.")
         self.pull_input.clear()
         self.refresh_models()
 
@@ -5256,6 +5465,7 @@ class MainWindow(QMainWindow):
         self.pull_bar.setRange(0, 100)
         self.pull_bar.setValue(0)
         self.pull_status.setText(f"Pull failed: {message}")
+        log_event(f"Pull failed: {message}")
 
     def on_progress(self, text, percent):
         self.status_label.setText(text)
@@ -5265,8 +5475,8 @@ class MainWindow(QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.table.setItem(row, 0, QTableWidgetItem(name))
-        self.table.setItem(row, 1, NumericItem(None, "—"))
-        self.table.setItem(row, 2, NumericItem(None, "—"))
+        self.table.setItem(row, 1, NumericItem(None, "n/a"))
+        self.table.setItem(row, 2, NumericItem(None, "n/a"))
         self.table.setItem(row, 3, QTableWidgetItem("running"))
 
     def _row_for(self, name):
@@ -5296,12 +5506,15 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 3, QTableWidgetItem(result["status"]))
 
     def on_run_finished(self, reason):
+        log_event(f"Run finished: {reason}")
         self.run_button.setEnabled(True)
         self.refresh_button.setEnabled(True)
         self.select_all_button.setEnabled(True)
         self.clear_button.setEnabled(True)
         self.select_all_templates_button.setEnabled(True)
         self.clear_templates_button.setEnabled(True)
+        self.model_list.setEnabled(True)
+        self.template_list.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.save_button.setEnabled(bool(self.results))
         self.save_report_action.setEnabled(bool(self.results))
@@ -5348,7 +5561,7 @@ class MainWindow(QMainWindow):
         result = self.results.get(name)
         if result is None:
             return
-        lines = [f"{name} — overall {fmt_score(result.get('overall_score'))}, "
+        lines = [f"{name}: overall {fmt_score(result.get('overall_score'))}, "
                  f"avg {fmt_toks(result.get('avg_decode_tok_s'))} tok/s"]
         if result["status"] != "done":
             lines.append(result["status"])
@@ -5378,7 +5591,7 @@ class MainWindow(QMainWindow):
                 header = (
                     f"\n{run.get('template_name', template_id)}: not run "
                     f"({not_run} {'task' if not_run == 1 else 'tasks'} "
-                    "not run — test file missing)"
+                    "not run: test file missing)"
                 )
             elif score is None and budget_stopped:
                 header = (
@@ -5402,7 +5615,7 @@ class MainWindow(QMainWindow):
                 )
                 if budget_stopped:
                     header += (
-                        f" — time budget reached "
+                        f", time budget reached "
                         f"({budget_stopped} "
                         f"{'task' if budget_stopped == 1 else 'tasks'} stopped)"
                     )
@@ -5561,7 +5774,7 @@ class MainWindow(QMainWindow):
                     score_text += ", time budget reached"
             stamp = (run["timestamp"] or "").replace("T", " ")
             item = QListWidgetItem(
-                f"{run['system_id']} — {stamp} — {run['template_name']} ({score_text})"
+                f"{run['system_id']} | {stamp} | {run['template_name']} ({score_text})"
             )
             item.setData(Qt.UserRole, run["path"])
             self.history_list.addItem(item)
@@ -5607,7 +5820,7 @@ class MainWindow(QMainWindow):
         path = os.path.join(get_results_dir(), slug, "PROFILE.md")
         try:
             with open(path, encoding="utf-8") as handle:
-                self.profile_view.setPlainText(handle.read())
+                self.profile_view.setMarkdown(handle.read())
         except OSError:
             self.profile_view.setPlainText(
                 "No profile yet for this model. Press Regenerate to build one."
@@ -5647,7 +5860,7 @@ class MainWindow(QMainWindow):
                                (self.compare_model_b, current_b)):
             combo.blockSignals(True)
             combo.clear()
-            combo.addItem("— pick a model —", None)
+            combo.addItem("Pick a model", None)
             for slug in models:
                 combo.addItem(names[slug], slug)
             combo.blockSignals(False)
@@ -5697,7 +5910,7 @@ class MainWindow(QMainWindow):
                 (2, "score_b", "not_run_b", "missing_b"),
             ):
                 if row[missing_key]:
-                    text = "—"
+                    text = "n/a"
                     value = None
                 elif row[not_run_key]:
                     text = "not run"
@@ -5844,7 +6057,7 @@ class MainWindow(QMainWindow):
         for index, model in enumerate(self.editing_provider["models"]):
             text = model["id"]
             if model.get("display_name"):
-                text += f" — {model['display_name']}"
+                text += f" ({model['display_name']})"
             text += format_capabilities(model.get("capabilities") or ["text"])
             price_in = model.get("price_input_per_1m")
             price_out = model.get("price_output_per_1m")
@@ -5919,6 +6132,14 @@ class MainWindow(QMainWindow):
             self.provider_status.setText("Pick a provider to remove first.")
             return
         name = item.data(Qt.UserRole)
+        answer = QMessageBox.question(
+            self, "Remove this provider?",
+            f"Remove {name}? Its API key and all its saved models go "
+            "with it. This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
         providers, _warnings = load_providers()
         providers = [p for p in providers if p["name"] != name]
         save_providers(providers)
@@ -6098,9 +6319,17 @@ class MainWindow(QMainWindow):
             return
         folder = get_results_dir()
         os.makedirs(folder, exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
-        txt_path = os.path.join(folder, f"bench-results-{stamp}.txt")
-        json_path = os.path.join(folder, f"bench-results-{stamp}.json")
+        stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        base = f"bench-results-{stamp}"
+        txt_path = os.path.join(folder, base + ".txt")
+        json_path = os.path.join(folder, base + ".json")
+        # Never overwrites: two saves in the same second get -2, -3,
+        # the same rule the run files use.
+        suffix = 2
+        while os.path.exists(txt_path) or os.path.exists(json_path):
+            txt_path = os.path.join(folder, f"{base}-{suffix}.txt")
+            json_path = os.path.join(folder, f"{base}-{suffix}.json")
+            suffix += 1
         results = [self.results[name] for name in self.result_order]
         with open(txt_path, "w", encoding="utf-8") as handle:
             handle.write(render_text_report(results))
@@ -6113,12 +6342,12 @@ class MainWindow(QMainWindow):
         dialog. Plain message when there is nothing to export."""
         if not self.results:
             self.status_label.setText(
-                "Nothing to export yet — run a test first."
+                "Nothing to export yet. Run a test first."
             )
             return
         folder = get_results_dir()
         os.makedirs(folder, exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+        stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         default = os.path.join(folder, f"bench-results-{stamp}.csv")
         path, _selected = QFileDialog.getSaveFileName(
             self, "Export results as CSV", default, "CSV files (*.csv)"
@@ -6135,12 +6364,12 @@ class MainWindow(QMainWindow):
         dialog. Plain message when there is nothing to export."""
         if not self.results:
             self.status_label.setText(
-                "Nothing to export yet — run a test first."
+                "Nothing to export yet. Run a test first."
             )
             return
         folder = get_results_dir()
         os.makedirs(folder, exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+        stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         default = os.path.join(folder, f"bench-results-{stamp}.html")
         path, _selected = QFileDialog.getSaveFileName(
             self, "Export results as HTML", default, "HTML files (*.html)"
@@ -6198,7 +6427,7 @@ def resolve_headless_targets(names):
                 if known:
                     detail = "Models I know about: " + ", ".join(known)
                 else:
-                    detail = ("No models found — is Ollama running, and "
+                    detail = ("No models found. Is Ollama running, and "
                               "are any providers saved?")
                 return None, f"Model not found: {name}.\n{detail}"
             caps = screen_ollama_model(name, caps_cache)
@@ -6339,7 +6568,7 @@ def main():
     parser.add_argument(
         "--models",
         help="comma-separated models to test in headless mode, "
-        "e.g. qwen3:0.6b — a provider model is written "
+        "e.g. qwen3:0.6b. A provider model is written "
         "\"provider / model-id\"",
     )
     parser.add_argument(
@@ -6350,6 +6579,11 @@ def main():
     args = parser.parse_args()
     # The media folders exist from the first launch, window or not.
     ensure_media_dirs()
+    # The debug log starts with the app: old logs pruned, the crash
+    # hook installed, the launch itself logged.
+    prune_old_logs()
+    install_excepthook()
+    log_event(f"OLLAMA SYSTEM TEST v{__version__} started")
     if args.headless:
         sys.exit(run_headless(args))
     if args.models or args.templates:
