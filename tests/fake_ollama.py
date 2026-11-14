@@ -676,9 +676,37 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
                     # Record the pull the moment the client can see
                     # success, or the client's list refresh races us.
                     self.server.pulled.add(name)
-                time.sleep(0.15)
+                # pull_slow stretches the gaps so the suite can click
+                # Stop mid-pull; the normal gaps keep the other pull
+                # checks fast.
+                time.sleep(2.0 if self.server.pull_slow else 0.15)
         except (BrokenPipeError, ConnectionResetError):
             return
+
+    def do_DELETE(self):
+        """DELETE /api/delete (v15, R24): forget a pulled model, or
+        404 when the name is not one of ours."""
+        if self.path != "/api/delete":
+            self._send_json(404, {"error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except ValueError:
+            self._send_json(400, {"error": "bad json"})
+            return
+        name = payload.get("name", "")
+        if name in self.server.pulled:
+            self.server.pulled.discard(name)
+            self.send_response(200)
+            self.end_headers()
+            return
+        if name in MODELS or name == BROKEN_MODEL:
+            # A built-in model is not deletable here, but it exists —
+            # deleting it would not change the list, so say so.
+            self._send_json(400, {"error": "model is built in"})
+            return
+        self._send_json(404, {"error": "model not found"})
 
 
 class FakeOllamaServer(ThreadingHTTPServer):
@@ -689,6 +717,7 @@ class FakeOllamaServer(ThreadingHTTPServer):
         self.slow = False
         self.ps_empty = False
         self.pull_fail = False
+        self.pull_slow = False
         self.pulled = set()
         self.fail_next_generate = False
         self.close_mid_stream = False

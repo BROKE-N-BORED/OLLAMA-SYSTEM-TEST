@@ -1,8 +1,10 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v14 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v15 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1146 v13 checks are carried over; the v14 checks
-cover the bento results overview (R14), charts (R16), the providers
-tab rebuild (R17), and the settings window (R18).
+answers per model. All 1232 v14 checks are carried over; the v15 checks
+cover the pull upgrades (R19), the past-runs timeline scrub (R20), the
+accessibility presets (R21), focus-first keyboard navigation (R22),
+micro-interactions and teach by playing (R23), and the v3 review
+leftovers (R24).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -717,7 +719,7 @@ def main():
     # restore it when they finish), and the real method is restored
     # at the end of main().
     _suite_real_preview = app.MainWindow._show_run_preview
-    app.MainWindow._show_run_preview = lambda self, t, m: True
+    app.MainWindow._show_run_preview = lambda self, t, m, p=None: True
     app.RETRY_DELAY = 0.1
     server.generate_count = 0
     server.fail_next_generate = True
@@ -3391,7 +3393,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 14", app.__version__ == "14",
+    check("__version__ is 15", app.__version__ == "15",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3405,8 +3407,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v14",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v14",
+    check("title bar shows OLLAMA SYSTEM TEST v15",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v15",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4229,9 +4231,9 @@ def main():
         preview_calls8 = []
         preview_answer8 = {"answer": True}
 
-        def fake_preview8(self, targets, templates):
+        def fake_preview8(self, targets, templates, pairs=None):
             preview = app.build_run_preview(
-                targets, templates, app.get_results_dir())
+                targets, templates, app.get_results_dir(), pairs)
             preview_calls8.append(preview["text"])
             return preview_answer8["answer"]
 
@@ -4820,10 +4822,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v14",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v14",
+        check("title bar shows v15",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v15",
               window9.windowTitle())
-        check("__version__ is 14", app.__version__ == "14", app.__version__)
+        check("__version__ is 15", app.__version__ == "15", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -4958,7 +4960,8 @@ def main():
               and window9.dark_mode_action.text() == "Dark mode")
         check("dark mode starts off (light is the default)",
               not window9.dark_mode_action.isChecked()
-              and qt_app.styleSheet() == ""
+              and qt_app.styleSheet() == app.LIGHT_STYLESHEET
+              and "#2b2b2b" not in qt_app.styleSheet()
               and not window9.dark_mode)
         check("dark stylesheet covers lists, tables, text, tabs, "
               "buttons, combos, menus, progress",
@@ -4995,7 +4998,8 @@ def main():
         window9b.dark_mode_action.trigger()
         qt_app.processEvents()
         check("toggling back restores the light theme",
-              qt_app.styleSheet() == ""
+              qt_app.styleSheet() == app.LIGHT_STYLESHEET
+              and "#2b2b2b" not in qt_app.styleSheet()
               and not window9b.dark_mode_action.isChecked()
               and not window9b.dark_mode)
         check("light choice is saved to QSettings",
@@ -6102,6 +6106,7 @@ def main():
             key: settings14.value(key)
             for key in ("models_folder", "ollama_host",
                         "default_budget_minutes", "template_sets",
+                        "font_point_size", "reduce_motion",
                         "setup_dismissed", "setup_completed")
         }
         prior_env_host14 = app._ENV_OLLAMA_HOST
@@ -6121,6 +6126,8 @@ def main():
                 "ollama_host": "http://127.0.0.1:11434",
                 "default_budget_minutes": 45,
                 "template_sets": {"fake-smart:2b": ["math"]},
+                "font_point_size": 14,
+                "reduce_motion": True,
             }
             app.save_app_settings(saved14)
             check("settings round-trip",
@@ -6131,13 +6138,15 @@ def main():
                   app.load_app_settings()["template_sets"] == {},
                   str(app.load_app_settings()["template_sets"]))
             for key in ("models_folder", "ollama_host",
-                        "default_budget_minutes", "template_sets"):
+                        "default_budget_minutes", "template_sets",
+                        "font_point_size", "reduce_motion"):
                 settings14.remove(key)
             settings14.sync()
             check("settings with no keys read as defaults",
                   app.load_app_settings() == {
                       "models_folder": "", "ollama_host": "",
-                      "default_budget_minutes": 0, "template_sets": {}},
+                      "default_budget_minutes": 0, "template_sets": {},
+                      "font_point_size": 0, "reduce_motion": False},
                   str(app.load_app_settings()))
             # The budget spin starts from the saved default.
             app.save_app_settings({
@@ -6267,12 +6276,17 @@ def main():
                 check("compare glance hides for the same model twice",
                       not window14.compare_tiles.isVisible()
                       and window14.compare_chart.rows == [])
-                # R17: the rebuilt Providers tab.
+                # R17: the rebuilt Providers tab. The group boxes are
+                # searched on the Providers tab page only — the
+                # window holds a third group box now (the Models
+                # tab's try-it box, v15).
                 window14.tabs.setCurrentIndex(window14.TAB_PROVIDERS)
                 qt_app.processEvents()
+                providers_page14 = window14.tabs.widget(
+                    window14.TAB_PROVIDERS)
                 group_titles14 = sorted(
                     g.title() for g in
-                    window14.findChildren(QGroupBox14))
+                    providers_page14.findChildren(QGroupBox14))
                 check("providers tab has Connection and Models sections",
                       group_titles14 == ["Connection",
                                         "Models on this provider"],
@@ -6370,7 +6384,12 @@ def main():
                           "models_folder": "/tmp/new-models",
                           "ollama_host": "http://127.0.0.1:11555",
                           "default_budget_minutes": 30,
-                          "template_sets": {"fake-smart:2b": ["math"]}},
+                          "template_sets": {"fake-smart:2b": ["math"]},
+                          # v15: the dialog also returns the font
+                          # size (untouched here, so the current
+                          # size) and the motion switch (off).
+                          "font_point_size": dialog14.font_spin.value(),
+                          "reduce_motion": False},
                       str(dialog14.result_values))
                 dialog14.close()
                 app._ENV_OLLAMA_HOST = "http://env-host:11434"
@@ -6563,6 +6582,696 @@ def main():
     finally:
         pserver14.shutdown()
         pserver14.server_close()
+
+    # ---------- v15: pull upgrades (R19), timeline scrub (R20),
+    # accessibility (R21), keyboard navigation (R22),
+    # micro-interactions (R23), v3 leftovers (R24) ----------
+    # Unit checks: the re-run helpers, the template preview text,
+    # the run headline, and the focus-ring stylesheets.
+    templates15, _warnings15 = app.load_templates()
+    by_id15 = {t["id"]: t for t in templates15}
+    math15 = by_id15["math"]
+    coding15 = by_id15["coding"]
+    speed15 = by_id15["speed"]
+    target_a15 = {"label": "a:1b", "kind": "ollama"}
+    target_b15 = {"label": "b:1b", "kind": "ollama"}
+    targets15 = [target_a15, target_b15]
+
+    def pairs15(failed):
+        return [(t["label"], x["id"]) for t, x in failed]
+
+    results15a = {
+        "a:1b": {"name": "a:1b", "status": "done", "templates": {
+            "math": {"template_score": 80.0, "total": 5},
+            "coding": {"template_score": None, "total": 0}}},
+    }
+    failed15a = app.failed_run_pairs(
+        results15a, targets15, [math15, coding15])
+    check("failed pairs: unscored with no tasks run, and a missing model",
+          pairs15(failed15a)
+          == [("a:1b", "coding"), ("b:1b", "math"), ("b:1b", "coding")],
+          str(pairs15(failed15a)))
+    failed15b = app.failed_run_pairs(
+        {"a:1b": {"name": "a:1b", "status": "failed: model exploded",
+                  "templates": {}}},
+        [target_a15], [math15, coding15])
+    check("failed pairs: a failed model fails every pair",
+          pairs15(failed15b) == [("a:1b", "math"), ("a:1b", "coding")],
+          str(pairs15(failed15b)))
+    failed15c = app.failed_run_pairs(
+        {"a:1b": {"name": "a:1b", "status": "done", "templates": {
+            "math": {"skipped": "not eligible"},
+            "coding": {"template_score": 60.0, "total": 5},
+            "speed": {"template_score": None, "total": 5}}}},
+        [target_a15], [math15, coding15, speed15])
+    check("failed pairs: skipped and unscored-but-run pairs are not failures",
+          pairs15(failed15c) == [],
+          str(pairs15(failed15c)))
+    failed15d = app.failed_run_pairs(
+        {"a:1b": {"name": "a:1b", "status": "done", "templates": {
+            "math": {"template_score": None, "total": 0,
+                     "time_budget_reached": True},
+            "coding": {"template_score": 60.0, "total": 5}}}},
+        [target_a15], [math15, coding15])
+    check("failed pairs: a budget-stopped template fails",
+          pairs15(failed15d) == [("a:1b", "math")],
+          str(pairs15(failed15d)))
+    failed15e = app.failed_run_pairs(
+        results15a, targets15, [math15, coding15],
+        pairs={("a:1b", "math"), ("b:1b", "coding")})
+    check("failed pairs: a pairs filter only considers its own pairs",
+          pairs15(failed15e) == [("b:1b", "coding")],
+          str(pairs15(failed15e)))
+    steps15a = app.count_run_steps(
+        [target_a15], [math15, coding15], pairs={("a:1b", "coding")})
+    check("run steps count only the pairs in a re-run",
+          steps15a == 6, str(steps15a))
+    steps15b = app.count_run_steps(
+        targets15, [math15, coding15], pairs={("a:1b", "math")})
+    check("run steps skip a target with no pairs in a re-run",
+          steps15b == 6, str(steps15b))
+    provider_target15 = {
+        "label": "p15 / m15", "kind": "provider",
+        "capabilities": ["text"],
+        "price_input_per_1m": 1.0, "price_output_per_1m": 2.0,
+    }
+    cost15 = app.estimate_run_cost(
+        [provider_target15], [math15, coding15],
+        pairs={("p15 / m15", "coding")})
+    cost15_full = app.estimate_run_cost(
+        [provider_target15], [math15, coding15])
+    check("run cost counts only the pairs in a re-run",
+          cost15["per_model"][0]["prompt_tokens"]
+          < cost15_full["per_model"][0]["prompt_tokens"]
+          and len(cost15["per_model"]) == 1,
+          str(cost15["per_model"]))
+    cost15_none = app.estimate_run_cost(
+        [provider_target15], [math15, coding15],
+        pairs={("someone-else", "math")})
+    check("run cost skips a provider target with no pairs",
+          cost15_none["per_model"] == [],
+          str(cost15_none["per_model"]))
+    preview15 = app.build_run_preview(
+        [target_a15], [math15, coding15],
+        os.path.join(SCRATCH, "no-results15"),
+        pairs={("a:1b", "math"), ("a:1b", "coding")})
+    check("re-run preview names the failed pairs",
+          preview15["text"].startswith(
+              "Re-running 2 failed pairs (1 model), 11 steps in total."),
+          preview15["text"].splitlines()[0] if preview15["text"] else "")
+    check("re-run preview counts only the paired steps",
+          preview15["total_steps"] == 11,
+          str(preview15["total_steps"]))
+    math_preview15 = app.render_template_preview(math15)
+    check("template preview names the tasks",
+          "apples" in math_preview15 and "train" in math_preview15,
+          math_preview15[:200])
+    check("template preview shows the expected answers",
+          "Expected: 21" in math_preview15,
+          math_preview15[:200])
+    multi_preview15 = app.render_template_preview(by_id15["multi_turn"])
+    check("template preview shows chat turns and the first prompt",
+          "2 turns" in multi_preview15 and "BANANA" in multi_preview15,
+          multi_preview15[:300])
+    vision_preview15 = app.render_template_preview(by_id15["vision"])
+    check("template preview names non-generate task kinds",
+          "(vision)" in vision_preview15,
+          vision_preview15[:300])
+    headline15 = app.format_run_headline({
+        "timestamp": "2026-11-13T10:00:00", "template_name": "Math",
+        "score": 80.0, "passed": 4, "total": 5, "speed": 20.0})
+    check("run headline names date, score and speed",
+          headline15 == "2026-11-13 10:00:00 - Math: 80% (4/5) at 20.0 tok/s",
+          headline15)
+    headline15b = app.format_run_headline({
+        "timestamp": "2026-11-13T10:00:00", "template_name": "Speed",
+        "score": None, "passed": None, "total": None, "speed": None})
+    check("run headline for an unscored run says so",
+          headline15b == "2026-11-13 10:00:00 - Speed: no scoring",
+          headline15b)
+    check("light stylesheet has a visible focus ring",
+          ":focus" in app.LIGHT_STYLESHEET
+          and "2px solid" in app.LIGHT_STYLESHEET,
+          app.LIGHT_STYLESHEET[:200])
+    check("dark stylesheet has a visible focus ring",
+          ":focus" in app.DARK_STYLESHEET
+          and "#7db8e8" in app.DARK_STYLESHEET,
+          app.DARK_STYLESHEET[-200:])
+    unit15 = os.path.join(SCRATCH, "results15-unit")
+    unit_dir15 = os.path.join(unit15, "fake-smart-2b", "sys1")
+    os.makedirs(unit_dir15, exist_ok=True)
+    with open(os.path.join(unit_dir15, "2026-11-13T10-00-00-math.json"),
+              "w", encoding="utf-8") as handle15:
+        json.dump({"timestamp": "2026-11-13T10:00:00", "template": "math",
+                   "template_name": "Math", "template_score": 80.0,
+                   "passed": 4, "total": 5, "avg_decode_tok_s": 20.0},
+                  handle15)
+    runs15 = app.list_history_runs(unit15, "fake-smart-2b")
+    check("history runs carry the decode speed",
+          len(runs15) == 1 and runs15[0]["speed"] == 20.0,
+          str(runs15))
+
+    # GUI checks. The settings keys live in the real QSettings, so
+    # the prior values are saved here and restored in the finally
+    # below, leaving no state behind — including the font size.
+    from PySide6.QtCore import QSettings as QSettings15
+    from PySide6.QtTest import QTest as QTest15
+    settings15 = QSettings15("BrokeNBored", app.APP_NAME)
+    prior15 = {
+        key: settings15.value(key)
+        for key in ("models_folder", "ollama_host",
+                    "default_budget_minutes", "template_sets",
+                    "font_point_size", "reduce_motion",
+                    "setup_dismissed", "setup_completed")
+    }
+    prior_host15 = os.environ.get("OLLAMA_HOST")
+    prior_results15 = os.environ.get("OST_RESULTS_DIR")
+    prior_providers15 = os.environ.get("OST_PROVIDERS_FILE")
+    prior_caps15 = os.environ.get("OST_CAPABILITIES_FILE")
+    prior_font15 = qt_app.font().pointSize()
+    # Start clean: no saved font size, no reduced motion, checklist
+    # neither dismissed nor completed, no usual template sets.
+    app.save_app_settings({"models_folder": "", "ollama_host": "",
+                           "default_budget_minutes": 0, "template_sets": {},
+                           "font_point_size": 0, "reduce_motion": False})
+    settings15.remove("setup_dismissed")
+    settings15.remove("setup_completed")
+    settings15.sync()
+    results15 = os.path.join(SCRATCH, "results15")
+    os.makedirs(results15, exist_ok=True)
+    os.environ["OST_RESULTS_DIR"] = results15
+    os.environ["OST_PROVIDERS_FILE"] = os.path.join(
+        SCRATCH, "providers15.json")
+    os.environ["OST_CAPABILITIES_FILE"] = os.path.join(
+        SCRATCH, "capabilities15.json")
+    server15, _t15 = fake_ollama.start_server()
+    host15, port15 = server15.server_address
+    ollama_url15 = f"http://{host15}:{port15}"
+    os.environ["OLLAMA_HOST"] = ollama_url15
+    window15 = app.MainWindow()
+    window15.show()
+    wait_until(lambda: window15.model_list.count() == 4,
+               timeout=10, app=qt_app)
+    try:
+        # R23: the first-run hint shows while no run exists, and the
+        # checklist is up on a first boot.
+        check("first-run hint shows with no runs",
+              window15.first_run_hint.isVisible())
+        check("setup checklist shows on a first boot",
+              window15.checklist_frame.isVisible())
+        # R21: the Settings accessibility section. The preset sets
+        # the spin to the startup size plus three and applies it
+        # live; Cancel puts the opening size back.
+        default_font15 = app.default_font_point_size()
+        dialog15 = app.SettingsDialog(app.load_app_settings(), window15)
+        check("settings font spin starts at the current size",
+              dialog15.font_spin.value() == default_font15,
+              str(dialog15.font_spin.value()))
+        dialog15.bigger_text_button.click()
+        qt_app.processEvents()
+        check("bigger-text preset sets the spin to default plus three",
+              dialog15.font_spin.value()
+              == min(20, default_font15 + app.FONT_PRESET_BONUS_PT),
+              str(dialog15.font_spin.value()))
+        check("bigger-text preset applies the font live",
+              qt_app.font().pointSize()
+              == min(20, default_font15 + app.FONT_PRESET_BONUS_PT),
+              str(qt_app.font().pointSize()))
+        dialog15.reject()
+        qt_app.processEvents()
+        check("cancelling Settings puts the font size back",
+              qt_app.font().pointSize() == default_font15,
+              str(qt_app.font().pointSize()))
+        dialog15b = app.SettingsDialog(app.load_app_settings(), window15)
+        dialog15b.font_spin.setValue(14)
+        dialog15b.reduce_motion_check.setChecked(True)
+        dialog15b.accept()
+        check("accepting Settings returns the font size and motion",
+              dialog15b.result_values["font_point_size"] == 14
+              and dialog15b.result_values["reduce_motion"] is True,
+              str(dialog15b.result_values))
+        values15 = dict(dialog15b.result_values)
+        # _apply_settings applies the Ollama address too, and the
+        # dialog's empty address would drop the fake server's — hand
+        # it the fake address so the window keeps talking to it.
+        values15["ollama_host"] = ollama_url15
+        window15._apply_settings(values15)
+        check("applying Settings sets the font size",
+              qt_app.font().pointSize() == 14,
+              str(qt_app.font().pointSize()))
+        check("applying Settings sets reduced motion",
+              window15._reduce_motion is True)
+        window15._reduce_motion = False
+        app.apply_font_size(0)
+        # R21: the Settings fields scroll at bigger text sizes — the
+        # dialog's content is taller than the dialog at 20 pt, and
+        # no explanation label may be clipped. The no-clip test is
+        # height against heightForWidth at the label's own width:
+        # sizeHint overstates a wrapped label's height, because it
+        # is computed at a narrower width than the label gets.
+        from PySide6.QtWidgets import QScrollArea as QScrollArea15
+        from PySide6.QtWidgets import QDialogButtonBox as QDialogButtonBox15
+        app.apply_font_size(20)
+        dialog15c = app.SettingsDialog(
+            app.load_app_settings(), window15)
+        dialog15c.show()
+        for _ in range(10):
+            qt_app.processEvents()
+        scroll15 = dialog15c.findChild(QScrollArea15)
+        check("settings fields live in a scroll area",
+              scroll15 is not None)
+        clipped15 = [
+            label.text()[:30]
+            for label in dialog15c.findChildren(QLabel)
+            if label.wordWrap()
+            and label.height() < label.heightForWidth(label.width())]
+        check("no settings label is clipped at 20 pt text",
+              clipped15 == [], str(clipped15))
+        buttons15 = dialog15c.findChild(QDialogButtonBox15)
+        check("settings Save stays visible at 20 pt text",
+              buttons15 is not None
+              and buttons15.button(
+                  QDialogButtonBox15.Ok).isVisibleTo(dialog15c))
+        dialog15c.close()
+        qt_app.processEvents()
+        # A modeless dialog closed under offscreen leaves the
+        # application with no active window — and with no active
+        # window, setFocus stops emitting focusChanged, so the
+        # focus memory below would go deaf. A real window manager
+        # re-activates the window when a dialog closes; do the
+        # same here before the focus checks run.
+        window15.activateWindow()
+        qt_app.processEvents()
+        app.apply_font_size(0)
+        # R21: the checklist's Bigger text button — one tap, saved
+        # right away.
+        window15.checklist_bigger_text.click()
+        qt_app.processEvents()
+        check("checklist Bigger text applies the preset font",
+              qt_app.font().pointSize()
+              == min(20, default_font15 + app.FONT_PRESET_BONUS_PT),
+              str(qt_app.font().pointSize()))
+        check("checklist Bigger text saves the preset size",
+              app.load_app_settings()["font_point_size"]
+              == min(20, default_font15 + app.FONT_PRESET_BONUS_PT),
+              str(app.load_app_settings()["font_point_size"]))
+        app.save_app_settings({"models_folder": "", "ollama_host": "",
+                               "default_budget_minutes": 0,
+                               "template_sets": {}, "font_point_size": 0,
+                               "reduce_motion": False})
+        app.apply_font_size(0)
+        # R22: Tab in visual order on the setup tab, and focus that
+        # comes back where it was after a tab change.
+        window15.tabs.setCurrentIndex(window15.TAB_SETUP)
+        window15.model_filter.setFocus()
+        qt_app.processEvents()
+        QTest15.keyClick(window15.model_filter, Qt.Key_Tab)
+        qt_app.processEvents()
+        check("Tab moves from the model filter to the model list",
+              window15.focusWidget() is window15.model_list)
+        QTest15.keyClick(window15.focusWidget(), Qt.Key_Tab)
+        qt_app.processEvents()
+        check("Tab moves from the model list to Select all",
+              window15.focusWidget() is window15.select_all_button)
+        window15.template_filter.setFocus()
+        qt_app.processEvents()
+        window15.tabs.setCurrentIndex(window15.TAB_RUN)
+        qt_app.processEvents()
+        check("a fresh tab focuses its most likely first action",
+              window15.focusWidget() is window15.table)
+        window15.tabs.setCurrentIndex(window15.TAB_SETUP)
+        qt_app.processEvents()
+        check("focus returns where it was on the setup tab",
+              window15.focusWidget() is window15.template_filter)
+        check("Run has its Ctrl+R shortcut",
+              window15.run_shortcut.key().toString() == "Ctrl+R",
+              window15.run_shortcut.key().toString())
+        check("Cancel has its Escape shortcut",
+              window15.cancel_shortcut.key().toString() == "Esc",
+              window15.cancel_shortcut.key().toString())
+        # R23: tick feedback — every tick says what is picked now.
+        set_checked_list(window15.model_list, {"fake-smart:2b"})
+        qt_app.processEvents()
+        check("ticking a model says what is picked",
+              window15.status_label.text() == "1 model, 0 templates picked.",
+              window15.status_label.text())
+        set_checked_templates(window15, {"math"})
+        qt_app.processEvents()
+        check("ticking a template updates the picked counts",
+              window15.status_label.text() == "1 model, 1 template picked.",
+              window15.status_label.text())
+        window15.clear_models()
+        window15.clear_templates()
+        qt_app.processEvents()
+        check("clearing the ticks says nothing is picked",
+              window15.status_label.text() == "0 models, 0 templates picked.",
+              window15.status_label.text())
+        # R24: the template preview — read a template's tasks first.
+        # The dialog is opened through the seam, with exec stubbed so
+        # no modal blocks the suite.
+        preview_dialog15 = app.TemplatePreviewDialog(window15, math15)
+        check("template preview dialog shows the tasks",
+              "apples" in preview_dialog15.text_view.toPlainText()
+              and "Expected: 21" in preview_dialog15.text_view.toPlainText())
+        real_exec15 = app.TemplatePreviewDialog.exec
+        exec_calls15 = []
+        app.TemplatePreviewDialog.exec = (
+            lambda self: exec_calls15.append(True) or QDialog.Rejected)
+        try:
+            for row15 in range(window15.template_list.count()):
+                if (window15.template_list.item(row15).data(Qt.UserRole)
+                        == "math"):
+                    window15.template_list.setCurrentRow(row15)
+                    break
+            window15._preview_template()
+            check("Preview opens the template preview",
+                  len(exec_calls15) == 1, str(len(exec_calls15)))
+            window15.template_list.setCurrentRow(-1)
+            window15.template_list.clearSelection()
+            window15._preview_template()
+            check("Preview with no selection opens nothing",
+                  len(exec_calls15) == 1, str(len(exec_calls15)))
+        finally:
+            app.TemplatePreviewDialog.exec = real_exec15
+        # R20: the timeline scrub — three fabricated runs for the
+        # smart model, newest first.
+        scrub_dir15 = os.path.join(
+            results15, "fake-smart-2b", window15.sys_id)
+        os.makedirs(scrub_dir15, exist_ok=True)
+        for stamp15, score15 in (("2026-11-13T10:00:00", 80.0),
+                                 ("2026-11-12T10:00:00", 60.0),
+                                 ("2026-11-11T10:00:00", 40.0)):
+            with open(os.path.join(
+                    scrub_dir15,
+                    f"{stamp15.replace(':', '-')}-math.json"),
+                    "w", encoding="utf-8") as handle15:
+                json.dump({"timestamp": stamp15, "template": "math",
+                           "template_name": "Math",
+                           "template_score": score15,
+                           "passed": int(score15 // 20), "total": 5,
+                           "avg_decode_tok_s": 20.0}, handle15)
+        window15.refresh_history()
+        qt_app.processEvents()
+        for row15 in range(window15.history_model_combo.count()):
+            if (window15.history_model_combo.itemData(row15)
+                    == "fake-smart-2b"):
+                window15.history_model_combo.setCurrentIndex(row15)
+                break
+        window15.on_history_model_changed()
+        qt_app.processEvents()
+        check("scrub slider is enabled with three runs",
+              window15.history_scrub_slider.isEnabled())
+        check("scrub slider spans the runs",
+              window15.history_scrub_slider.maximum() == 2,
+              str(window15.history_scrub_slider.maximum()))
+        check("scrub readout names the newest run",
+              "80%" in window15.history_scrub_label.text(),
+              window15.history_scrub_label.text())
+        check("hovering a run previews it",
+              "80%" in window15.history_list.item(0).toolTip(),
+              window15.history_list.item(0).toolTip())
+        detail_before15 = window15.history_view.toPlainText()
+        window15.history_scrub_slider.setValue(2)
+        qt_app.processEvents()
+        check("scrubbing to the oldest run updates the readout",
+              "40%" in window15.history_scrub_label.text(),
+              window15.history_scrub_label.text())
+        check("scrubbing moves the highlight",
+              window15.history_list.currentRow() == 2,
+              str(window15.history_list.currentRow()))
+        check("scrubbing does not open the run",
+              window15.history_view.toPlainText() == detail_before15)
+        window15.history_list.setCurrentRow(1)
+        qt_app.processEvents()
+        check("picking a run moves the slider to match",
+              window15.history_scrub_slider.value() == 1
+              and "60%" in window15.history_scrub_label.text(),
+              window15.history_scrub_label.text())
+        # R24: try one model — ask one question, no run.
+        window15.tabs.setCurrentIndex(window15.TAB_MODELS)
+        window15.tryit_model_combo.setCurrentText("fake-smart:2b")
+        window15.tryit_input.setText("What is 2 plus 2?")
+        window15.tryit_ask_button.click()
+        answered15 = wait_until(
+            lambda: "Asking" not in window15.tryit_answer.toPlainText(),
+            timeout=15, app=qt_app)
+        check("try-it answers the question",
+              answered15
+              and len(window15.tryit_answer.toPlainText()) > 0,
+              window15.tryit_answer.toPlainText()[:120])
+        window15.tryit_input.setText("")
+        window15.tryit_ask_button.click()
+        qt_app.processEvents()
+        check("try-it with no question says so",
+              window15.tryit_answer.toPlainText()
+              == "Type a question first.",
+              window15.tryit_answer.toPlainText())
+        # R19: pull upgrades, against a slow pull server — the gaps
+        # between pull events stretch to 2 s, so the suite can stop
+        # a pull mid-download.
+        server15.pull_slow = True
+        window15.pull_input.setText("slow-a:1b")
+        window15.pull_button.click()
+        qt_app.processEvents()
+        check("Pull stays enabled while a pull runs",
+              window15.pull_button.isEnabled())
+        check("Stop pull is enabled while a pull runs",
+              window15.pull_cancel_button.isEnabled())
+        speed_shown15 = wait_until(
+            lambda: "MB/s" in window15.pull_status.text(),
+            timeout=12, app=qt_app)
+        check("pull progress shows the speed",
+              speed_shown15, window15.pull_status.text())
+        check("pull progress shows the time left",
+              "left" in window15.pull_status.text(),
+              window15.pull_status.text())
+        window15.pull_cancel_button.click()
+        stopped15 = wait_until(
+            lambda: "stopped at" in window15.pull_status.text(),
+            timeout=10, app=qt_app)
+        check("stopping a pull names how far it got",
+              stopped15, window15.pull_status.text())
+        check("a stopped pull keeps the bar where it stopped",
+              window15.pull_bar.value() > 0,
+              str(window15.pull_bar.value()))
+        check("a stopped pull puts its name back in the box",
+              window15.pull_input.text() == "slow-a:1b",
+              window15.pull_input.text())
+        check("a stopped pull is recorded for a resume",
+              "slow-a:1b" in window15.pull_interrupted)
+        # The queue: two pulls behind a slow one, a duplicate refused,
+        # one removed, and the next one starting when the running
+        # pull is stopped.
+        window15.pull_input.setText("slow-b:1b")
+        window15.pull_button.click()
+        window15.pull_input.setText("queued-a:1b")
+        window15.pull_button.click()
+        qt_app.processEvents()
+        check("a pull behind a running pull is queued",
+              window15.pull_queue_list.count() == 1
+              and window15.pull_queue_list.isVisible(),
+              str(window15.pull_queue_list.count()))
+        window15.pull_input.setText("queued-a:1b")
+        window15.pull_button.click()
+        # No processEvents here: the refusal message shares the pull
+        # status line with the running pull's progress, and the next
+        # progress event would overwrite it before the check reads
+        # it. The click sets the message synchronously.
+        check("queueing the same model twice is refused",
+              "already pulling or queued" in window15.pull_status.text()
+              and window15.pull_queue_list.count() == 1,
+              window15.pull_status.text())
+        window15.pull_input.setText("queued-b:1b")
+        window15.pull_button.click()
+        qt_app.processEvents()
+        check("a second pull queues behind the first",
+              window15.pull_queue_list.count() == 2,
+              str(window15.pull_queue_list.count()))
+        window15.pull_queue_list.setCurrentRow(1)
+        window15.pull_queue_remove_button.click()
+        qt_app.processEvents()
+        check("a queued pull can be removed",
+              window15.pull_queue_list.count() == 1,
+              str(window15.pull_queue_list.count()))
+        window15.pull_cancel_button.click()
+        queued_started15 = wait_until(
+            lambda: window15.pull_worker is not None
+            and window15.pull_worker.name == "queued-a:1b",
+            timeout=10, app=qt_app)
+        check("stopping a pull starts the next queued pull",
+              queued_started15,
+              window15.pull_worker.name
+              if window15.pull_worker is not None else "no worker")
+        window15.pull_cancel_button.click()
+        queue_drained15 = wait_until(
+            lambda: window15.pull_worker is None,
+            timeout=10, app=qt_app)
+        check("the queue drains when its pull is stopped",
+              queue_drained15
+              and window15.pull_queue_list.count() == 0)
+        # Resume: the stopped pull picks up where it left off.
+        server15.pull_slow = False
+        window15.pull_input.setText("slow-a:1b")
+        window15.pull_button.click()
+        qt_app.processEvents()
+        check("re-pulling a stopped pull resumes it",
+              window15._pull_resuming is True)
+        resumed15 = wait_until(
+            lambda: "Pulled slow-a:1b." in window15.pull_status.text(),
+            timeout=10, app=qt_app)
+        check("a resumed pull completes",
+              resumed15, window15.pull_status.text())
+        check("a completed resume clears the interrupted record",
+              "slow-a:1b" not in window15.pull_interrupted)
+        # R24: delete a model — Yes removes it, No leaves it.
+        window15.pull_input.setText("del-me:1b")
+        window15.pull_button.click()
+        pulled15 = wait_until(
+            lambda: "Pulled del-me:1b." in window15.pull_status.text(),
+            timeout=10, app=qt_app)
+        check("a model pulls for the delete test",
+              pulled15, window15.pull_status.text())
+
+        def find_installed15(name):
+            for row15 in range(window15.installed_list.count()):
+                item15 = window15.installed_list.item(row15)
+                if item15.data(Qt.UserRole) == name:
+                    return row15
+            return None
+
+        row15 = find_installed15("del-me:1b")
+        check("the pulled model is in the installed list",
+              row15 is not None)
+        if row15 is not None:
+            window15.installed_list.setCurrentRow(row15)
+            qt_app.processEvents()
+            check("Delete is enabled with a model selected",
+                  window15.delete_model_button.isEnabled())
+            # The suite-wide question stub answers Yes.
+            window15.delete_model_button.click()
+            deleted15 = wait_until(
+                lambda: "del-me:1b" not in server15.pulled,
+                timeout=10, app=qt_app)
+            check("deleting a model removes it from Ollama",
+                  deleted15)
+            check("deleting a model says so",
+                  window15.status_label.text() == "Deleted del-me:1b.",
+                  window15.status_label.text())
+            check("a deleted model leaves the installed list",
+                  find_installed15("del-me:1b") is None)
+        window15.pull_input.setText("del-no:1b")
+        window15.pull_button.click()
+        wait_until(lambda: "Pulled del-no:1b." in window15.pull_status.text(),
+                   timeout=10, app=qt_app)
+        row15 = find_installed15("del-no:1b")
+        real_question15 = QMessageBox.question
+        QMessageBox.question = lambda *a, **k: QMessageBox.No
+        try:
+            if row15 is not None:
+                window15.installed_list.setCurrentRow(row15)
+                qt_app.processEvents()
+                window15.delete_model_button.click()
+                qt_app.processEvents()
+        finally:
+            QMessageBox.question = real_question15
+        check("answering No keeps the model",
+              "del-no:1b" in server15.pulled
+              and find_installed15("del-no:1b") is not None)
+        # R24: re-run failed only — a real run with the broken model,
+        # then a re-run that only re-runs what failed. The preview
+        # seam records the pairs each run was asked for.
+        preview_calls15 = []
+        real_preview15 = app.MainWindow._show_run_preview
+
+        def fake_preview15(self, targets, templates, pairs=None):
+            preview_calls15.append(
+                (sorted(t["label"] for t in targets),
+                 sorted(t["id"] for t in templates),
+                 None if pairs is None else sorted(pairs)))
+            return True
+
+        app.MainWindow._show_run_preview = fake_preview15
+        try:
+            set_checked_list(window15.model_list,
+                             {"fake-smart:2b", "fake-broken:1b"})
+            set_checked_templates(window15, {"math", "coding"})
+            window15.run_button.click()
+            run_done15 = wait_until(
+                lambda: window15.worker is None
+                and window15.save_button.isEnabled(),
+                timeout=120, app=qt_app)
+            check("the re-run test run finishes",
+                  run_done15,
+                  window15.status_label.text())
+            check("the first run asked for the whole run",
+                  preview_calls15
+                  and preview_calls15[0][2] is None,
+                  str(preview_calls15))
+            check("Re-run failed only is offered after a failed run",
+                  window15.rerun_failed_button.isEnabled())
+            check("the finish headline has its tick",
+                  window15.finish_label.isVisible()
+                  and window15.finish_label.text().startswith("✓"),
+                  window15.finish_label.text())
+            check("the finish headline fades in",
+                  window15.finish_label.graphicsEffect() is not None)
+            window15._reduce_motion = True
+            window15._show_finish_label(10.0)
+            qt_app.processEvents()
+            check("reduced motion skips the finish fade",
+                  window15.finish_label.graphicsEffect() is None)
+            window15._reduce_motion = False
+            window15._show_finish_label(10.0)
+            qt_app.processEvents()
+            check("the finish fade returns with motion on",
+                  window15.finish_label.graphicsEffect() is not None)
+            check("the first-run hint is gone after a run",
+                  not window15.first_run_hint.isVisible())
+            window15.rerun_failed_button.click()
+            rerun_done15 = wait_until(
+                lambda: window15.worker is None
+                and window15.save_button.isEnabled(),
+                timeout=120, app=qt_app)
+            check("the re-run finishes",
+                  rerun_done15,
+                  window15.status_label.text())
+            check("the re-run asked for only the failed pairs",
+                  len(preview_calls15) == 2
+                  and preview_calls15[1][2]
+                  == [("fake-broken:1b", "coding"),
+                      ("fake-broken:1b", "math")],
+                  str(preview_calls15))
+            check("the re-run ran only the failed model",
+                  window15.table.rowCount() == 1
+                  and window15.table.item(0, 0).text() == "fake-broken:1b",
+                  str(window15.table.rowCount()))
+        finally:
+            app.MainWindow._show_run_preview = real_preview15
+    finally:
+        window15.close()
+        window15.deleteLater()
+        qt_app.processEvents()
+        server15.shutdown()
+        server15.server_close()
+        if prior_font15 and prior_font15 > 0:
+            app.apply_font_size(prior_font15)
+        else:
+            app.apply_font_size(0)
+        for key15, value15 in prior15.items():
+            if value15 is None:
+                settings15.remove(key15)
+            else:
+                settings15.setValue(key15, value15)
+        settings15.sync()
+        for env15, value15 in (
+                ("OLLAMA_HOST", prior_host15),
+                ("OST_RESULTS_DIR", prior_results15),
+                ("OST_PROVIDERS_FILE", prior_providers15),
+                ("OST_CAPABILITIES_FILE", prior_caps15)):
+            if value15 is None:
+                os.environ.pop(env15, None)
+            else:
+                os.environ[env15] = value15
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview

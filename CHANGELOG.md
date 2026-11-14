@@ -1,5 +1,65 @@
 # Changelog
 
+## v15 (2026-11-14)
+
+UI redesign, part 5 (tasks R19, R20, R21, R22, R23, R24) — the
+pulls, the history, the keyboard, and the small moments. No new
+templates.
+
+- Pull upgrades (R19). A pull can be stopped part-way, and pulling
+  the same model again resumes from where it stopped instead of
+  starting over — Ollama keeps the part it downloaded. While a pull
+  runs, the Pull button stays live: typing another model queues it
+  behind the running one, in order, and a queued pull can be
+  removed. Pull progress shows the real speed and the time left,
+  from the download rate so far. The bar stays where a stopped pull
+  stopped, so you can see how far it got.
+- Past runs timeline scrub (R20). A slider under the run list walks
+  a model's runs newest to oldest, with a readout naming the date,
+  the template, the score, and the speed — ten runs browsable in
+  the time one open takes. Scrubbing moves the highlight, never the
+  detail view: opening a run still takes a click. Hovering a run
+  previews the same line without opening it.
+- Accessibility presets (R21). Bigger text is one tap, offered on
+  the first-run checklist and in Settings — the startup size plus
+  three points, everywhere in the app. The size stays adjustable
+  on its own in Settings, applies live while the dialog is open,
+  and goes back if you cancel. A Reduce motion switch in Settings
+  turns off the fade effects.
+- Focus-first keyboard navigation (R22). The focus ring is a
+  2 px solid border, visible in both themes — not a 1 px dotted
+  line. Tab moves in visual order on every tab. Switching tabs
+  brings focus back to the widget it was on, or to the tab's most
+  likely first action when there is none. Ctrl+R and Esc already
+  ran and cancelled runs; they are pinned now.
+- Micro-interactions and teach by playing (R23). Every tick says
+  what is picked now in the status line. The finish headline has a
+  tick and a 200 ms fade-in — cheap motion, skipped when reduced
+  motion is on. Until the first run exists, one line under the
+  intro points at the smallest possible first step: ask one model
+  one question on the Models tab.
+- v3 review leftovers (R24). Delete a model from the installed
+  list (asks first, defaults to No). Re-run failed only: after a
+  run, one button re-runs just the pairs that did not finish — the
+  good results stay in their run files and profiles. A template's
+  tasks can be read before running it — Preview button, or
+  double-click the template. And a try-it box on the Models tab
+  asks one model one question with no run at all.
+- Fixes found while verifying v15: the Pull button no longer
+  disables during a pull (it did, which made the queue unreachable
+  from the UI); deleting a model now reports the result after the
+  list refreshes, so the message is not overwritten; focus memory
+  now finds the tab a widget belongs to through the tab widget's
+  own pages (a parent walk misses, because tab pages live under an
+  internal stack); every worker completion slot now waits for its
+  thread before dropping the reference — the GUI drive aborted
+  twice with "QThread: Destroyed while thread is still running"
+  when a pull finished, because the finished signal fires while
+  the thread is still exiting; and the Settings fields now live in
+  a scroll area — at bigger text sizes the fixed dialog clipped
+  the explanation labels instead of scrolling, with Save and
+  Cancel kept outside it, always visible.
+
 ## v14 (2026-11-14)
 
 UI redesign, part 4 (tasks R14, R16, R17, R18) — results you can

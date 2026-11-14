@@ -99,11 +99,12 @@ from datetime import datetime, timedelta
 
 try:
     from PySide6.QtCore import (
-        QCoreApplication, QRect, QSettings, QSize, Qt, QThread, QTimer,
-        Signal,
+        QCoreApplication, QPropertyAnimation, QRect, QSettings, QSize, Qt,
+        QThread, QTimer, Signal,
     )
     from PySide6.QtGui import (
-        QAction, QIcon, QKeySequence, QPainter, QPalette, QPen, QShortcut,
+        QAction, QFont, QIcon, QKeySequence, QPainter, QPalette, QPen,
+        QShortcut,
     )
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (
@@ -114,6 +115,7 @@ try:
         QDialogButtonBox,
         QFileDialog,
         QFrame,
+        QGraphicsOpacityEffect,
         QGridLayout,
         QGroupBox,
         QHBoxLayout,
@@ -127,6 +129,7 @@ try:
         QProgressBar,
         QPushButton,
         QScrollArea,
+        QSlider,
         QSpinBox,
         QTabWidget,
         QTableWidget,
@@ -148,10 +151,13 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "14"
+__version__ = "15"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
+# Try-it answers (R24): one question, one short answer — long enough
+# to judge, short enough to stay quick.
+TRYIT_PREDICT = 200
 TEMPERATURE = 0
 READ_TIMEOUT = 10.0       # seconds between streamed chunks before retrying
 STALL_TIMEOUT = 120.0     # seconds with no chunk at all before giving up
@@ -429,7 +435,9 @@ _ENV_OLLAMA_MODELS = os.environ.get("OLLAMA_MODELS")
 def load_app_settings():
     """The app's own settings from QSettings (R18): the models
     folder, the Ollama address, the default time budget, and the
-    per-model usual template sets. Missing keys read as empty."""
+    per-model usual template sets. R21 adds the text size (0 means
+    the system default) and the reduce-motion flag. Missing keys
+    read as empty."""
     settings = QSettings("BrokeNBored", APP_NAME)
     sets_raw = settings.value("template_sets", "")
     try:
@@ -445,6 +453,12 @@ def load_app_settings():
             "default_budget_minutes", 0, type=int
         ),
         "template_sets": template_sets,
+        "font_point_size": settings.value(
+            "font_point_size", 0, type=int
+        ),
+        "reduce_motion": settings.value(
+            "reduce_motion", False, type=bool
+        ),
     }
 
 
@@ -458,6 +472,12 @@ def save_app_settings(values):
     )
     settings.setValue(
         "template_sets", json.dumps(values.get("template_sets", {}))
+    )
+    settings.setValue(
+        "font_point_size", values.get("font_point_size", 0)
+    )
+    settings.setValue(
+        "reduce_motion", values.get("reduce_motion", False)
     )
 
 
@@ -717,6 +737,27 @@ def install_excepthook():
 # covering every widget the window uses — lists, tables, text edits,
 # tabs, buttons, combo boxes, menus, the progress bar. Light stays the
 # default; this only applies when the user toggles View > Dark mode.
+def _focus_rules(color):
+    """R22: the focus ring (library 023) — a 2 px solid border on
+    every focusable widget. NOT outline: this PySide6 build does not
+    render outline at all (probed 2026-11-14: 0 pixels), while border
+    paints (1782 pixels). The ring must be unmistakable, not a 1 px
+    dotted line."""
+    widgets = ("QPushButton", "QLineEdit", "QComboBox", "QSpinBox",
+               "QListWidget", "QTableWidget", "QTextEdit", "QCheckBox",
+               "QSlider")
+    return "\n".join(
+        f"{widget}:focus {{ border: 2px solid {color}; }}"
+        for widget in widgets
+    ) + "\n"
+
+
+# The light theme is the native look plus the focus ring: light mode
+# is not "no stylesheet" anymore, because the ring must show in both
+# themes (light is the default).
+LIGHT_STYLESHEET = _focus_rules("#0b5cad")
+
+
 DARK_STYLESHEET = """
 QWidget {
     background-color: #2b2b2b;
@@ -844,15 +885,58 @@ QWidget:disabled {
 """
 
 
+# The focus ring goes last, so it wins over the base 1 px borders
+# above (same specificity, later rule wins).
+DARK_STYLESHEET += _focus_rules("#7db8e8")
+
+
 def apply_theme(dark):
-    """Apply the dark stylesheet to the running application, or clear
-    it back to the default light theme. A no-op without a
-    QApplication — headless mode runs under a QCoreApplication,
+    """Apply the dark stylesheet to the running application, or the
+    light one (native look plus the focus ring) back. A no-op without
+    a QApplication — headless mode runs under a QCoreApplication,
     which has no window to restyle."""
     app = QApplication.instance()
     if not isinstance(app, QApplication):
         return
-    app.setStyleSheet(DARK_STYLESHEET if dark else "")
+    app.setStyleSheet(DARK_STYLESHEET if dark else LIGHT_STYLESHEET)
+
+
+# The font the application started with, captured the first time the
+# text size is changed — restoring the default means restoring this,
+# not guessing at a size.
+_DEFAULT_FONT = None
+
+# The big-text preset (R21, library 015): the default size plus this
+# many points. One tap, readable text throughout; the size stays
+# adjustable on its own afterwards.
+FONT_PRESET_BONUS_PT = 3
+
+
+def default_font_point_size():
+    """The point size of the font the application started with."""
+    app = QApplication.instance()
+    if not isinstance(app, QApplication):
+        return 0
+    if _DEFAULT_FONT is not None:
+        return _DEFAULT_FONT.pointSize()
+    return app.font().pointSize()
+
+
+def apply_font_size(point_size):
+    """Set the application's text size (R21). 0 restores the font
+    the application started with. A no-op without a QApplication."""
+    global _DEFAULT_FONT
+    app = QApplication.instance()
+    if not isinstance(app, QApplication):
+        return
+    if _DEFAULT_FONT is None:
+        _DEFAULT_FONT = QFont(app.font())
+    if not point_size:
+        app.setFont(QFont(_DEFAULT_FONT))
+        return
+    font = QFont(_DEFAULT_FONT)
+    font.setPointSize(max(8, min(20, int(point_size))))
+    app.setFont(font)
 
 
 def tok_s(count, duration_ns):
@@ -1031,7 +1115,7 @@ def estimate_template_tokens(template):
     return prompt_tokens, completion_tokens
 
 
-def estimate_run_cost(targets, templates):
+def estimate_run_cost(targets, templates, pairs=None):
     """Pre-run cost estimate for the provider targets in a run.
 
     Returns a dict: "per_model" is one entry per provider target
@@ -1043,7 +1127,8 @@ def estimate_run_cost(targets, templates):
     counted (the provider charges for it too), for text models only
     — a model with no text capability gets a connection test instead
     of a text warmup, same as the worker. Templates a target cannot
-    run are skipped, same as the worker.
+    run are skipped, same as the worker. When pairs is given (a
+    re-run of failed pairs, R24), only the pairs in the set count.
     """
     per_model = []
     total = 0.0
@@ -1051,12 +1136,17 @@ def estimate_run_cost(targets, templates):
     for target in targets:
         if target["kind"] != "provider":
             continue
+        mine = [t for t in templates
+                if pairs is None
+                or (target["label"], t["id"]) in pairs]
+        if pairs is not None and not mine:
+            continue
         prompt_tokens = 0
         completion_tokens = 0
         if "text" in set(target.get("capabilities") or ["text"]):
             prompt_tokens += _chars_to_tokens(len(WARMUP_PROMPT))
             completion_tokens += WARMUP_PREDICT
-        for template in templates:
+        for template in mine:
             if not template_eligible(template, target):
                 continue
             template_prompt, template_completion = (
@@ -1091,17 +1181,66 @@ def estimate_run_cost(targets, templates):
     }
 
 
-def count_run_steps(targets, templates):
+def failed_run_pairs(results, targets, templates, pairs=None):
+    """The (target, template) pairs a run did not finish (R24).
+
+    A pair failed when the model never started (missing from the
+    results), the model failed outright (its status is not "done"),
+    the template never ran for that model, the template ran but
+    nothing in it ran (a scored template with no score and zero
+    tasks run), or the time budget stopped it. Skipped pairs (a
+    model that cannot run a template) are not failures — nothing
+    went wrong, and re-running would skip them again. When pairs is
+    given, only pairs in that set are considered: a re-run checks
+    only what it ran. Returns the pairs in run order."""
+    wanted = None if pairs is None else set(pairs)
+    failed = []
+    for target in targets:
+        label = target["label"]
+        mine = [t for t in templates
+                if wanted is None or (label, t["id"]) in wanted]
+        if not mine:
+            continue
+        result = results.get(label)
+        if result is None or result.get("status") != "done":
+            failed.extend((target, t) for t in mine)
+            continue
+        ran = result.get("templates") or {}
+        for template in mine:
+            run = ran.get(template["id"])
+            if run is None:
+                failed.append((target, template))
+                continue
+            if run.get("skipped"):
+                continue
+            if run.get("time_budget_reached"):
+                failed.append((target, template))
+                continue
+            if (template.get("scored", True)
+                    and run.get("template_score") is None
+                    and (run.get("total") or 0) == 0):
+                failed.append((target, template))
+    return failed
+
+
+def count_run_steps(targets, templates, pairs=None):
     """Progress steps for a run: one warmup per target, then one step
     per model call on the eligible templates only. A multi-turn task
     counts its turns (each turn is a call); the Speed template counts
     its context lengths. Skipped pairs cost no steps. The worker and
     the run preview share this, so the preview's step count is the
-    same count the run itself uses."""
+    same count the run itself uses. When pairs is given (a re-run of
+    failed pairs, R24), only the pairs in the set count — a target
+    with no pairs costs no warmup either."""
     steps = 0
     for target in targets:
+        mine = [t for t in templates
+                if pairs is None
+                or (target["label"], t["id"]) in pairs]
+        if pairs is not None and not mine:
+            continue
         steps += 1  # warmup
-        for template in templates:
+        for template in mine:
             if not template_eligible(template, target):
                 continue
             if template["scored"]:
@@ -1139,7 +1278,7 @@ def latest_decode_speed(results_dir, label):
     return None
 
 
-def build_run_preview(targets, templates, results_dir):
+def build_run_preview(targets, templates, results_dir, pairs=None):
     """R11: the run preview (library 017) — what a run will do, in
     plain text, before it starts.
 
@@ -1154,20 +1293,37 @@ def build_run_preview(targets, templates, results_dir):
     newest past run — or 8 tok/s when it has never run here — plus
     10 s per model for loading, all times a 1.25 safety margin. It
     says "at most about" because that is what it is.
+
+    When pairs is given (a re-run of failed pairs, R24), the preview
+    counts and prices only the pairs in the set, and says so.
     """
     lines = []
-    total_steps = count_run_steps(targets, templates)
-    lines.append(
-        f"{len(targets)} {'model' if len(targets) == 1 else 'models'}, "
-        f"{len(templates)} {'template' if len(templates) == 1 else 'templates'}, "
-        f"{total_steps} steps in total."
-    )
+    total_steps = count_run_steps(targets, templates, pairs)
+    if pairs is not None:
+        models = {label for label, _tid in pairs}
+        lines.append(
+            f"Re-running {len(pairs)} "
+            f"{'failed pair' if len(pairs) == 1 else 'failed pairs'} "
+            f"({len(models)} "
+            f"{'model' if len(models) == 1 else 'models'}), "
+            f"{total_steps} steps in total."
+        )
+    else:
+        lines.append(
+            f"{len(targets)} {'model' if len(targets) == 1 else 'models'}, "
+            f"{len(templates)} {'template' if len(templates) == 1 else 'templates'}, "
+            f"{total_steps} steps in total."
+        )
     lines.append("")
     seconds_upper = 0.0
     for target in targets:
         label = target["label"]
-        steps = count_run_steps([target], templates)
-        eligible = [t for t in templates if template_eligible(t, target)]
+        mine = [t for t in templates
+                if pairs is None or (label, t["id"]) in pairs]
+        if pairs is not None and not mine:
+            continue
+        steps = count_run_steps([target], templates, pairs)
+        eligible = [t for t in mine if template_eligible(t, target)]
         lines.append(
             f"  {label}: {len(eligible)} "
             f"{'template' if len(eligible) == 1 else 'templates'}, "
@@ -1191,9 +1347,14 @@ def build_run_preview(targets, templates, results_dir):
         "estimate; the run usually finishes sooner)."
     )
     provider_targets = [t for t in targets if t["kind"] == "provider"]
+    if pairs is not None:
+        provider_targets = [
+            t for t in provider_targets
+            if any(label == t["label"] for label, _tid in pairs)
+        ]
     cost = None
     if provider_targets:
-        cost = estimate_run_cost(provider_targets, templates)
+        cost = estimate_run_cost(provider_targets, templates, pairs)
         lines.append("")
         lines.append("Cost (provider models cost real money):")
         for entry in cost["per_model"]:
@@ -1415,6 +1576,26 @@ def ollama_show(model):
         raise OllamaError(_http_error_reason(exc))
     except (urllib.error.URLError, socket.timeout, OSError):
         raise OllamaError("could not reach Ollama")
+
+
+def delete_ollama_model(name):
+    """DELETE /api/delete for one model (R24). Returns (ok, message):
+    ok True when Ollama deleted it, False with a plain reason when
+    it did not answer or refused."""
+    payload = {"name": name}
+    req = urllib.request.Request(
+        ollama_base() + "/api/delete",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=READ_TIMEOUT):
+            return True, ""
+    except urllib.error.HTTPError as exc:
+        return False, _http_error_reason(exc)
+    except (urllib.error.URLError, socket.timeout, OSError):
+        return False, "could not reach Ollama"
 
 
 def capabilities_from_show(data):
@@ -3209,9 +3390,29 @@ def list_history_runs(results_dir, model_slug):
                 "not_run": data.get("not_run", 0),
                 "budget_stopped": data.get("budget_stopped", 0),
                 "time_budget_reached": data.get("time_budget_reached", False),
+                "speed": data.get("avg_decode_tok_s"),
             })
     runs.sort(key=lambda r: (r["timestamp"], r["filename"]), reverse=True)
     return runs
+
+
+def format_run_headline(run):
+    """R20: one run as one line — date, template, score, speed. The
+    timeline scrub's readout and the hover preview share it, so the
+    glance and the hover never disagree."""
+    stamp = (run.get("timestamp") or "").replace("T", " ")
+    score = run.get("score")
+    if score is None:
+        score_text = "no scoring"
+    else:
+        score_text = f"{score:.0f}%"
+        if run.get("passed") is not None and run.get("total"):
+            score_text += f" ({run['passed']}/{run['total']})"
+    text = f"{stamp} - {run.get('template_name', '')}: {score_text}"
+    speed = run.get("speed")
+    if speed:
+        text += f" at {speed:.1f} tok/s"
+    return text
 
 
 def load_run_file(path):
@@ -4043,8 +4244,16 @@ class BenchWorker(QThread):
     run_finished = Signal(str)
 
     def __init__(self, targets, templates, sys_id, machine, results_dir,
-                 time_budget_seconds=None):
+                 time_budget_seconds=None, pairs=None):
         super().__init__()
+        # R24: a re-run of failed pairs only runs the pairs in the
+        # set — (model label, template id). A target with no pairs
+        # never starts (no warmup, no row).
+        self.pairs = None if pairs is None else set(pairs)
+        if self.pairs is not None:
+            targets = [t for t in targets
+                       if any(label == t["label"]
+                              for label, _tid in self.pairs)]
         self.targets = targets
         self.templates = templates
         self.sys_id = sys_id
@@ -4141,7 +4350,7 @@ class BenchWorker(QThread):
         """Progress steps: one warmup per target, then one step per
         model call on the eligible templates only. See
         count_run_steps — the worker and the run preview share it."""
-        return count_run_steps(self.targets, self.templates)
+        return count_run_steps(self.targets, self.templates, self.pairs)
 
     def _failed_result(self, job_id, prompt, task, detail):
         """A task record for a call that failed before it could be scored."""
@@ -4733,7 +4942,10 @@ class BenchWorker(QThread):
                 self.model_done.emit(label, result)
                 continue
             try:
-                for template in self.templates:
+                mine = [t for t in self.templates
+                        if self.pairs is None
+                        or (label, t["id"]) in self.pairs]
+                for template in mine:
                     if self._stop:
                         raise Cancelled()
                     if not template_eligible(template, target):
@@ -4910,10 +5122,48 @@ class PullWorker(QThread):
     progress = Signal(int, str)  # percent 0-100, or -1 when unknown; status text
     finished_ok = Signal(str)    # model name
     failed = Signal(str)         # plain message
+    cancelled = Signal(str)      # model name
 
     def __init__(self, name):
         super().__init__()
         self.name = name
+        self._cancelled = False
+        self._resp = None
+        # The last progress Ollama reported — the window keeps it so
+        # a stopped pull can be resumed (R19) and named honestly.
+        self.last_completed = 0
+        self.last_total = 0
+
+    def cancel(self):
+        """Stop the pull (R19). The flag ends the read loop at the
+        next line or the next socket timeout; closing the response
+        ends a stalled read at once."""
+        self._cancelled = True
+        resp = self._resp
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _rate_text(self, samples, completed, total):
+        """Speed and remaining time from the recent progress samples:
+        (monotonic time, completed bytes). Needs at least half a
+        second of movement, or there is no rate worth showing."""
+        if len(samples) < 2:
+            return ""
+        first_time, first_done = samples[0]
+        last_time, last_done = samples[-1]
+        span = last_time - first_time
+        moved = last_done - first_done
+        if span < 0.5 or moved <= 0:
+            return ""
+        rate = moved / span
+        eta = (total - completed) / rate if total > completed else 0
+        return (
+            f", {rate / 1_000_000:.1f} MB/s, "
+            f"about {fmt_eta(eta)} left"
+        )
 
     def run(self):
         payload = {"name": self.name, "stream": True}
@@ -4930,18 +5180,33 @@ class PullWorker(QThread):
         except (urllib.error.URLError, socket.timeout, OSError):
             self.failed.emit(UNREACHABLE_HINT)
             return
+        self._resp = resp
         last_chunk = time.monotonic()
+        # Recent (time, completed) samples for the speed estimate —
+        # the last 10 seconds of movement, oldest first.
+        samples = deque(maxlen=40)
         try:
             while True:
+                if self._cancelled:
+                    self.cancelled.emit(self.name)
+                    return
                 try:
                     line = resp.readline()
                 except socket.timeout:
+                    if self._cancelled:
+                        self.cancelled.emit(self.name)
+                        return
                     if time.monotonic() - last_chunk > STALL_TIMEOUT:
                         self.failed.emit("Ollama stopped responding")
                         return
                     continue
-                except OSError:
-                    self.failed.emit(UNREACHABLE_HINT)
+                except (OSError, ValueError):
+                    # ValueError: the response was closed under us by
+                    # cancel() — a stop, not a failure.
+                    if self._cancelled:
+                        self.cancelled.emit(self.name)
+                    else:
+                        self.failed.emit(UNREACHABLE_HINT)
                     return
                 if not line:
                     break
@@ -4963,18 +5228,59 @@ class PullWorker(QThread):
                 completed = event.get("completed")
                 total = event.get("total")
                 if total:
-                    percent = int(100 * (completed or 0) / total)
+                    self.last_completed = completed or 0
+                    self.last_total = total
+                    now = time.monotonic()
+                    samples.append((now, self.last_completed))
+                    while samples and now - samples[0][0] > 10.0:
+                        samples.popleft()
+                    percent = int(100 * self.last_completed / total)
                     text = (
-                        f"{status}: {(completed or 0) / 1_000_000:.1f} MB "
+                        f"{status}: {self.last_completed / 1_000_000:.1f} MB "
                         f"of {total / 1_000_000:.1f} MB"
+                        f"{self._rate_text(samples, self.last_completed, total)}"
                     )
                 else:
                     percent = -1
                     text = status
                 self.progress.emit(percent, text)
         finally:
+            self._resp = None
             resp.close()
+        if self._cancelled:
+            self.cancelled.emit(self.name)
+            return
         self.failed.emit("The pull ended without finishing. Try again.")
+
+
+class TryItWorker(QThread):
+    """One question to one model (R24): a single generate call in its
+    own thread, so the window never waits on it. Emits (ok, text):
+    the model's answer, or a plain reason when it did not answer."""
+
+    answered = Signal(bool, str)
+
+    def __init__(self, model, question):
+        super().__init__()
+        self.model = model
+        self.question = question
+
+    def run(self):
+        try:
+            metrics = generate_once(
+                self.model, self.question, TRYIT_PREDICT, TEMPERATURE
+            )
+        except Cancelled:
+            return
+        except OllamaError as exc:
+            self.answered.emit(
+                False, f"Could not ask {self.model}: {describe_error(exc)}"
+            )
+            return
+        answer = (metrics.get("answer") or "").strip()
+        if not answer:
+            answer = f"{self.model} answered with nothing."
+        self.answered.emit(True, answer)
 
 
 class NumericItem(QTableWidgetItem):
@@ -5036,6 +5342,66 @@ class RunPreviewDialog(QDialog):
         self.adjust_button = buttons.button(QDialogButtonBox.Cancel)
         self.adjust_button.setText("Adjust")
         buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+def render_template_preview(template):
+    """R24: a template's tasks as plain text, for the preview dialog
+    — what the template asks, before the user runs it. Prompts are
+    cut at 300 characters: enough to judge the task, short enough
+    to read. Chat tasks show their turn count; every task shows its
+    expected answer when it has one."""
+    lines = [template.get("name", template.get("id", "template"))]
+    description = template.get("description") or ""
+    if description:
+        lines.append(description)
+    capability = template.get("capability", "text")
+    scored = "scored" if template.get("scored", True) else "not scored"
+    lines.append(
+        f"Needs: {capability}. {scored}. "
+        f"Up to {template.get('num_predict', 200)} tokens per answer."
+    )
+    tasks = template.get("tasks") or []
+    lines.append("")
+    lines.append(
+        f"{len(tasks)} {'task' if len(tasks) == 1 else 'tasks'}:"
+    )
+    for task in tasks:
+        kind = task.get("kind", "generate")
+        head = f"  {task.get('id', '?')}"
+        if kind != "generate":
+            head += f" ({kind})"
+        lines.append(head)
+        prompt = task.get("prompt") or ""
+        if not prompt and task.get("turns"):
+            first = task["turns"][0] or {}
+            prompt = first.get("prompt") or first.get("content", "")
+            lines.append(f"    {len(task['turns'])} turns")
+        if prompt:
+            shown = prompt if len(prompt) <= 300 else prompt[:300] + "..."
+            lines.append(f"    {shown}")
+        if "expected" in task:
+            lines.append(f"    Expected: {task['expected']}")
+    return "\n".join(lines)
+
+
+class TemplatePreviewDialog(QDialog):
+    """R24: read a template's tasks before running it. Read-only —
+    the preview is for judging, not editing."""
+
+    def __init__(self, parent, template):
+        super().__init__(parent)
+        self.setWindowTitle(
+            f"Template: {template.get('name', template.get('id', ''))}"
+        )
+        self.resize(520, 420)
+        layout = QVBoxLayout(self)
+        self.text_view = QTextEdit()
+        self.text_view.setReadOnly(True)
+        self.text_view.setPlainText(render_template_preview(template))
+        layout.addWidget(self.text_view)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
@@ -5385,9 +5751,10 @@ def _explain(text):
 
 
 class SettingsDialog(QDialog):
-    """Settings (R18): the models folder, the Ollama address, the
-    default time budget, and the per-model usual template sets — in
-    the app, not env-only. Built from a load_app_settings dict;
+    """Settings (R18, R21): the models folder, the Ollama address,
+    the default time budget, the accessibility preset (bigger text,
+    reduce motion), and the per-model usual template sets — in the
+    app, not env-only. Built from a load_app_settings dict;
     result_values holds the new dict when the dialog is accepted.
     A field whose variable is set in the environment shows the
     environment's value, locked: the environment wins, always, and
@@ -5400,7 +5767,21 @@ class SettingsDialog(QDialog):
         self._current = dict(current)
         self._template_sets = dict(current.get("template_sets") or {})
         self.result_values = None
+        # R21: the fields live in a scroll area, not straight in the
+        # dialog — at the bigger text sizes the content is taller
+        # than the dialog, and a fixed stack clips the explanation
+        # labels instead of scrolling. The Save/Cancel buttons stay
+        # outside it, always visible.
         layout = QVBoxLayout(self)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        scroll = QScrollArea()
+        scroll.setWidget(content)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+        layout.addWidget(scroll)
+        layout = content_layout
         layout.addWidget(QLabel(
             "Settings the app reads, set here instead of in the "
             "environment."
@@ -5465,6 +5846,41 @@ class SettingsDialog(QDialog):
             "Minutes after which a template stops (0 means no "
             "limit). Applies to new runs."
         ))
+        # R21: accessibility (library 015) — a bigger-text preset and
+        # a reduce-motion switch, in Settings as well as at first
+        # boot. The size applies live while the dialog is open, so
+        # the user sees it before saving; Cancel puts it back.
+        self._font_at_open = default_font_point_size()
+        layout.addWidget(QLabel("Accessibility:"))
+        bigger_row = QHBoxLayout()
+        self.bigger_text_button = QPushButton("Bigger text")
+        self.bigger_text_button.clicked.connect(self._apply_bigger_text)
+        bigger_row.addWidget(self.bigger_text_button)
+        bigger_row.addWidget(QLabel("Text size:"))
+        self.font_spin = QSpinBox()
+        self.font_spin.setRange(8, 20)
+        saved_size = current.get("font_point_size") or 0
+        self.font_spin.setValue(
+            saved_size if saved_size else default_font_point_size()
+        )
+        self.font_spin.setSuffix(" pt")
+        self.font_spin.valueChanged.connect(self._on_font_size_changed)
+        bigger_row.addWidget(self.font_spin)
+        bigger_row.addStretch()
+        layout.addLayout(bigger_row)
+        layout.addWidget(_explain(
+            "Bigger text: one tap for larger text everywhere. The "
+            "size above stays adjustable on its own afterwards."
+        ))
+        self.reduce_motion_check = QCheckBox("Reduce motion")
+        self.reduce_motion_check.setChecked(
+            bool(current.get("reduce_motion", False))
+        )
+        layout.addWidget(self.reduce_motion_check)
+        layout.addWidget(_explain(
+            "Reduce motion: no fade or slide effects anywhere in "
+            "the app."
+        ))
         layout.addWidget(QLabel("Usual templates per model:"))
         self.template_sets_label = QLabel()
         self.template_sets_label.setWordWrap(True)
@@ -5486,7 +5902,9 @@ class SettingsDialog(QDialog):
         buttons.button(QDialogButtonBox.Ok).setText("Save")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        # The buttons stay in the dialog's own layout, below the
+        # scroll area — always visible, never scrolled away.
+        self.layout().addWidget(buttons)
 
     def _refresh_template_sets_label(self):
         if not self._template_sets:
@@ -5515,6 +5933,25 @@ class SettingsDialog(QDialog):
         if folder:
             self.models_folder_input.setText(folder)
 
+    def _on_font_size_changed(self, value):
+        """R21: the size applies live, so the user sees the change
+        before saving it. Cancel puts the opening size back."""
+        apply_font_size(value)
+
+    def _apply_bigger_text(self):
+        """R21: the bigger-text preset — the startup size plus the
+        preset bonus. One tap, readable text throughout; the spin
+        stays adjustable afterwards."""
+        self.font_spin.setValue(min(
+            20, default_font_point_size() + FONT_PRESET_BONUS_PT
+        ))
+
+    def reject(self):
+        """R21: Cancel puts the font size back to what it was when
+        the dialog opened."""
+        apply_font_size(self._font_at_open)
+        super().reject()
+
     def accept(self):
         values = dict(self._current)
         if self.models_folder_input.isEnabled():
@@ -5526,6 +5963,8 @@ class SettingsDialog(QDialog):
                 self.ollama_host_input.text().strip().rstrip("/")
             )
         values["default_budget_minutes"] = self.budget_spin.value()
+        values["font_point_size"] = self.font_spin.value()
+        values["reduce_motion"] = self.reduce_motion_check.isChecked()
         values["template_sets"] = dict(self._template_sets)
         self.result_values = values
         super().accept()
@@ -5573,6 +6012,27 @@ class MainWindow(QMainWindow):
         self.pull_worker = None
         self.starter = None
         self.provider_test_worker = None
+        # R19: pulls waiting behind the one running, and pulls that
+        # stopped part-way (name -> (completed, total) bytes) so a
+        # re-pull can say it is resuming instead of starting over.
+        self.pull_queue = []
+        self.pull_interrupted = {}
+        self._pull_resuming = False
+        # R24: the try-it answer worker, and the last run's inputs
+        # for re-running only the pairs that failed.
+        self.tryit_worker = None
+        self._last_run_targets = []
+        self._last_run_templates = []
+        self._last_run_pairs = None
+        self._history_runs = []
+        self._reduce_motion = bool(
+            load_app_settings().get("reduce_motion", False)
+        )
+        # R22: the last focused widget on each tab, so focus returns
+        # where it was instead of getting lost on a tab change.
+        self._tab_focus = {}
+        # R23: the finish label's fade, kept alive while it runs.
+        self._finish_fade = None
         # R12/R13: the running run's progress state. The start time
         # and step counts feed the honest progress line; the current
         # text is the latest progress signal.
@@ -5634,7 +6094,25 @@ class MainWindow(QMainWindow):
         self.history_list.itemClicked.connect(self.on_history_run_clicked)
         self.history_list.currentItemChanged.connect(
             self._update_delete_button)
+        self.history_list.currentItemChanged.connect(
+            self._on_history_selection_changed)
         history_layout.addWidget(self.history_list)
+        # R20: the timeline scrub (library 018). Drag across a
+        # model's runs and watch the scores change in the readout —
+        # ten runs browsable in the time one open takes. The slider
+        # moves the highlight, never the detail view: opening a run
+        # still takes a click.
+        scrub_row = QHBoxLayout()
+        scrub_row.addWidget(QLabel("Scrub runs:"))
+        self.history_scrub_slider = QSlider(Qt.Horizontal)
+        self.history_scrub_slider.setEnabled(False)
+        self.history_scrub_slider.valueChanged.connect(
+            self._on_history_scrub)
+        scrub_row.addWidget(self.history_scrub_slider)
+        history_layout.addLayout(scrub_row)
+        self.history_scrub_label = QLabel("No runs for this model yet.")
+        self.history_scrub_label.setWordWrap(True)
+        history_layout.addWidget(self.history_scrub_label)
         self.history_view = QTextEdit()
         self.history_view.setReadOnly(True)
         self.history_view.setPlainText("Pick a run to see its scores.")
@@ -5974,6 +6452,13 @@ class MainWindow(QMainWindow):
         providers_layout.addLayout(provider_columns)
         tabs.currentChanged.connect(self.on_tab_changed)
 
+        # R22: Tab in visual order on every tab, and focus that comes
+        # back where it was when the tab changes.
+        self._set_tab_orders()
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            app.focusChanged.connect(self._remember_focus)
+
         # The status line lives under the tabs, not inside one: it
         # is the one thing that must stay visible on every tab.
         central = QWidget()
@@ -6020,6 +6505,13 @@ class MainWindow(QMainWindow):
         self.checklist_dismiss = QPushButton("Hide this checklist")
         self.checklist_dismiss.clicked.connect(self._dismiss_checklist)
         dismiss_row.addWidget(self.checklist_dismiss)
+        # R21: the bigger-text preset at first boot (library 015) —
+        # one tap, readable text throughout, saved right away. It
+        # lives on the checklist, so it goes away with it.
+        self.checklist_bigger_text = QPushButton("Bigger text")
+        self.checklist_bigger_text.clicked.connect(
+            self._apply_bigger_text_preset)
+        dismiss_row.addWidget(self.checklist_bigger_text)
         dismiss_row.addStretch()
         checklist_layout.addLayout(dismiss_row)
         layout.addWidget(self.checklist_frame)
@@ -6033,6 +6525,15 @@ class MainWindow(QMainWindow):
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
+        # R23: the first run teaches the app by doing it (library
+        # 014) — one line pointing at the smallest possible first
+        # step. Visible only until the first run exists.
+        self.first_run_hint = QLabel(
+            "New here? Ask one model one question first: Models tab, "
+            "Try one model."
+        )
+        self.first_run_hint.setWordWrap(True)
+        layout.addWidget(self.first_run_hint)
 
         pick_row = QHBoxLayout()
         model_box = QVBoxLayout()
@@ -6050,6 +6551,8 @@ class MainWindow(QMainWindow):
         # templates. Connected after the grey-outs, so the set only
         # ever ticks templates a ticked model can run.
         self.model_list.itemChanged.connect(self._on_model_ticked)
+        # R23: every tick says what is picked now, in the status line.
+        self.model_list.itemChanged.connect(self._update_pick_counts)
         model_box.addWidget(self.model_list)
         model_buttons = QHBoxLayout()
         self.select_all_button = QPushButton("Select all")
@@ -6076,6 +6579,11 @@ class MainWindow(QMainWindow):
         # R18: a hand-changed template tick means the applied usual
         # set no longer matches, so its label goes away.
         self.template_list.itemChanged.connect(self._on_template_ticked)
+        # R23: every tick says what is picked now, in the status line.
+        self.template_list.itemChanged.connect(self._update_pick_counts)
+        # R24: double-click a template to read its tasks first.
+        self.template_list.itemDoubleClicked.connect(
+            self._preview_template)
         template_box.addWidget(self.template_list)
         # R18: which model's usual templates are ticked, when a set
         # was applied. Empty the rest of the time.
@@ -6087,8 +6595,12 @@ class MainWindow(QMainWindow):
         self.select_all_templates_button.clicked.connect(self.select_all_templates)
         self.clear_templates_button = QPushButton("Clear")
         self.clear_templates_button.clicked.connect(self.clear_templates)
+        # R24: read the selected template's tasks before running it.
+        self.preview_template_button = QPushButton("Preview")
+        self.preview_template_button.clicked.connect(self._preview_template)
         template_buttons.addWidget(self.select_all_templates_button)
         template_buttons.addWidget(self.clear_templates_button)
+        template_buttons.addWidget(self.preview_template_button)
         template_buttons.addStretch()
         template_box.addLayout(template_buttons)
         pick_row.addLayout(template_box)
@@ -6141,10 +6653,16 @@ class MainWindow(QMainWindow):
         self.export_html_button = QPushButton("Export HTML")
         self.export_html_button.clicked.connect(self.export_html)
         self.export_html_button.setEnabled(False)
+        # R24: re-run only the pairs the last run did not finish.
+        # Enabled when a finished run left failed pairs behind.
+        self.rerun_failed_button = QPushButton("Re-run failed only")
+        self.rerun_failed_button.clicked.connect(self._rerun_failed)
+        self.rerun_failed_button.setEnabled(False)
         run_buttons.addWidget(self.cancel_button)
         run_buttons.addWidget(self.save_button)
         run_buttons.addWidget(self.export_csv_button)
         run_buttons.addWidget(self.export_html_button)
+        run_buttons.addWidget(self.rerun_failed_button)
         run_buttons.addStretch()
         # R13: the calm status chip (library 003/021). One word — the
         # run's state — at the right end of the button row, where a
@@ -6202,7 +6720,10 @@ class MainWindow(QMainWindow):
 
     def _build_models_tab(self, tabs):
         """The Models tab (R1): what is installed, pulling a new
-        model, Refresh, and Start Ollama."""
+        model, Refresh, and Start Ollama. R19 adds stopping a pull
+        and queueing pulls behind the one running; R24 adds deleting
+        a model and a try-it box (ask one model one question, no
+        run)."""
         models_tab = QWidget()
         tabs.addTab(models_tab, "Models")
         layout = QVBoxLayout(models_tab)
@@ -6218,6 +6739,8 @@ class MainWindow(QMainWindow):
         # Read-only: no checkboxes, nothing to tick here — ticking
         # happens on the Run setup tab.
         self.installed_list = QListWidget()
+        self.installed_list.currentItemChanged.connect(
+            self._update_delete_model_button)
         layout.addWidget(self.installed_list)
 
         model_buttons = QHBoxLayout()
@@ -6225,8 +6748,12 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh_models)
         self.start_ollama_button = QPushButton("Start Ollama")
         self.start_ollama_button.clicked.connect(self.start_ollama)
+        self.delete_model_button = QPushButton("Delete selected model")
+        self.delete_model_button.clicked.connect(self.delete_selected_model)
+        self.delete_model_button.setEnabled(False)
         model_buttons.addWidget(self.refresh_button)
         model_buttons.addWidget(self.start_ollama_button)
+        model_buttons.addWidget(self.delete_model_button)
         model_buttons.addStretch()
         layout.addLayout(model_buttons)
 
@@ -6237,8 +6764,12 @@ class MainWindow(QMainWindow):
         self.pull_input.returnPressed.connect(self.start_pull)
         self.pull_button = QPushButton("Pull")
         self.pull_button.clicked.connect(self.start_pull)
+        self.pull_cancel_button = QPushButton("Stop pull")
+        self.pull_cancel_button.clicked.connect(self.cancel_pull)
+        self.pull_cancel_button.setEnabled(False)
         pull_row.addWidget(self.pull_input)
         pull_row.addWidget(self.pull_button)
+        pull_row.addWidget(self.pull_cancel_button)
         layout.addLayout(pull_row)
         self.pull_bar = QProgressBar()
         self.pull_bar.setRange(0, 100)
@@ -6247,10 +6778,59 @@ class MainWindow(QMainWindow):
         self.pull_status = QLabel("")
         self.pull_status.setWordWrap(True)
         layout.addWidget(self.pull_status)
+        # R19: pulls waiting behind the one running. The list stays
+        # hidden until something is queued — an empty queue is not
+        # a control the user needs to see.
+        self.pull_queue_label = QLabel("Pull queue:")
+        self.pull_queue_label.hide()
+        layout.addWidget(self.pull_queue_label)
+        self.pull_queue_list = QListWidget()
+        self.pull_queue_list.setMaximumHeight(70)
+        self.pull_queue_list.hide()
+        layout.addWidget(self.pull_queue_list)
+        queue_row = QHBoxLayout()
+        self.pull_queue_remove_button = QPushButton(
+            "Remove from queue"
+        )
+        self.pull_queue_remove_button.clicked.connect(
+            self._remove_queued_pull)
+        self.pull_queue_remove_button.hide()
+        queue_row.addWidget(self.pull_queue_remove_button)
+        queue_row.addStretch()
+        layout.addLayout(queue_row)
+
+        # R24: try one model — ask one question, get one answer, no
+        # run and no scoring. Also the first thing a new user can do
+        # (R23): the doing that teaches the app.
+        tryit_box = QGroupBox("Try one model")
+        tryit_layout = QVBoxLayout(tryit_box)
+        tryit_row = QHBoxLayout()
+        self.tryit_model_combo = QComboBox()
+        self.tryit_model_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToContents)
+        self.tryit_input = QLineEdit()
+        self.tryit_input.setPlaceholderText("Ask one question...")
+        self.tryit_input.returnPressed.connect(self.ask_tryit)
+        self.tryit_ask_button = QPushButton("Ask")
+        self.tryit_ask_button.clicked.connect(self.ask_tryit)
+        tryit_row.addWidget(self.tryit_model_combo)
+        tryit_row.addWidget(self.tryit_input)
+        tryit_row.addWidget(self.tryit_ask_button)
+        tryit_layout.addLayout(tryit_row)
+        self.tryit_answer = QTextEdit()
+        self.tryit_answer.setReadOnly(True)
+        self.tryit_answer.setMaximumHeight(110)
+        self.tryit_answer.setPlainText(
+            "Pick a model, ask one question, press Ask.")
+        tryit_layout.addWidget(self.tryit_answer)
+        layout.addWidget(tryit_box)
 
     def refresh_checklist(self):
         """The first-run checklist (R7): three live steps. Dismissed
         or completed means gone for good — it never reappears."""
+        # R23: the first-run hint goes away with the first run, even
+        # when the checklist itself was dismissed.
+        self.first_run_hint.setVisible(not any_run_exists())
         settings = QSettings("BrokeNBored", APP_NAME)
         if settings.value("setup_dismissed", False, type=bool):
             self.checklist_frame.hide()
@@ -6286,6 +6866,16 @@ class MainWindow(QMainWindow):
         settings = QSettings("BrokeNBored", APP_NAME)
         settings.setValue("setup_dismissed", True)
         self.checklist_frame.hide()
+
+    def _apply_bigger_text_preset(self):
+        """R21: the bigger-text preset from the first-run checklist
+        (library 015) — the startup size plus the preset bonus,
+        applied and saved at once."""
+        size = min(20, default_font_point_size() + FONT_PRESET_BONUS_PT)
+        values = load_app_settings()
+        values["font_point_size"] = size
+        save_app_settings(values)
+        apply_font_size(size)
 
     def _on_instance_connection(self):
         """A second copy knocked (U27): bring this window forward."""
@@ -6434,10 +7024,13 @@ class MainWindow(QMainWindow):
 
     def _apply_settings(self, values):
         """Apply saved settings to the running window: the default
-        time budget, and the Ollama address when the environment did
-        not set it at startup. Clearing a saved address removes the
-        address this app set, so Ollama answers at the default again."""
+        time budget, the text size and the motion setting (R21), and
+        the Ollama address when the environment did not set it at
+        startup. Clearing a saved address removes the address this
+        app set, so Ollama answers at the default again."""
         self.budget_spin.setValue(values["default_budget_minutes"])
+        apply_font_size(values.get("font_point_size") or 0)
+        self._reduce_motion = bool(values.get("reduce_motion", False))
         if _ENV_OLLAMA_HOST is not None:
             return
         if values["ollama_host"]:
@@ -6537,7 +7130,18 @@ class MainWindow(QMainWindow):
             installed_item.setFlags(
                 installed_item.flags() & ~Qt.ItemIsUserCheckable
             )
+            # The plain name rides along: the visible text carries
+            # capability brackets, and delete needs the bare name.
+            installed_item.setData(Qt.UserRole, name)
             self.installed_list.addItem(installed_item)
+        # R24: the try-it box offers the installed Ollama models,
+        # keeping the current pick when it is still installed.
+        current_tryit = self.tryit_model_combo.currentText()
+        self.tryit_model_combo.clear()
+        for name in ollama_names:
+            self.tryit_model_combo.addItem(name)
+        if current_tryit in ollama_names:
+            self.tryit_model_combo.setCurrentText(current_tryit)
         for provider in providers:
             for model_entry in provider["models"]:
                 targets.append(provider_target(provider, model_entry))
@@ -6648,6 +7252,26 @@ class MainWindow(QMainWindow):
         finally:
             self.template_list.blockSignals(False)
 
+    def _update_pick_counts(self, _item=None):
+        """R23: tick feedback (library 001) — every tick says what
+        is picked now, in the status line. Silent during a run: the
+        progress line owns the status then."""
+        if self.worker is not None:
+            return
+        models = sum(
+            1 for row in range(self.model_list.count())
+            if self.model_list.item(row).checkState() == Qt.Checked
+        )
+        templates = sum(
+            1 for row in range(self.template_list.count())
+            if self.template_list.item(row).checkState() == Qt.Checked
+        )
+        self.status_label.setText(
+            f"{models} {'model' if models == 1 else 'models'}, "
+            f"{templates} {'template' if templates == 1 else 'templates'} "
+            "picked."
+        )
+
     def _on_model_ticked(self, item):
         """R18: ticking a model with a saved usual set ticks exactly
         those templates and says so. Only on a tick, never on an
@@ -6727,6 +7351,22 @@ class MainWindow(QMainWindow):
     def clear_templates(self):
         self._set_all_checked(self.template_list, Qt.Unchecked)
 
+    def _preview_template(self, _item=None):
+        """R24: show the selected template's tasks in their own
+        window. Nothing happens with no selection — the button is
+        only useful when a template is picked."""
+        item = self.template_list.currentItem()
+        if item is None:
+            return
+        template_id = item.data(Qt.UserRole)
+        template = next(
+            (t for t in self.templates if t["id"] == template_id), None
+        )
+        if template is None:
+            return
+        dialog = TemplatePreviewDialog(self, template)
+        dialog.exec()
+
     def selected_targets(self):
         """Ticked models as benchmark targets (Ollama and provider)."""
         targets = []
@@ -6763,6 +7403,29 @@ class MainWindow(QMainWindow):
         if not templates:
             self.status_label.setText("Tick at least one test template first.")
             return
+        self._start_run_with(targets, templates)
+
+    def _rerun_failed(self):
+        """Re-run only the pairs the last run did not finish (R24):
+        models that never started or failed, templates that never
+        ran, and templates the time budget stopped. The good results
+        stay in their run files and profiles; the table shows this
+        re-run's results."""
+        pairs = failed_run_pairs(
+            self.results, self._last_run_targets,
+            self._last_run_templates, self._last_run_pairs,
+        )
+        if not pairs:
+            return
+        pair_set = {(t["label"], x["id"]) for t, x in pairs}
+        targets = [t for t in self._last_run_targets
+                   if any(label == t["label"] for label, _tid in pair_set)]
+        self._start_run_with(
+            targets, self._last_run_templates, pair_set)
+
+    def _start_run_with(self, targets, templates, pairs=None):
+        """Start a run over the given targets and templates — the
+        whole run, or only the pairs in the set (a re-run, R24)."""
         # The list may have come from the CLI fallback while the API was
         # down, or Ollama may have stopped since the window opened: check
         # it answers before starting, or every local model fails one by
@@ -6776,13 +7439,20 @@ class MainWindow(QMainWindow):
         # long it may take, what it will cost — and asks to go ahead.
         # The old cost guard is folded into it: a provider run's cost
         # is part of the preview, named there.
-        if not self._show_run_preview(targets, templates):
+        if not self._show_run_preview(targets, templates, pairs):
             self.status_label.setText("Run cancelled.")
             return
         # R18: this run's templates become each ticked model's usual
         # set. Saved here, after the preview was accepted — a
-        # cancelled preview saves nothing.
-        self._save_template_sets(targets, templates)
+        # cancelled preview saves nothing. A re-run saves nothing:
+        # its subset must not clobber the model's real usual set.
+        if pairs is None:
+            self._save_template_sets(targets, templates)
+        # R24: the last run's inputs, so "Re-run failed only" knows
+        # what to re-run — and which pairs this run itself ran.
+        self._last_run_targets = list(targets)
+        self._last_run_templates = list(templates)
+        self._last_run_pairs = None if pairs is None else set(pairs)
         # The run lives on the Run tab: switch there so the user
         # watches it instead of the setup lists.
         self.tabs.setCurrentIndex(self.TAB_RUN)
@@ -6798,6 +7468,7 @@ class MainWindow(QMainWindow):
         self.save_report_action.setEnabled(False)
         self.export_csv_button.setEnabled(False)
         self.export_html_button.setEnabled(False)
+        self.rerun_failed_button.setEnabled(False)
         self.run_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.select_all_button.setEnabled(False)
@@ -6823,6 +7494,7 @@ class MainWindow(QMainWindow):
         self.worker = BenchWorker(
             targets, templates, self.sys_id, self.machine, get_results_dir(),
             time_budget_seconds=self._time_budget_seconds(),
+            pairs=pairs,
         )
         self._update_delete_button()
         self.worker.model_started.connect(self.on_model_started)
@@ -6833,9 +7505,16 @@ class MainWindow(QMainWindow):
         self.worker.step_progress.connect(self.on_step_progress)
         self.worker.run_finished.connect(self.on_run_finished)
         self.worker.start()
-        log_event(
-            f"Run started: {len(targets)} models, {len(templates)} templates"
-        )
+        if pairs is None:
+            log_event(
+                f"Run started: {len(targets)} models, "
+                f"{len(templates)} templates"
+            )
+        else:
+            log_event(
+                f"Re-run started: {len(pairs)} failed "
+                f"{'pair' if len(pairs) == 1 else 'pairs'}"
+            )
 
     def cancel_run(self):
         if self.worker is not None:
@@ -6849,12 +7528,13 @@ class MainWindow(QMainWindow):
         minutes = self.budget_spin.value()
         return minutes * 60 if minutes else None
 
-    def _show_run_preview(self, targets, templates):
+    def _show_run_preview(self, targets, templates, pairs=None):
         """R11: show the run preview dialog (library 017) and return
         True when the user presses Run, False on Adjust. A seam for
         the suite, which stubs it so existing run tests pass through
         without a dialog."""
-        preview = build_run_preview(targets, templates, get_results_dir())
+        preview = build_run_preview(
+            targets, templates, get_results_dir(), pairs)
         dialog = RunPreviewDialog(self, preview["text"])
         return dialog.exec() == QDialog.Accepted
 
@@ -6885,21 +7565,91 @@ class MainWindow(QMainWindow):
     # -- pull a model ----------------------------------------------------
 
     def start_pull(self):
+        """Pull the named model — or queue it behind the pull that is
+        running (R19). A pull that stopped part-way resumes: Ollama
+        keeps the part it downloaded, so the re-pull picks up where
+        it left off and says so."""
         name = self.pull_input.text().strip()
         if not name:
             self.pull_status.setText("Type a model name first.")
             return
         if self.pull_worker is not None:
+            if (name == self.pull_worker.name
+                    or name in self.pull_queue):
+                self.pull_status.setText(f"{name} is already pulling or queued.")
+                return
+            self.pull_queue.append(name)
+            self._refresh_pull_queue()
+            self.pull_input.clear()
+            count = len(self.pull_queue)
+            self.pull_status.setText(
+                f"Queued {name}. {count} "
+                f"{'pull' if count == 1 else 'pulls'} in the queue."
+            )
             return
-        self.pull_button.setEnabled(False)
+        self.pull_input.clear()
+        self._begin_pull(name)
+
+    def _begin_pull(self, name):
+        """Start a pull worker for one model (R19). The Pull button
+        stays enabled while a pull runs: pressing it with a new name
+        queues that pull behind the running one."""
+        self._pull_resuming = name in self.pull_interrupted
+        self.pull_cancel_button.setEnabled(True)
         self.pull_bar.setRange(0, 100)
         self.pull_bar.setValue(0)
-        self.pull_status.setText(f"Pulling {name}...")
+        if self._pull_resuming:
+            done, total = self.pull_interrupted[name]
+            if total:
+                self.pull_bar.setValue(int(100 * done / total))
+            self.pull_status.setText(f"Resuming {name}...")
+        else:
+            self.pull_status.setText(f"Pulling {name}...")
         self.pull_worker = PullWorker(name)
         self.pull_worker.progress.connect(self.on_pull_progress)
         self.pull_worker.finished_ok.connect(self.on_pull_done)
         self.pull_worker.failed.connect(self.on_pull_failed)
+        self.pull_worker.cancelled.connect(self.on_pull_cancelled)
         self.pull_worker.start()
+
+    def cancel_pull(self):
+        """Stop the running pull (R19). What Ollama downloaded stays
+        downloaded — pulling the same model again resumes it."""
+        if self.pull_worker is not None:
+            self.pull_cancel_button.setEnabled(False)
+            self.pull_status.setText(
+                f"Stopping the pull of {self.pull_worker.name}..."
+            )
+            self.pull_worker.cancel()
+
+    def _refresh_pull_queue(self):
+        """The queue list shows the waiting pulls, or hides when the
+        queue is empty."""
+        self.pull_queue_list.clear()
+        for name in self.pull_queue:
+            self.pull_queue_list.addItem(name)
+        visible = bool(self.pull_queue)
+        self.pull_queue_label.setVisible(visible)
+        self.pull_queue_list.setVisible(visible)
+        self.pull_queue_remove_button.setVisible(visible)
+
+    def _remove_queued_pull(self):
+        """Drop the selected pull from the queue (R19)."""
+        item = self.pull_queue_list.currentItem()
+        if item is None:
+            return
+        name = item.text()
+        if name in self.pull_queue:
+            self.pull_queue.remove(name)
+        self._refresh_pull_queue()
+        self.pull_status.setText(f"Removed {name} from the queue.")
+
+    def _start_next_queued(self):
+        """Start the next queued pull, if there is one (R19)."""
+        if self.pull_worker is not None or not self.pull_queue:
+            return
+        self._begin_pull(self.pull_queue.pop(0))
+        self._refresh_pull_queue()
 
     def on_pull_progress(self, percent, text):
         if percent < 0:
@@ -6907,25 +7657,145 @@ class MainWindow(QMainWindow):
         else:
             self.pull_bar.setRange(0, 100)
             self.pull_bar.setValue(percent)
+        if self._pull_resuming:
+            text = f"Resuming: {text}"
         self.pull_status.setText(text)
 
     def on_pull_done(self, name):
+        # The worker's finished signal fires while its thread is
+        # still exiting: capture it, clear the attribute, and wait
+        # for it before the last reference goes — dropping the
+        # reference first aborts Qt ("QThread: Destroyed while
+        # thread is still running"). The same wait guards every
+        # worker slot in this window.
+        worker = self.pull_worker
         self.pull_worker = None
+        if worker is not None:
+            worker.wait()
+        self._pull_resuming = False
         self.pull_button.setEnabled(True)
+        self.pull_cancel_button.setEnabled(False)
         self.pull_bar.setRange(0, 100)
         self.pull_bar.setValue(100)
         self.pull_status.setText(f"Pulled {name}.")
         log_event(f"Pulled {name}.")
-        self.pull_input.clear()
+        self.pull_interrupted.pop(name, None)
         self.refresh_models()
+        self._start_next_queued()
 
     def on_pull_failed(self, message):
+        worker = self.pull_worker
         self.pull_worker = None
+        if worker is not None:
+            worker.wait()
+        self._pull_resuming = False
         self.pull_button.setEnabled(True)
+        self.pull_cancel_button.setEnabled(False)
         self.pull_bar.setRange(0, 100)
         self.pull_bar.setValue(0)
         self.pull_status.setText(f"Pull failed: {message}")
         log_event(f"Pull failed: {message}")
+        # A pull that got part-way keeps its place: pulling the same
+        # model again resumes from where it stopped (R19). The name
+        # goes back in the box, so resuming is one press of Pull.
+        if worker is not None:
+            if not self.pull_input.text():
+                self.pull_input.setText(worker.name)
+            if worker.last_total:
+                self.pull_interrupted[worker.name] = (
+                    worker.last_completed, worker.last_total)
+        self._start_next_queued()
+
+    def on_pull_cancelled(self, name):
+        """A stopped pull (R19): the bar stays where it stopped, so
+        the user can see how far it got, and the model stays queued
+        for a resume."""
+        worker = self.pull_worker
+        self.pull_worker = None
+        if worker is not None:
+            worker.wait()
+        self._pull_resuming = False
+        self.pull_button.setEnabled(True)
+        self.pull_cancel_button.setEnabled(False)
+        if worker is not None and worker.last_total:
+            self.pull_interrupted[name] = (
+                worker.last_completed, worker.last_total)
+            percent = int(100 * worker.last_completed / worker.last_total)
+            self.pull_status.setText(
+                f"Pull of {name} stopped at {percent}%. "
+                f"Pull it again to resume."
+            )
+        else:
+            self.pull_status.setText(f"Pull of {name} stopped.")
+        if not self.pull_input.text():
+            self.pull_input.setText(name)
+        log_event(f"Pull of {name} stopped.")
+        self._start_next_queued()
+
+    # -- delete a model --------------------------------------------------
+
+    def _update_delete_model_button(self, _current=None, _previous=None):
+        """Delete is enabled only when a model is selected (R24)."""
+        self.delete_model_button.setEnabled(
+            self.installed_list.currentItem() is not None
+        )
+
+    def delete_selected_model(self):
+        """Delete the selected installed model (R24). Asks to confirm
+        first — deletion cannot be undone — and defaults to No."""
+        item = self.installed_list.currentItem()
+        if item is None:
+            return
+        name = item.data(Qt.UserRole) or item.text()
+        answer = QMessageBox.question(
+            self, "Delete this model?",
+            f"Delete {name} from this PC? The model file will be "
+            "removed. This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        ok, message = delete_ollama_model(name)
+        # The list refreshes first: it rewrites the status line with
+        # its models-found message, so the delete result is set after
+        # it, or the user never sees it.
+        self.refresh_models()
+        if ok:
+            self.status_label.setText(f"Deleted {name}.")
+            log_event(f"Deleted model {name}.")
+        else:
+            self.status_label.setText(f"Could not delete {name}: {message}")
+
+    # -- try one model ---------------------------------------------------
+
+    def ask_tryit(self):
+        """Ask one model one question (R24): one call, one answer, no
+        run and no scoring."""
+        if self.tryit_worker is not None:
+            return
+        model = self.tryit_model_combo.currentText()
+        question = self.tryit_input.text().strip()
+        if not model:
+            self.tryit_answer.setPlainText(
+                "No model to ask: pull one first.")
+            return
+        if not question:
+            self.tryit_answer.setPlainText(
+                "Type a question first.")
+            return
+        self.tryit_ask_button.setEnabled(False)
+        self.tryit_answer.setPlainText("Asking...")
+        self.tryit_worker = TryItWorker(model, question)
+        self.tryit_worker.answered.connect(self.on_tryit_answered)
+        self.tryit_worker.start()
+
+    def on_tryit_answered(self, ok, text):
+        worker = self.tryit_worker
+        self.tryit_worker = None
+        if worker is not None:
+            worker.wait()
+        self.tryit_ask_button.setEnabled(True)
+        self.tryit_answer.setPlainText(text)
 
     def on_progress(self, text, percent):
         self.status_label.setText(text)
@@ -7031,6 +7901,12 @@ class MainWindow(QMainWindow):
         self.save_report_action.setEnabled(bool(self.results))
         self.export_csv_button.setEnabled(bool(self.results))
         self.export_html_button.setEnabled(bool(self.results))
+        # R24: "Re-run failed only" is there when the run left failed
+        # pairs behind — and only then.
+        self.rerun_failed_button.setEnabled(bool(failed_run_pairs(
+            self.results, self._last_run_targets,
+            self._last_run_templates, self._last_run_pairs,
+        )))
         self.table.setSortingEnabled(True)
         if reason == "done":
             self.status_label.setText("Done. Press Save report to keep the results.")
@@ -7073,7 +7949,10 @@ class MainWindow(QMainWindow):
         else:
             self.run_chip.setText("Stopped")
         self._run_started_at = None
+        worker = self.worker
         self.worker = None
+        if worker is not None:
+            worker.wait()
         self.refresh_history()
         self.refresh_profiles_for_run()
         self.refresh_compare()
@@ -7097,7 +7976,7 @@ class MainWindow(QMainWindow):
         models = len(self.result_order)
         templates = len(best.get("templates", {}))
         text = (
-            f"Done. Best: {best['name']}, "
+            f"✓ Done. Best: {best['name']}, "
             f"{fmt_score(best.get('overall_score'))} overall at "
             f"{fmt_toks(best.get('avg_decode_tok_s'))} tok/s. "
             f"{models} {'model' if models == 1 else 'models'}, "
@@ -7109,6 +7988,21 @@ class MainWindow(QMainWindow):
             text += "."
         self.finish_label.setText(text)
         self.finish_label.show()
+        # R23: the finish moment (library 008) — a 200 ms fade-in,
+        # cheap motion, and only when the user has not asked for
+        # reduced motion.
+        if self._reduce_motion:
+            self.finish_label.setGraphicsEffect(None)
+            self._finish_fade = None
+        else:
+            effect = QGraphicsOpacityEffect(self.finish_label)
+            self.finish_label.setGraphicsEffect(effect)
+            fade = QPropertyAnimation(effect, b"opacity", self)
+            fade.setDuration(200)
+            fade.setStartValue(0.0)
+            fade.setEndValue(1.0)
+            fade.start()
+            self._finish_fade = fade
 
     def refresh_profiles_for_run(self):
         """Rebuild the profiles of every model this run touched."""
@@ -7267,6 +8161,101 @@ class MainWindow(QMainWindow):
             # changed — otherwise an edit in progress would be wiped.
             if self._providers_file_bytes() != self._providers_snapshot:
                 self.refresh_providers()
+        # R22: focus comes back where it was on this tab — after the
+        # refreshes above, which rebuild lists and could move it.
+        self._restore_tab_focus(index)
+
+    def _set_tab_orders(self):
+        """R22: Tab moves in visual order on every tab (library 023),
+        instead of the order the widgets were built in."""
+        chains = [
+            [self.checklist_dismiss, self.checklist_bigger_text,
+             self.model_filter, self.model_list,
+             self.select_all_button, self.clear_button, self.screen_button,
+             self.template_filter, self.template_list,
+             self.select_all_templates_button, self.clear_templates_button,
+             self.preview_template_button, self.budget_spin,
+             self.run_button],
+            [self.cancel_button, self.save_button,
+             self.export_csv_button, self.export_html_button,
+             self.rerun_failed_button, self.table, self.detail_view],
+            [self.installed_list, self.refresh_button,
+             self.start_ollama_button, self.delete_model_button,
+             self.pull_input, self.pull_button, self.pull_cancel_button,
+             self.pull_queue_list, self.pull_queue_remove_button,
+             self.tryit_model_combo, self.tryit_input,
+             self.tryit_ask_button, self.tryit_answer],
+            [self.history_model_combo, self.history_refresh_button,
+             self.history_list, self.history_scrub_slider,
+             self.history_view, self.delete_run_button],
+            [self.profile_model_combo, self.profile_regen_button,
+             self.profile_view],
+            [self.compare_model_a, self.compare_model_b,
+             self.compare_table],
+            [self.provider_list, self.provider_new_button,
+             self.provider_remove_button, self.provider_name_input,
+             self.provider_url_input, self.provider_key_input,
+             self.provider_test_button, self.fetched_models_combo,
+             self.provider_models_list, self.provider_model_id_input,
+             self.provider_model_name_input, self.provider_price_in_input,
+             self.provider_price_out_input]
+            + [self.provider_cap_boxes[c] for c in CAPABILITIES]
+            + [self.provider_add_model_button,
+               self.provider_update_model_button,
+               self.provider_remove_model_button,
+               self.provider_save_button],
+        ]
+        for chain in chains:
+            for first, second in zip(chain, chain[1:]):
+                self.setTabOrder(first, second)
+
+    def _remember_focus(self, _old, new):
+        """R22: remember the focused widget per tab, so a tab change
+        brings focus back where it was (library 023: focus is never
+        lost). Widgets outside the tabs — the menu bar, a dialog —
+        are not stored. (A tab page's parent is the tab widget's
+        internal stack, not the tab widget, so the test is
+        isAncestorOf, not a parent walk.)"""
+        if new is None or not isinstance(new, QWidget):
+            return
+        for index in range(self.tabs.count()):
+            page = self.tabs.widget(index)
+            if page is new or page.isAncestorOf(new):
+                self._tab_focus[index] = new
+                return
+
+    def _restore_tab_focus(self, index):
+        """R22: on a tab change, focus goes back to the widget it was
+        on last time — or the tab's most likely first action when
+        there is none."""
+        widget = self._tab_focus.get(index)
+        if (widget is None or not widget.isVisibleTo(self)
+                or not widget.isEnabled()):
+            widget = self._default_focus_widget(index)
+        if widget is not None:
+            widget.setFocus()
+
+    def _default_focus_widget(self, index):
+        """R22: each tab's most likely first action."""
+        if index == self.TAB_SETUP:
+            return self.model_filter
+        if index == self.TAB_RUN:
+            if self.worker is not None:
+                return self.cancel_button
+            if self.results:
+                return self.save_button
+            return self.table
+        if index == self.TAB_MODELS:
+            return self.pull_input
+        if index == self.TAB_HISTORY:
+            return self.history_model_combo
+        if index == self.TAB_PROFILES:
+            return self.profile_model_combo
+        if index == self.TAB_COMPARE:
+            return self.compare_model_a
+        if index == self.TAB_PROVIDERS:
+            return self.provider_list
+        return None
 
     def refresh_history(self):
         results_dir = get_results_dir()
@@ -7339,9 +8328,15 @@ class MainWindow(QMainWindow):
         slug = self.history_model_combo.currentData()
         self.history_list.clear()
         self.history_view.setPlainText("Pick a run to see its scores.")
+        self._history_runs = []
+        self.history_scrub_slider.setRange(0, 0)
+        self.history_scrub_slider.setEnabled(False)
+        self.history_scrub_label.setText("No runs for this model yet.")
         if not slug:
+            self._update_delete_button()
             return
         runs = list_history_runs(get_results_dir(), slug)
+        self._history_runs = runs
         for run in runs:
             score = run["score"]
             not_run = run.get("not_run", 0) or 0
@@ -7364,7 +8359,41 @@ class MainWindow(QMainWindow):
                 f"{run['system_id']} | {stamp} | {run['template_name']} ({score_text})"
             )
             item.setData(Qt.UserRole, run["path"])
+            # R20: hover a run to preview it without opening it.
+            item.setToolTip(format_run_headline(run))
             self.history_list.addItem(item)
+        # R20: the scrub slider walks the same list, newest first.
+        # One run needs no slider; zero runs needs no readout.
+        count = len(runs)
+        self.history_scrub_slider.setRange(0, max(0, count - 1))
+        self.history_scrub_slider.setEnabled(count >= 2)
+        self.history_scrub_slider.blockSignals(True)
+        self.history_scrub_slider.setValue(0)
+        self.history_scrub_slider.blockSignals(False)
+        if count:
+            self.history_scrub_label.setText(
+                format_run_headline(runs[0]))
+        self._update_delete_button()
+
+    def _on_history_scrub(self, value):
+        """R20: the slider moves the highlight and the readout. The
+        detail view does not move — scrubbing is a preview, opening
+        still takes a click."""
+        if 0 <= value < len(self._history_runs):
+            self.history_list.setCurrentRow(value)
+            self.history_scrub_label.setText(
+                format_run_headline(self._history_runs[value]))
+
+    def _on_history_selection_changed(self, _current, _previous):
+        """R20: picking a run in the list moves the slider and the
+        readout to match, so the two never disagree."""
+        row = self.history_list.currentRow()
+        if 0 <= row < len(self._history_runs):
+            self.history_scrub_slider.blockSignals(True)
+            self.history_scrub_slider.setValue(row)
+            self.history_scrub_slider.blockSignals(False)
+            self.history_scrub_label.setText(
+                format_run_headline(self._history_runs[row]))
 
     def on_history_run_clicked(self, item):
         path = item.data(Qt.UserRole)
@@ -7887,7 +8916,10 @@ class MainWindow(QMainWindow):
         self.provider_test_worker.start()
 
     def on_provider_tested(self, ok, message, model_ids):
+        worker = self.provider_test_worker
         self.provider_test_worker = None
+        if worker is not None:
+            worker.wait()
         self.provider_test_button.setEnabled(True)
         self.provider_test_status.setText(message)
         # R17: the fetched model list becomes a pick-list — the model
@@ -8334,6 +9366,9 @@ def main():
               "opening the window.", file=sys.stderr)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    # R21: the saved text size applies before the window is built,
+    # so a bigger-text user never sees small text first.
+    apply_font_size(load_app_settings().get("font_point_size") or 0)
     # Single instance (U27): a second copy nudges the running one
     # and exits. Headless runs skip this — cron must not be blocked.
     instance_server, is_first = acquire_single_instance(SINGLE_INSTANCE_NAME)

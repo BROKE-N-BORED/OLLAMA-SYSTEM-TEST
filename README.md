@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v14
+# OLLAMA SYSTEM TEST v15
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,20 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v15 is a pulls-and-polish release, no new templates: a pull can be
+stopped and resumed, queued behind another, and watched with a real
+speed and time-left readout. The Past runs tab gains a timeline
+scrubber — drag across a model's runs and watch the scores change.
+Bigger text is one tap on the first-run checklist and in Settings,
+with a Reduce motion switch beside it. The focus ring is a visible
+2 px border, Tab moves in visual order, and focus comes back where
+it was when you switch tabs. Every tick says what is picked now, and
+the finish headline has a tick and a short fade. The Models tab can
+delete a model and ask one model one question with no run; the Run
+tab can re-run only the pairs that failed; and any template's tasks
+can be read before running it, from the Preview button or a
+double-click.
 
 v14 is a results-and-settings release, no new templates: the Profiles
 tab is a dashboard now — one hero tile for the latest overall score,
@@ -193,12 +207,16 @@ remembered next time.
    results — model, overall score, speed, status, and per-template
    scores — as a spreadsheet file or a web page, wherever you choose.
 6. The Past runs tab lets you browse every run you have ever done,
-   grouped by model and by system. It also shows how much disk the
-   results store uses ("Results use 12.3 MB"). To remove a run, pick
-   it and press Delete run: its file and any images or audio it saved
-   are removed, and the model's profile rebuilds from the runs that
-   are left. Deleting asks to confirm first, and it is disabled while
-   a run is in progress.
+   grouped by model and by system. A slider under the run list
+   scrubs across a model's runs newest to oldest, with a readout
+   naming the date, the template, the score, and the speed — and
+   hovering a run previews the same line without opening it. The
+   tab also shows how much disk the results store uses ("Results
+   use 12.3 MB"). To remove a run, pick it and press Delete run:
+   its file and any images or audio it saved are removed, and the
+   model's profile rebuilds from the runs that are left. Deleting
+   asks to confirm first, and it is disabled while a run is in
+   progress.
 7. The Profiles tab shows each model's profile: a hero tile for the
    latest overall score, small tiles for the best score, decode
    speed, and strongest and weakest templates, score bars per
@@ -219,7 +237,10 @@ remembered next time.
    templates: tick a model and its usual templates tick with it,
    with a label saying which set is active; a run saves the
    templates it ran as that model's usual set. The Settings window
-   lists the saved sets and can forget them all.
+   lists the saved sets and can forget them all. Settings also
+   holds the accessibility options: Bigger text (one tap for
+   larger text everywhere, with the size still adjustable on its
+   own) and Reduce motion (no fade effects).
 10. Shortcuts: Ctrl+R runs, Ctrl+S saves the report, Esc cancels a
    run. The File menu has Save report, Settings, and Quit; Help has
    How to Use, the full manual in its own window; About, which
@@ -336,9 +357,15 @@ typing their id on the Providers tab, not pulled.
 
 On the Models tab, type a model name in the "Pull a model" box (for example `qwen3:4b`)
 and press Pull. The download runs in the background with a live
-progress bar and a status line showing what is downloading and how many
-megabytes are in so far. When it finishes, the new model appears in the
-list — unticked, like everything else.
+progress bar and a status line showing what is downloading, how many
+megabytes are in so far, the speed, and the time left. When it
+finishes, the new model appears in the list — unticked, like
+everything else. While a pull runs, the Pull button stays live:
+typing another model queues it behind the running one, in order.
+A pull can be stopped with Stop pull, and pulling the same model
+again resumes from where it stopped instead of starting over. The
+Models tab can also delete a model (asks first) and ask one model
+one question with no run at all, in the Try one model box.
 
 Pulls go to Ollama's own models folder. If you want models stored
 somewhere else, that is Ollama's own setting: set the OLLAMA_MODELS

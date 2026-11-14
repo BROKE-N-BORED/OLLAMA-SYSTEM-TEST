@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v14
+# TEST-REPORT — OLLAMA SYSTEM TEST v15
 
 Verified 2026-11-14 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
@@ -8,6 +8,20 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v15 is the pulls-and-polish release (tasks R19, R20, R21, R22, R23,
+R24 from the redesign list): a pull can be stopped and resumed,
+queued behind another, and watched with a real speed and time-left
+readout; the Past runs tab gains a timeline scrubber; bigger text
+is one tap on the first-run checklist and in Settings, with a
+Reduce motion switch beside it; the focus ring is a visible 2 px
+border, Tab moves in visual order, and focus comes back where it
+was when the tab changes; every tick says what is picked now, and
+the finish headline has a tick and a short fade; the Models tab can
+delete a model and ask one model one question with no run; the Run
+tab can re-run only the pairs that failed; and any template's tasks
+can be read before running it, from the Preview button or a
+double-click. No new templates, no template changes.
 
 v14 is the results-and-settings release (tasks R14, R16, R17, R18
 from the redesign list): the Profiles tab is a dashboard — one hero
@@ -88,10 +102,35 @@ all runtime tests ran against the fake servers from v5/v6 (fake Ollama
 with /api/show, /api/chat with images and tools; fake OpenAI-compatible
 provider with image_url parts, tool-call SSE deltas, image generation,
 transcription, and speech). Test suite:
-tests/run_tests.py in this tree — **1232 passed, 0 failed** (final
-run; the v13 suite's 1146 checks are all carried over and green
-inside that count, plus 86 new v14 checks). The road to green: the
-first run crashed at 1211 checks — the suite imported QAction from
+tests/run_tests.py in this tree — **1323 passed, 0 failed** (final
+run; the v14 suite's 1232 checks are all carried over and green
+inside that count, plus 91 new v15 checks). The road to green: the
+first run came back 1316/4, all four test-only. The v14 providers
+sections check searched the whole window for group boxes, and the
+v15 try-it box is a third one — the check now searches the
+Providers tab page only. The v14 settings-accept check compared
+against a dict without the two new v15 keys (font size, reduced
+motion) — added. The try-it empty-question check read the status
+line, but the message goes in the answer box, where the answer
+would be — the check reads the right place now. And the
+queue-duplicate check read the pull status after a processEvents,
+which let a progress event from the running pull overwrite the
+refusal message first — the check reads it right after the click,
+which sets it synchronously. The second run from a fresh unzip on
+workspace disk, TMPDIR=/tmp/ost-v15 with a watchdog keeping it
+alive, is the green 1320. Then the GUI drive found two app defects
+(the worker-thread abort and the Settings overflow, §7 below),
+fixed in the app with three scroll checks added, and the third run
+came back 1322/1: the focus-restore check failed because the new
+20 pt dialog check shows and closes a modeless dialog, which under
+offscreen leaves the application with no active window — and with
+no active window, setFocus stops emitting focusChanged, so the
+focus memory goes deaf (probed: 0 emissions until activateWindow
+restored it; a real window manager re-activates the window when a
+dialog closes, so this is harness-only). The suite re-activates
+the window after the dialog closes, and the fourth run from a
+fresh unzip is the green 1323 above. The v14 suite's own history
+follows: the first run crashed at 1211 checks — the suite imported QAction from
 QtWidgets, where it does not live (it is in QtGui), and one File-menu
 check still expected the v7 menu without Settings (both test-only
 fixes; the app was right). The second run came back 1227/4: the
@@ -144,6 +183,141 @@ test (it stamped its run files 09:00, which is only "later" before
 09:00) and four version pins still said v9. Both were fixed in the
 test, not the app, and the re-run from a fresh unzip is the green
 1016 that v11 carries.
+
+## What was verified (v15)
+
+The GUI drive (v15_gui_drive.py, Xvfb at 1366x768, fresh config,
+fake Ollama server, fabricated runs for the scrub) ran all 17
+steps in 21 s, exit 0, no unexpected dialogs. Screenshots in
+~/workspace/ollama-system-test-audit/v15-gui-drive/.
+
+### 1. Pull upgrades (R19)
+
+- A slow pull (2 s between events) shows a real speed and time
+  left: "downloading: 50.0 MB of 100.0 MB, 12.5 MB/s, about 4s
+  left" (suite, against the slow pull server).
+- Stop pull stops it where it is: "Pull of slow-a:1b stopped at
+  75%. Pull it again to resume." The bar stays at 75, the name
+  goes back in the box, and the interrupted record is kept
+  (suite). Re-pulling resumes ("Resuming" in the status) and
+  completes, clearing the record (suite).
+- While a pull runs, the Pull button stays live: two more pulls
+  queue behind it in order, a duplicate is refused ("already
+  pulling or queued"), a queued pull can be removed, and stopping
+  the running pull starts the next queued one (suite).
+- The drive pulled a model the plain way ("Pulled
+  drive-model:1b.", in the installed list) — no abort, which is
+  what §7 is about.
+
+### 2. Timeline scrub (R20)
+
+- Three fabricated runs for the smart model: the slider spans
+  them, the readout names the newest ("2026-11-13 10:00:00 -
+  Math: 80% (4/5) at 20.0 tok/s"), scrubbing to the oldest shows
+  "2026-11-11 10:00:00 - Math: 40% (2/5) at 20.0 tok/s" with the
+  highlight on row 2, and the detail view still says "Pick a run
+  to see its scores." — scrubbing previews, it never opens
+  (drive + suite). Hovering a run shows the same line as a
+  tooltip (suite). Picking a run in the list moves the slider to
+  match (suite).
+
+### 3. Accessibility presets (R21)
+
+- First boot: the checklist shows with steps 1-2 honestly ticked
+  and step 3 open, and its Bigger text button takes the font from
+  9 pt to 12 pt at one tap, saved right away (drive).
+- Settings holds the same preset: the spin follows it, the font
+  applies live while the dialog is open, and Cancel puts the
+  opening size back; Save returns the size and the Reduce motion
+  switch, and applying them sets both (suite).
+- The Settings fields scroll: at 20 pt text no explanation label
+  is clipped (height against heightForWidth at the label's own
+  width — sizeHint overstates a wrapped label's height, because
+  it is computed at a narrower width than the label gets), and
+  Save stays visible below the scroll area (suite + a 12 pt
+  screenshot read by eye, top and scrolled to the bottom).
+
+### 4. Focus-first keyboard navigation (R22)
+
+- Tab moves in visual order on the setup tab (filter, list,
+  Select all) and focus returns where it was after a tab change
+  (suite + drive: "focus after Tab: model_list").
+- The focus ring is a 2 px solid border in both themes (the
+  stylesheet rules are pinned in the suite; `outline` does not
+  render in this PySide6 build — probed — so the ring uses
+  `border`). In the drive screenshot the focused model list
+  shows 2,354 pixels of the ring blue, against 132 before the
+  window was activated — an inactive window's widgets report
+  hasFocus() False, so the ring never paints there (see §7).
+- Ctrl+R and Esc are pinned as the Run and Cancel shortcuts
+  (suite; they already existed from v7).
+
+### 5. Micro-interactions and teach by playing (R23)
+
+- Every tick says what is picked now: "1 model, 0 templates
+  picked." after ticking a model, "1 model, 1 template picked."
+  after ticking a template (drive + suite).
+- The finish headline has its tick and a 200 ms fade-in: "✓
+  Done. Best: fake-smart:2b, 100% overall at 20.0 tok/s.
+  2 models, 2 templates, 10s." Reduced motion skips the fade
+  (suite checks the effect is absent then).
+- The first-run hint shows with no runs ("New here? Ask one
+  model one question first: Models tab, Try one model.") and is
+  gone after a run (drive + suite).
+
+### 6. v3 review leftovers (R24)
+
+- Delete a model: the confirm asks ("Delete drive-model:1b from
+  this PC? ... This cannot be undone."), Yes removes it from
+  Ollama and the list ("Deleted drive-model:1b."), No keeps it
+  (drive + suite).
+- Re-run failed only: after a run with the broken model, the
+  button is enabled; the re-run's preview says "Re-running 2
+  failed pairs (1 model), 11 steps in total." and its table has
+  one row, the broken model (drive + suite). The pair logic is
+  unit-checked: missing models, failed models, unscored
+  templates with no tasks run, and budget-stopped templates
+  fail; skipped pairs and unscored-but-run templates do not.
+- Template preview: the math dialog names the tasks and their
+  expected answers, the multi-turn dialog shows the turn counts
+  and the first prompt (suite).
+- Try one model: "What is 2 plus 2?" to the smart model answers
+  "A fine answer indeed." (drive + suite); no question says so
+  in the answer box (suite).
+
+### 7. What the verification caught
+
+- The drive aborted twice at the first pull completion with
+  "QThread: Destroyed while thread is still running" —
+  faulthandler put the abort inside on_pull_done, which dropped
+  the last reference to the PullWorker while its thread was
+  still exiting. All six worker completion slots (pull done /
+  failed / cancelled, try-it, run finished, provider tested)
+  now capture the worker, clear the attribute, and wait() before
+  the reference goes. The drive has completed cleanly three times
+  since.
+- The Pull button disabled itself during a pull, which made the
+  queue unreachable from the UI — it stays enabled now.
+- Deleting a model set the status before the list refresh, so
+  the refresh overwrote it — the result is set after.
+- Focus memory walked parents to find the tab, but tab pages
+  live under the tab widget's internal stack, not the tab widget
+  — it uses isAncestorOf now.
+- The template preview read chat turns' "content" key; the
+  template files use "prompt".
+- The fake server's DELETE handler used urlparse, which the
+  file never imported — it uses the file's plain path
+  comparison now.
+- The Settings dialog clipped its explanation labels at bigger
+  text sizes (its fixed 420 px height is shorter than the
+  content) — the fields live in a scroll area now, with
+  Save/Cancel outside it.
+- A modeless dialog closed under offscreen leaves the
+  application with no active window, and setFocus then stops
+  emitting focusChanged — the suite re-activates the window
+  after the dialog closes. The same inactive-window effect
+  hides the :focus ring in screenshots; the drive activates the
+  window before the focus shot.
 
 ## What was verified (v14)
 
