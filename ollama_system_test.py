@@ -65,6 +65,13 @@ with a plain "time budget reached" status, default off; and the
 current results export to CSV and HTML, with a Compare tab putting
 two models' per-template scores side by side.
 
+v17 stops making the user start Ollama: the app starts it itself
+whenever it needs it (opening, running, pulling), restarts it once
+mid-run if it dies loading a model, and checks free RAM before each
+model so a model too big for the machine is skipped instead of
+killing the run. The Speed template gets a real score at last:
+decode speed graded against 20 tokens per second, per context length.
+
 DURABLE RULE: nothing is ever ticked by default. Every model and every
 template starts unchecked; the user ticks what they want to test.
 
@@ -93,6 +100,7 @@ import tempfile
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timedelta
@@ -151,7 +159,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "16"
+__version__ = "17"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -163,14 +171,15 @@ READ_TIMEOUT = 10.0       # seconds between streamed chunks before retrying
 STALL_TIMEOUT = 120.0     # seconds with no chunk at all before giving up
 CODE_TIMEOUT = 10.0       # seconds allowed for one code test case
 ANSWER_TRUNCATE = 2000    # chars of raw answer kept in a run file
-OLLAMA_DOWN_MESSAGE = "Ollama is not running. Start it first, then open this again."
-OLLAMA_DOWN_RUN_MESSAGE = "Ollama is not running. Press Start Ollama, then Run again."
-OLLAMA_DIED_MESSAGE = "Ollama stopped responding. Start Ollama, then press Refresh and Run again."
+OLLAMA_DOWN_MESSAGE = "Ollama is not running."
+OLLAMA_DOWN_RUN_MESSAGE = ("Ollama is not answering at the set address. "
+                           "Check the address in Settings.")
+OLLAMA_DIED_MESSAGE = "Ollama stopped responding. Press Run again and the app will start it."
 UNREACHABLE = "could not reach Ollama"
-UNREACHABLE_HINT = "could not reach Ollama. Start it, then press Refresh"
-START_OLLAMA_TIMEOUT_MSG = "Ollama could not be started. Run ollama serve in a terminal to see the error."
+UNREACHABLE_HINT = "could not reach Ollama. Try again and the app will start it."
+START_OLLAMA_TIMEOUT_MSG = "Ollama could not be started. Try again."
 START_OLLAMA_MISSING_MSG = "Ollama is not installed. Install it first, then try again."
-NO_MODELS_MESSAGE = "No models installed yet. Pull one with ollama pull, then press Refresh."
+NO_MODELS_MESSAGE = "No models installed yet. Pull one with the pull box on the Models tab."
 NO_TEMPLATES_MESSAGE = "No test templates found in the templates folder."
 # The name the single-instance guard listens on (U27). A second copy
 # of the app connects here, tells the running copy to show itself,
@@ -192,8 +201,8 @@ tests Ollama models on this PC and cloud provider models the same way.
 
 ## First time
 
-1. Start Ollama. If Ollama is not running, press Start Ollama on the
-   Models tab, or run `ollama serve` in a terminal.
+1. Ollama starts itself. The app starts Ollama on its own whenever
+   it needs it. If Ollama is not installed, install it first.
 2. Pull a model. On the Models tab, type a model name (for example
    `qwen3:0.6b`) and press Pull.
 3. Pick what to run. On the Run setup tab, tick a model and a test
@@ -292,10 +301,10 @@ results as a spreadsheet file or a web page, wherever you choose.
 
 ## If something goes wrong
 
-- "Ollama is not running": press Start Ollama in the app, or start
-  Ollama yourself, then press Refresh.
-- "could not reach Ollama. Start it, then press Refresh": Ollama
-  stopped answering. Start it again, press Refresh, and Run again.
+- "Ollama is not running": the app starts Ollama on its own. If it
+  keeps failing, check that Ollama is installed.
+- "could not reach Ollama. Try again and the app will start it.":
+  Ollama stopped answering. Press Run again and the app starts it.
 - "provider X did not answer": the provider could not be reached.
   Check the base URL on the Providers tab, or try Test connection.
 - "provider X rejected the key": the API key is wrong or revoked.
@@ -341,6 +350,16 @@ MAX_FETCHED_MODELS = 200       # most model ids the Test connection pick-list ho
 PROVIDER_LABEL_SEP = " / "      # "provider / model-id", used everywhere
 SHOW_TIMEOUT = 2.0              # seconds for one /api/show screening call
 LONG_CONTEXT_MIN_TOKENS = 32768  # a context this long counts as long-context
+# Speed's full score (v17): decode speed that earns 100%. The
+# fastest small models on the target Ryzen 3 box measure about 8-18
+# tokens per second, so 20 is just above the best — a fast 2B model
+# scores near full marks, a slow 4B model scores low, honestly.
+SPEED_FULL_SCORE_TOK_S = 20.0
+# RAM check (v17): a model needs its file size times this much free
+# RAM to load safely — the weights plus room for the context and the
+# rest of the system. A model that does not fit is skipped, never
+# run into an out-of-memory kill.
+RAM_NEED_FACTOR = 1.2
 # The cost guard asks to confirm a provider run when the estimated
 # cost is over this amount. $1.00: a plain round number, documented
 # in the README. Under it the run starts with no extra step.
@@ -1278,7 +1297,8 @@ def latest_decode_speed(results_dir, label):
     return None
 
 
-def build_run_preview(targets, templates, results_dir, pairs=None):
+def build_run_preview(targets, templates, results_dir, pairs=None,
+                      resume=None):
     """R11: the run preview (library 017) — what a run will do, in
     plain text, before it starts.
 
@@ -1295,11 +1315,23 @@ def build_run_preview(targets, templates, results_dir, pairs=None):
     says "at most about" because that is what it is.
 
     When pairs is given (a re-run of failed pairs, R24), the preview
-    counts and prices only the pairs in the set, and says so.
+    counts and prices only the pairs in the set, and says so. When
+    resume is given (v17: (manifest, notes)), it says it is a resume
+    and lists the pairs skipped because their model or template is
+    gone.
     """
     lines = []
     total_steps = count_run_steps(targets, templates, pairs)
-    if pairs is not None:
+    if resume is not None:
+        manifest, notes = resume
+        started = (manifest.get("started") or "").replace("T", " ")
+        lines.append(
+            f"Resuming the run from {started}: only the pairs below "
+            "will run."
+        )
+        for note in notes:
+            lines.append(f"  {note}")
+    elif pairs is not None:
         models = {label for label, _tid in pairs}
         lines.append(
             f"Re-running {len(pairs)} "
@@ -1542,6 +1574,58 @@ def list_models():
     if names:
         return names, "ollama list"
     raise OllamaError(OLLAMA_DOWN_MESSAGE)
+
+
+def ollama_address_is_local():
+    """True when the Ollama address points at this machine (v17):
+    localhost, 127.0.0.1, ::1, or no host at all. Only a local
+    address may be auto-started — a remote server is someone
+    else's to start."""
+    try:
+        host = urllib.parse.urlparse(ollama_base()).hostname
+    except ValueError:
+        return False
+    if host is None:
+        return True
+    return host.lower() in ("localhost", "127.0.0.1", "::1")
+
+
+def list_model_sizes():
+    """Map of model name -> file size in bytes, from /api/tags.
+
+    {} when Ollama does not answer — the RAM check then stays off
+    instead of blocking a run on a failed read."""
+    try:
+        data = http_get_json("/api/tags", timeout=10)
+    except OllamaError:
+        return {}
+    sizes = {}
+    for model in data.get("models", []) or []:
+        if model.get("name") and isinstance(model.get("size"), int):
+            sizes[model["name"]] = model["size"]
+    return sizes
+
+
+def get_meminfo_path():
+    """Where mem_available_bytes reads: /proc/meminfo, or the
+    OST_MEMINFO_FILE override the suite points at a fixture."""
+    return os.environ.get("OST_MEMINFO_FILE", "/proc/meminfo")
+
+
+def mem_available_bytes():
+    """MemAvailable from /proc/meminfo, or None when it cannot be
+    read (non-Linux, or a failed read) — the RAM check then stays
+    off instead of blocking a run."""
+    try:
+        with open(get_meminfo_path(), encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def ps_sizes():
@@ -2677,6 +2761,16 @@ def task_credit(task, answer, passed):
     return 1.0 if passed else 0.0
 
 
+def speed_credit(decode_tok_s):
+    """One speed job's credit (v17): decode speed as a fraction of
+    full speed (SPEED_FULL_SCORE_TOK_S), capped at 1. A failed job
+    (no speed recorded) scores 0. Rounded to two decimals, so the
+    stamped credit reads clean in the run file."""
+    if decode_tok_s is None:
+        return 0.0
+    return round(min(1.0, decode_tok_s / SPEED_FULL_SCORE_TOK_S), 2)
+
+
 def task_mark(task):
     """One task's mark for the detail and summary views (M4):
     pass, fail, partial with its credit ("partial (0.5)"), not
@@ -3404,6 +3498,19 @@ def load_templates(templates_dir=None):
                 if not isinstance(base, str) or not base:
                     base = prompts[0] if prompts else "Write a short story."
                 template["context_base_prompt"] = base
+            # v17: an unscored template may still score, by speed —
+            # the Speed template grades decode speed instead of
+            # answers. An unknown value drops the template with a
+            # warning, same as an unknown capability: a typo must
+            # never silently unscore a template.
+            score_by = data.get("score_by")
+            if score_by is not None:
+                if score_by != "speed":
+                    warnings.append(
+                        f"{filename}: skipped, unknown score_by {score_by!r}"
+                    )
+                    continue
+                template["score_by"] = score_by
         if scored:
             # Fixture check: a vision task names an image in images/, a
             # transcribe task names a clip in audio/. A missing fixture
@@ -3547,6 +3654,270 @@ def save_run_file(results_dir, model, sys_id, run_data, stamp=None):
     return path
 
 
+# ---------------------------------------------------------------------------
+# Run manifests (v17): what a run was, and how far it got — so an
+# interrupted run can resume where it left off, even after the app
+# was closed. R24's re-run-failed is in-memory only; the manifest is
+# the part that survives a restart.
+# ---------------------------------------------------------------------------
+
+def get_runs_dir(results_dir=None):
+    """results/_runs: run manifests live here, one file per run."""
+    if results_dir is None:
+        results_dir = get_results_dir()
+    return os.path.join(results_dir, "_runs")
+
+
+def manifest_path(results_dir, run_id):
+    return os.path.join(get_runs_dir(results_dir), f"{run_id}.json")
+
+
+def new_run_id(results_dir):
+    """A run id from the start time; -2, -3 when one already exists
+    for this second (two runs started at once)."""
+    base = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id = base
+    n = 2
+    while os.path.exists(manifest_path(results_dir, run_id)):
+        run_id = f"{base}-{n}"
+        n += 1
+    return run_id
+
+
+def pair_key(label, template_id):
+    return f"{label}|{template_id}"
+
+
+def split_pair_key(key):
+    """A pair key back into (label, template id). Split on the last
+    bar: template ids never contain one, labels might."""
+    label, _bar, template_id = key.rpartition("|")
+    return label, template_id
+
+
+def new_manifest(run_id, targets, templates, sys_id):
+    """A fresh manifest: every pair pending, nothing finished. The
+    targets carry label, kind, model, and provider name only — never
+    the provider entry itself, which holds the API key."""
+    pairs = {}
+    for target in targets:
+        for template in templates:
+            pairs[pair_key(target["label"], template["id"])] = "pending"
+    return {
+        "run_id": run_id,
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "finished_at": None,
+        "status": "running",
+        "system_id": sys_id,
+        "targets": [
+            {"label": t["label"], "kind": t["kind"], "model": t["model"],
+             "provider_name": t.get("provider_name")}
+            for t in targets
+        ],
+        "templates": [t["id"] for t in templates],
+        "pairs": pairs,
+        "run_files": {},
+    }
+
+
+def save_manifest(results_dir, manifest):
+    """Atomic write: tmp file + replace, so a crash never leaves a
+    half-written manifest."""
+    folder = get_runs_dir(results_dir)
+    os.makedirs(folder, exist_ok=True)
+    path = manifest_path(results_dir, manifest["run_id"])
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    return path
+
+
+def load_manifest(results_dir, run_id):
+    """One manifest by id, or None when it is missing or unreadable."""
+    try:
+        with open(manifest_path(results_dir, run_id),
+                  encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "pairs" not in data:
+        return None
+    return data
+
+
+def list_manifests(results_dir):
+    """All manifests, newest first. Unreadable files are skipped."""
+    folder = get_runs_dir(results_dir)
+    manifests = []
+    if not os.path.isdir(folder):
+        return manifests
+    try:
+        filenames = sorted(os.listdir(folder), reverse=True)
+    except OSError:
+        return manifests
+    for filename in filenames:
+        if not filename.endswith(".json"):
+            continue
+        manifest = load_manifest(results_dir, filename[:-5])
+        if manifest is not None:
+            manifests.append(manifest)
+    return manifests
+
+
+def manifest_is_resumable(manifest):
+    """A manifest with pairs left to run — pending or failed. A run
+    that finished with everything done or skipped is not resumable,
+    whatever its end status says. A manifest still marked running
+    (the app died mid-run) is resumable too."""
+    pairs = manifest.get("pairs") or {}
+    return any(status in ("pending", "failed")
+               for status in pairs.values())
+
+
+def latest_resumable_manifest(results_dir):
+    """The newest manifest with pairs left to run, or None."""
+    for manifest in list_manifests(results_dir):
+        if manifest_is_resumable(manifest):
+            return manifest
+    return None
+
+
+def build_resume_plan(manifest, targets_by_label, templates_by_id,
+                      results_dir):
+    """Turn a manifest into what a resume runs (v17).
+
+    targets_by_label: the targets available now, by label.
+    templates_by_id: the templates available now, by id.
+    Returns (targets, pair_set, preloaded, notes):
+    - targets: the available targets that still have pairs to run.
+    - pair_set: (label, template id) pairs to run — pending or
+      failed, both ends still available.
+    - preloaded: {label: {template id: run data}} for the done
+      pairs, loaded from their run files. A done pair whose run
+      file is gone goes back to pending and runs again.
+    - notes: plain words for pairs skipped because their model or
+      template is gone.
+
+    The manifest is updated in place: pairs whose model or template
+    is gone are marked "skipped" (so a resume can finish even when
+    something was deleted), and a done pair whose run file is gone
+    goes back to "pending". The caller saves the manifest — the
+    worker does it when a run starts, and the no-pairs path does
+    it before reporting nothing left.
+    """
+    notes = []
+    preloaded = {}
+    pair_set = set()
+    pairs = manifest.get("pairs") or {}
+    run_files = manifest.get("run_files") or {}
+    missing_models = {}
+    missing_templates = {}
+    for key, status in pairs.items():
+        label, template_id = split_pair_key(key)
+        target = targets_by_label.get(label)
+        template = templates_by_id.get(template_id)
+        if status == "done":
+            rel = run_files.get(key)
+            run_data = None
+            if rel:
+                run_data = load_run_file(os.path.join(results_dir, rel))
+            if run_data is not None:
+                preloaded.setdefault(label, {})[template_id] = run_data
+                continue
+            # The run file is gone (deleted from Past runs): run
+            # the pair again instead of showing a hole.
+            status = "pending"
+            pairs[key] = "pending"
+        if status == "skipped":
+            continue
+        if target is None:
+            missing_models[label] = missing_models.get(label, 0) + 1
+            pairs[key] = "skipped"
+            continue
+        if template is None:
+            missing_templates[template_id] = (
+                missing_templates.get(template_id, 0) + 1)
+            pairs[key] = "skipped"
+            continue
+        if status in ("pending", "failed"):
+            pair_set.add((label, template_id))
+    targets = []
+    for entry in manifest.get("targets") or []:
+        label = entry.get("label")
+        target = targets_by_label.get(label)
+        if target is None:
+            continue
+        if any(pair_label == label for pair_label, _tid in pair_set):
+            targets.append(target)
+    for label, count in sorted(missing_models.items()):
+        notes.append(
+            f"{label} is no longer installed, so its "
+            f"{count} {'pair' if count == 1 else 'pairs'} "
+            "were skipped."
+        )
+    for template_id, count in sorted(missing_templates.items()):
+        template = templates_by_id.get(template_id)
+        name = template["name"] if template else template_id
+        notes.append(
+            f"The {name} template is gone, so "
+            f"{count} {'pair' if count == 1 else 'pairs'} "
+            "were skipped."
+        )
+    return targets, pair_set, preloaded, notes
+
+
+def merge_resume_result(result, extra_templates=None):
+    """Fold a resumed run's done pairs into a model's result (v17):
+    the templates dict gains the extra run files, and the overall
+    score, average speeds, and token totals are recomputed over the
+    whole run. The warmup tokens of the earlier part are not in any
+    run file, so the token total covers the run files only. Mutates
+    and returns the result."""
+    templates = result.setdefault("templates", {})
+    if extra_templates:
+        for tid, run_data in extra_templates.items():
+            templates.setdefault(tid, run_data)
+    scores = [run["template_score"] for run in templates.values()
+              if run.get("template_score") is not None]
+    result["overall_score"] = (
+        sum(scores) / len(scores) if scores else None)
+    speeds = [task["decode_tok_s"] for run in templates.values()
+              for task in run.get("tasks", [])
+              if task.get("decode_tok_s") is not None]
+    result["avg_decode_tok_s"] = (
+        sum(speeds) / len(speeds) if speeds else None)
+    ttfts = [task["ttft_s"] for run in templates.values()
+             for task in run.get("tasks", [])
+             if task.get("ttft_s") is not None]
+    result["avg_ttft_s"] = sum(ttfts) / len(ttfts) if ttfts else None
+    prompt_speeds = [task["prompt_tok_s"] for run in templates.values()
+                     for task in run.get("tasks", [])
+                     if task.get("prompt_tok_s") is not None]
+    result["avg_prompt_tok_s"] = (
+        sum(prompt_speeds) / len(prompt_speeds) if prompt_speeds else None)
+    prompt_total = 0
+    completion_total = 0
+    saw_tokens = False
+    for run_data in templates.values():
+        if run_data.get("prompt_tokens") is not None:
+            prompt_total += run_data["prompt_tokens"]
+            saw_tokens = True
+        if run_data.get("completion_tokens") is not None:
+            completion_total += run_data["completion_tokens"]
+            saw_tokens = True
+    if saw_tokens:
+        result["prompt_tokens"] = prompt_total
+        result["completion_tokens"] = completion_total
+        result["total_tokens"] = prompt_total + completion_total
+        result["estimated_cost_usd"] = estimate_cost(
+            prompt_total, completion_total,
+            result.get("price_input_per_1m"),
+            result.get("price_output_per_1m"),
+        )
+    return result
+
+
 def list_history_models(results_dir):
     """Model slugs that have result folders, sorted."""
     try:
@@ -3555,7 +3926,11 @@ def list_history_models(results_dir):
         return []
     return sorted(
         name for name in entries
+        # v17: the _runs folder holds run manifests, not a model's
+        # runs — it must never appear as a model in Past runs,
+        # Profiles, or Compare.
         if os.path.isdir(os.path.join(results_dir, name))
+        and name != "_runs"
     )
 
 
@@ -3733,8 +4108,10 @@ def render_run_summary(run_data):
     elif score is None:
         lines.append("Score: no scoring (speed only)")
     else:
+        # v17: a speed-scored run counts lengths, not tasks.
+        noun = "lengths" if run_data.get("score_by") == "speed" else "tasks"
         lines.append(
-            f"Score: {score:.0f}% ({run_data.get('passed', '?')}/{run_data.get('total', '?')} tasks"
+            f"Score: {score:.0f}% ({run_data.get('passed', '?')}/{run_data.get('total', '?')} {noun}"
             f"{_not_run_suffix(not_run)})"
         )
     budget_stopped = run_data.get("budget_stopped", 0) or 0
@@ -4446,7 +4823,8 @@ class BenchWorker(QThread):
     run_finished = Signal(str)
 
     def __init__(self, targets, templates, sys_id, machine, results_dir,
-                 time_budget_seconds=None, pairs=None):
+                 time_budget_seconds=None, pairs=None, models_folder=None,
+                 manifest=None):
         super().__init__()
         # R24: a re-run of failed pairs only runs the pairs in the
         # set — (model label, template id). A target with no pairs
@@ -4466,6 +4844,75 @@ class BenchWorker(QThread):
         # its own window, starting when the template starts.
         self.time_budget_seconds = time_budget_seconds
         self._stop = False
+        # v17: the saved models folder, passed to the Ollama a
+        # mid-run restart starts; whether this run has already used
+        # its one restart; and the model sizes for the RAM check,
+        # fetched once when the run starts.
+        self._models_folder = models_folder
+        self._ollama_restarted = False
+        self._model_sizes = {}
+        self._total_steps = 0
+        self._done_steps = 0
+        # v17: this run's manifest (created by the window, or by the
+        # worker itself when none was passed). The worker owns it
+        # from here: every pair updates it, every ending finishes it.
+        self._manifest = manifest
+
+    def _save_manifest(self):
+        """Write the manifest now, when there is one. A failed write
+        never stops a run — the manifest is a convenience, not the
+        run itself."""
+        if self._manifest is None:
+            return
+        try:
+            save_manifest(self.results_dir, self._manifest)
+        except OSError:
+            pass
+
+    def _finish_manifest(self, status):
+        """Mark the manifest finished with its end status. A manifest
+        with pending or failed pairs left stays resumable, whatever
+        the end status says."""
+        if self._manifest is None:
+            return
+        self._manifest["status"] = status
+        self._manifest["finished_at"] = (
+            datetime.now().isoformat(timespec="seconds"))
+        self._save_manifest()
+
+    def _set_pair_status(self, label, template_id, status, run_file=None):
+        """Mark one pair in the manifest (v17) and save it at once:
+        a crash after this pair still leaves the manifest true."""
+        if self._manifest is None:
+            return
+        self._manifest.setdefault("pairs", {})[
+            pair_key(label, template_id)] = status
+        if run_file is not None:
+            self._manifest.setdefault("run_files", {})[
+                pair_key(label, template_id)] = run_file
+        self._save_manifest()
+
+    def _fail_model_pairs(self, label):
+        """Mark one model's unfinished pairs failed (v17): the model
+        itself errored, so a resume retries them. Done pairs stay
+        done; skipped pairs stay skipped."""
+        if self._manifest is None:
+            return
+        pairs = self._manifest.get("pairs") or {}
+        changed = False
+        for key, status in pairs.items():
+            if status in ("pending", "failed"):
+                pair_label, _tid = split_pair_key(key)
+                if pair_label == label:
+                    pairs[key] = "failed"
+                    changed = True
+        if changed:
+            self._save_manifest()
+
+    def _end_run(self, reason):
+        """End the run: mark the manifest finished and tell the window."""
+        self._finish_manifest(reason)
+        self.run_finished.emit(reason)
 
     def request_cancel(self):
         self._stop = True
@@ -4499,6 +4946,28 @@ class BenchWorker(QThread):
             self._should_stop,
         )
 
+    def _try_restart_ollama(self, target):
+        """Restart a dead local Ollama once per run (v17). Returns
+        True when a restart was attempted and Ollama answers again.
+        Provider targets and remote addresses never trigger it, and
+        a second death in the same run fails without another restart.
+        Runs on the worker thread, so the up-to-30-second wait does
+        not freeze the window; the progress line says what is
+        happening."""
+        if target.get("kind") != "ollama":
+            return False
+        if not ollama_address_is_local():
+            return False
+        if self._ollama_restarted:
+            return False
+        self._ollama_restarted = True
+        percent = (int(100 * self._done_steps / self._total_steps)
+                   if self._total_steps else 0)
+        self.progress.emit("Ollama stopped, restarting it...", percent)
+        log_event("Ollama stopped during the run; restarting it once.")
+        ok, _message = start_ollama_process(self._models_folder)
+        return ok
+
     def _generate(self, target, prompt, num_predict):
         """One generate call, retried once if the other end did not answer.
 
@@ -4516,7 +4985,16 @@ class BenchWorker(QThread):
             time.sleep(RETRY_DELAY)
             if self._stop:
                 raise Cancelled()
-            return self._call_once(target, prompt, num_predict)
+            try:
+                return self._call_once(target, prompt, num_predict)
+            except OllamaError as exc2:
+                # v17: Ollama may have died loading the model (out of
+                # memory on a small box). Restart it once per run and
+                # try once more; if that fails, fail as before.
+                if (is_unreachable(exc2)
+                        and self._try_restart_ollama(target)):
+                    return self._call_once(target, prompt, num_predict)
+                raise
 
     def _call_chat(self, target, messages, num_predict, tools=None):
         """One chat call (Ollama /api/chat or provider chat completions).
@@ -4546,7 +5024,16 @@ class BenchWorker(QThread):
             time.sleep(RETRY_DELAY)
             if self._stop:
                 raise Cancelled()
-            return self._call_chat(target, messages, num_predict, tools)
+            try:
+                return self._call_chat(target, messages, num_predict, tools)
+            except OllamaError as exc2:
+                # v17: same mid-run restart as _generate — Ollama may
+                # have died loading the model. Once per run, then fail.
+                if (is_unreachable(exc2)
+                        and self._try_restart_ollama(target)):
+                    return self._call_chat(target, messages, num_predict,
+                                           tools)
+                raise
 
     def _count_steps(self):
         """Progress steps: one warmup per target, then one step per
@@ -5000,9 +5487,16 @@ class BenchWorker(QThread):
         budget_stopped = sum(
             1 for t in task_results if is_budget_stopped(t)
         )
-        if template["scored"]:
+        if template["scored"] or template.get("score_by") == "speed":
             ran = [t for t in task_results
                    if not is_not_run(t) and not is_budget_stopped(t)]
+            if template.get("score_by") == "speed":
+                # v17: Speed scores decode speed, not answers — each
+                # context length earns a credit from its own tok/s,
+                # so a fast short run cannot mask a slow long one.
+                # Failed jobs earn 0; jobs that never ran stay out.
+                for t in ran:
+                    t["credit"] = speed_credit(t.get("decode_tok_s"))
             # M4: the score is over credits, not passes — a task
             # with steps earns a fraction per part right, so a
             # half-right task counts half. Tasks without a credit
@@ -5080,6 +5574,10 @@ class BenchWorker(QThread):
                 target["price_input_per_1m"], target["price_output_per_1m"],
             ),
         }
+        # v17: a speed-scored run says so, so the summary can call
+        # its items lengths instead of tasks.
+        if template.get("score_by"):
+            run_data["score_by"] = template["score_by"]
         path = save_run_file(self.results_dir, label, self.sys_id, run_data, stamp=stamp)
         return run_data, path
 
@@ -5091,14 +5589,48 @@ class BenchWorker(QThread):
         )
         self.step_progress.emit(self._done_steps, self._total_steps)
 
+    def _ram_skip_reason(self, target):
+        """v17: why a model must not load, or None when it fits (or
+        the check cannot run). Need is the file size times
+        RAM_NEED_FACTOR, against MemAvailable read fresh for this
+        model. Provider targets never reach here — the caller checks
+        the kind first. An unreadable size or meminfo means proceed
+        without the check, never block a run on a failed read."""
+        size = self._model_sizes.get(target["model"])
+        if size is None:
+            return None
+        available = mem_available_bytes()
+        if available is None:
+            return None
+        need = int(size * RAM_NEED_FACTOR)
+        if need <= available:
+            return None
+        return (f"skipped: needs ~{fmt_bytes(need)} RAM, "
+                f"{fmt_bytes(available)} free. "
+                "Close other apps and run again.")
+
     def run(self):
         self._total_steps = self._count_steps()
         self._done_steps = 0
+        # v17: model sizes for the RAM check, once per run. {} when
+        # Ollama does not answer — the check then stays off.
+        self._model_sizes = list_model_sizes()
+        # v17: the manifest for this run — the one passed in (a
+        # resume or a re-run), or a fresh one. A resumed manifest
+        # goes back to running with its pairs as they stood.
+        if self._manifest is None:
+            self._manifest = new_manifest(
+                new_run_id(self.results_dir), self.targets,
+                self.templates, self.sys_id)
+        else:
+            self._manifest["status"] = "running"
+            self._manifest["finished_at"] = None
+        self._save_manifest()
         self.run_started.emit(self._total_steps)
         for target in self.targets:
             label = target["label"]
             if self._stop:
-                self.run_finished.emit("cancelled")
+                self._end_run("cancelled")
                 return
             self.model_started.emit(label)
             result = {
@@ -5121,6 +5653,26 @@ class BenchWorker(QThread):
             }
             warmup_prompt_tokens = None
             warmup_completion_tokens = None
+            # v17: a model too big for the free RAM is skipped, not
+            # run into an out-of-memory kill that takes Ollama down
+            # with it. No run files, no scores — the run carries on
+            # with the next model. The steps still count, so the
+            # progress line stays honest.
+            if target["kind"] == "ollama":
+                skip_reason = self._ram_skip_reason(target)
+                if skip_reason is not None:
+                    result["status"] = skip_reason
+                    log_event(f"{label}: {skip_reason}")
+                    self._done_steps += count_run_steps(
+                        [target], self.templates, self.pairs)
+                    self.progress.emit(
+                        f"{label}: skipped, not enough free RAM",
+                        int(100 * self._done_steps / self._total_steps),
+                    )
+                    self.step_progress.emit(
+                        self._done_steps, self._total_steps)
+                    self.model_done.emit(label, result)
+                    continue
             try:
                 self.progress.emit(
                     f"{label}: warming up",
@@ -5143,15 +5695,18 @@ class BenchWorker(QThread):
                 # "N of M steps" line is right from the first step.
                 self.step_progress.emit(self._done_steps, self._total_steps)
             except Cancelled:
-                self.run_finished.emit("cancelled")
+                self._end_run("cancelled")
                 return
             except OllamaError as exc:
                 if is_unreachable(exc):
                     # The warmup retry already failed: Ollama is gone.
                     result["status"] = f"failed: {describe_error(exc)}"
                     self.model_done.emit(label, result)
-                    self.run_finished.emit("ollama_down")
+                    self._end_run("ollama_down")
                     return
+                # The model itself failed: its pairs failed too, so a
+                # resume retries them.
+                self._fail_model_pairs(label)
                 result["status"] = f"failed: {exc}"
                 self.model_done.emit(label, result)
                 continue
@@ -5159,6 +5714,7 @@ class BenchWorker(QThread):
                 # The provider did not answer or rejected the key: this
                 # model fails plainly and the run carries on with the
                 # rest, including the local Ollama models.
+                self._fail_model_pairs(label)
                 result["status"] = f"failed: {exc}"
                 self.model_done.emit(label, result)
                 continue
@@ -5190,19 +5746,28 @@ class BenchWorker(QThread):
                             "total_tokens": None,
                             "estimated_cost_usd": None,
                         }
+                        # v17: resolved, never to run — a resume must
+                        # not offer it again.
+                        self._set_pair_status(
+                            label, template["id"], "skipped")
                         continue
                     run_data, path = self._run_template(target, template)
                     result["templates"][template["id"]] = run_data
                     result["templates"][template["id"]]["run_file"] = path
+                    # v17: done, with the run file recorded so a
+                    # resume loads it instead of running it again.
+                    self._set_pair_status(label, template["id"], "done",
+                                          run_file=os.path.relpath(
+                                              path, self.results_dir))
                     self.template_done.emit(label, run_data, path)
             except Cancelled:
-                self.run_finished.emit("cancelled")
+                self._end_run("cancelled")
                 return
             except OllamaUnreachable as exc:
                 log_event(f"Ollama stopped responding during the run: {exc}")
                 result["status"] = f"failed: {exc}"
                 self.model_done.emit(label, result)
-                self.run_finished.emit("ollama_down")
+                self._end_run("ollama_down")
                 return
             scores = [
                 run["template_score"]
@@ -5270,12 +5835,48 @@ class BenchWorker(QThread):
                 result["size_ram"] = ps_sizes().get(label)
             self.model_done.emit(label, result)
         self.progress.emit("Done.", 100)
-        self.run_finished.emit("done")
+        self._end_run("done")
 
 
 # ---------------------------------------------------------------------------
 # Ollama starter (runs `ollama serve` detached, then waits for it)
 # ---------------------------------------------------------------------------
+
+def start_ollama_process(models_folder=None):
+    """Start `ollama serve` detached and wait for it to answer.
+
+    Returns (True, "") when Ollama answers, else (False, message).
+    The OllamaStarter thread, the mid-run restart, and headless mode
+    all share this. Already-running returns True at once, without
+    launching a second server. The saved models folder goes to the
+    child as OLLAMA_MODELS (R18) — unless the environment already
+    sets it, in which case the child inherits it and this stays out.
+    """
+    if ollama_reachable():
+        return True, ""
+    env = None
+    if models_folder and "OLLAMA_MODELS" not in os.environ:
+        env = dict(os.environ)
+        env["OLLAMA_MODELS"] = models_folder
+    try:
+        subprocess.Popen(
+            ["ollama", "serve"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+    except FileNotFoundError:
+        return False, START_OLLAMA_MISSING_MSG
+    except OSError as exc:
+        return False, f"Could not start Ollama: {exc}"
+    deadline = time.monotonic() + START_OLLAMA_TIMEOUT
+    while time.monotonic() < deadline:
+        if ollama_reachable():
+            return True, ""
+        time.sleep(START_OLLAMA_POLL)
+    return False, START_OLLAMA_TIMEOUT_MSG
+
 
 class OllamaStarter(QThread):
     started_ok = Signal()
@@ -5289,34 +5890,11 @@ class OllamaStarter(QThread):
         self.models_folder = models_folder
 
     def run(self):
-        if ollama_reachable():
+        ok, message = start_ollama_process(self.models_folder)
+        if ok:
             self.started_ok.emit()
-            return
-        env = None
-        if self.models_folder and "OLLAMA_MODELS" not in os.environ:
-            env = dict(os.environ)
-            env["OLLAMA_MODELS"] = self.models_folder
-        try:
-            subprocess.Popen(
-                ["ollama", "serve"],
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=env,
-            )
-        except FileNotFoundError:
-            self.failed.emit(START_OLLAMA_MISSING_MSG)
-            return
-        except OSError as exc:
-            self.failed.emit(f"Could not start Ollama: {exc}")
-            return
-        deadline = time.monotonic() + START_OLLAMA_TIMEOUT
-        while time.monotonic() < deadline:
-            if ollama_reachable():
-                self.started_ok.emit()
-                return
-            time.sleep(START_OLLAMA_POLL)
-        self.failed.emit(START_OLLAMA_TIMEOUT_MSG)
+        else:
+            self.failed.emit(message)
 
 
 # ---------------------------------------------------------------------------
@@ -6232,6 +6810,12 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.pull_worker = None
         self.starter = None
+        # v17: a run or a pull waiting for Ollama to start — the
+        # starter runs it when Ollama answers, or drops it when the
+        # start fails. A run is (targets, templates, pairs); a pull
+        # is the model name.
+        self._pending_run = None
+        self._pending_pull = None
         self.provider_test_worker = None
         # R19: pulls waiting behind the one running, and pulls that
         # stopped part-way (name -> (completed, total) bytes) so a
@@ -6245,6 +6829,14 @@ class MainWindow(QMainWindow):
         self._last_run_targets = []
         self._last_run_templates = []
         self._last_run_pairs = None
+        # v17: the last run's manifest, so "Re-run failed only"
+        # updates the same manifest instead of starting a new one;
+        # the done pairs a resumed run preloads; and what the run
+        # preview says when it is a resume.
+        self._last_run_manifest = None
+        self._resume_preloaded = {}
+        self._preview_resume = None
+        self._resumable_manifest = None
         self._history_runs = []
         self._reduce_motion = bool(
             load_app_settings().get("reduce_motion", False)
@@ -6831,6 +7423,12 @@ class MainWindow(QMainWindow):
         self.run_button = QPushButton("Run")
         self.run_button.clicked.connect(self.start_run)
         run_row.addWidget(self.run_button)
+        # v17: resume the latest run that did not finish. It sits
+        # next to Run, where the run happens — never on another tab.
+        self.resume_button = QPushButton("Resume last run")
+        self.resume_button.clicked.connect(self.start_resume)
+        self.resume_button.setEnabled(False)
+        run_row.addWidget(self.resume_button)
         run_row.addStretch()
         layout.addLayout(run_row)
 
@@ -7068,7 +7666,7 @@ class MainWindow(QMainWindow):
             return
         self.checklist_step1.setText(
             "✓ Ollama is running." if ollama_up
-            else "○ Start Ollama: press Start Ollama on the Models tab."
+            else "○ Ollama is not running yet: the app starts it itself."
         )
         self.checklist_step2.setText(
             "✓ At least one model is pulled." if have_model
@@ -7276,6 +7874,12 @@ class MainWindow(QMainWindow):
         for template in templates:
             if template["scored"]:
                 label = f"{template['name']} ({len(template['tasks'])} tasks)"
+            elif (template.get("score_by") == "speed"
+                    and template.get("context_lengths")):
+                # v17: Speed scores per context length, so the list
+                # counts lengths instead of saying "no scoring".
+                label = (f"{template['name']} "
+                         f"({len(template['context_lengths'])} lengths)")
             else:
                 label = f"{template['name']} (no scoring)"
             capability = template.get("capability", "text")
@@ -7374,6 +7978,16 @@ class MainWindow(QMainWindow):
             self.run_button.setEnabled(False)
             self.update_template_availability()
             self.refresh_checklist()
+            self.refresh_resume_button()
+            # v17: Ollama is down and nothing lists without it — start
+            # it instead of leaving the user to. Local addresses
+            # only, and never a second starter while one is already
+            # running. Once Ollama answers, the starter's refresh
+            # lists the models; no recursion, because a reachable
+            # Ollama never reaches this branch.
+            if (ollama_error is not None and self.starter is None
+                    and ollama_address_is_local()):
+                self.start_ollama()
             return
         for target in targets:
             item = QListWidgetItem(
@@ -7394,6 +8008,7 @@ class MainWindow(QMainWindow):
             self.run_button.setEnabled(False)
             self.update_template_availability()
             self.refresh_checklist()
+            self.refresh_resume_button()
             return
         self.run_button.setEnabled(True)
         if ollama_error is not None:
@@ -7413,6 +8028,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(status)
         self.update_template_availability()
         self.refresh_checklist()
+        self.refresh_resume_button()
 
     def screen_models(self):
         """Re-screen every Ollama model from scratch: drop the cached
@@ -7615,6 +8231,92 @@ class MainWindow(QMainWindow):
 
     # -- benchmark run ---------------------------------------------------
 
+    def refresh_resume_button(self):
+        """v17: the Resume button offers the latest run that did not
+        finish, or sits disabled when there is none. Checked on
+        startup, on refresh, and when a run ends."""
+        manifest = latest_resumable_manifest(get_results_dir())
+        self._resumable_manifest = manifest
+        if manifest is None:
+            self.resume_button.setText("Resume last run")
+            self.resume_button.setEnabled(False)
+            return
+        pairs = manifest.get("pairs") or {}
+        left = sum(1 for s in pairs.values() if s in ("pending", "failed"))
+        total = len(pairs)
+        self.resume_button.setText(
+            f"Resume last run ({left} of {total} pairs left)")
+        self.resume_button.setEnabled(left > 0 and self.worker is None)
+
+    def start_resume(self):
+        """v17: resume the latest run that did not finish — only the
+        pairs it did not finish. Done pairs load from their run
+        files, so the table shows the whole run."""
+        self.refresh_models()
+        manifest = latest_resumable_manifest(get_results_dir())
+        if manifest is None:
+            self.status_label.setText("No run to resume.")
+            self.refresh_resume_button()
+            return
+        targets_by_label = {}
+        for row in range(self.model_list.count()):
+            item = self.model_list.item(row)
+            target = item.data(Qt.UserRole)
+            if isinstance(target, dict):
+                targets_by_label[target["label"]] = target
+        templates_by_id = {t["id"]: t for t in self.templates}
+        targets, pair_set, preloaded, notes = build_resume_plan(
+            manifest, targets_by_label, templates_by_id, get_results_dir())
+        if not pair_set:
+            # The plan may have marked pairs skipped (a model or
+            # template gone): save that, so the run stops offering
+            # a resume with nothing in it.
+            save_manifest(get_results_dir(), manifest)
+            text = "Nothing left to resume in that run."
+            if notes:
+                text += " " + " ".join(notes)
+            self.status_label.setText(text)
+            self.refresh_resume_button()
+            return
+        if notes:
+            log_event("Resume skips: " + " ".join(notes))
+        self._start_run_with(targets, self.templates, pair_set,
+                             resume=(manifest, preloaded, notes))
+
+    def _preload_resume_results(self, preloaded, targets):
+        """v17: the done pairs of a resumed run, loaded into the
+        results before the worker starts. Models with nothing left
+        to run get their row now, from their run files alone."""
+        running_labels = {t["label"] for t in targets}
+        # Snapshot: a fully-done model goes through on_model_done,
+        # which pops its own entry out of this same dict — iterating
+        # the live dict dies with "dictionary changed size".
+        for label, runs in list(preloaded.items()):
+            if label in running_labels:
+                self.results[label] = {
+                    "name": label, "status": "running",
+                    "templates": dict(runs),
+                }
+            else:
+                result = {
+                    "name": label, "status": "done",
+                    "templates": dict(runs),
+                    "overall_score": None,
+                    "avg_decode_tok_s": None,
+                    "avg_ttft_s": None,
+                    "avg_prompt_tok_s": None,
+                    "size_ram": None,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                    "estimated_cost_usd": None,
+                    "price_input_per_1m": None,
+                    "price_output_per_1m": None,
+                }
+                merge_resume_result(result)
+                self.on_model_started(label)
+                self.on_model_done(label, result)
+
     def start_run(self):
         targets = self.selected_targets()
         templates = self.selected_templates()
@@ -7641,12 +8343,22 @@ class MainWindow(QMainWindow):
         pair_set = {(t["label"], x["id"]) for t, x in pairs}
         targets = [t for t in self._last_run_targets
                    if any(label == t["label"] for label, _tid in pair_set)]
+        # v17: the re-run updates the same manifest the run wrote,
+        # so Resume sees the pairs it finished.
         self._start_run_with(
-            targets, self._last_run_templates, pair_set)
+            targets, self._last_run_templates, pair_set,
+            manifest=self._last_run_manifest)
 
-    def _start_run_with(self, targets, templates, pairs=None):
+    def _start_run_with(self, targets, templates, pairs=None, resume=None,
+                        manifest=None):
         """Start a run over the given targets and templates — the
-        whole run, or only the pairs in the set (a re-run, R24)."""
+        whole run, or only the pairs in the set (a re-run, R24, or a
+        resume, v17). resume is (manifest, preloaded, notes) for a
+        resumed run; manifest reuses one run's manifest for a re-run.
+        """
+        # v17: a resumed run's done pairs, folded into each model's
+        # result as it finishes. A fresh run or a re-run has none.
+        self._resume_preloaded = resume[1] if resume is not None else {}
         # The list may have come from the CLI fallback while the API was
         # down, or Ollama may have stopped since the window opened: check
         # it answers before starting, or every local model fails one by
@@ -7654,15 +8366,51 @@ class MainWindow(QMainWindow):
         # Ollama at all.
         needs_ollama = any(t["kind"] == "ollama" for t in targets)
         if needs_ollama and not ollama_reachable():
+            # v17: a local Ollama starts itself and the run waits
+            # behind it — the user never starts anything by hand. A
+            # remote address cannot be started from here, so that
+            # run still waits on the user.
+            if ollama_address_is_local():
+                self._pending_run = (
+                    targets, templates, pairs, resume, manifest)
+                if self.starter is None:
+                    self.status_label.setText(
+                        "Ollama is not running. Starting it now; "
+                        "your run will begin when it answers.")
+                    self.start_ollama()
+                else:
+                    self.status_label.setText(
+                        "Ollama is starting. Your run will begin "
+                        "when it answers.")
+                return
+            self._resume_preloaded = {}
             self.status_label.setText(OLLAMA_DOWN_RUN_MESSAGE)
             return
         # R11: every run shows its preview first — what will run, how
         # long it may take, what it will cost — and asks to go ahead.
         # The old cost guard is folded into it: a provider run's cost
         # is part of the preview, named there.
-        if not self._show_run_preview(targets, templates, pairs):
+        self._preview_resume = (
+            (resume[0], resume[2]) if resume is not None else None)
+        try:
+            preview_ok = self._show_run_preview(targets, templates, pairs)
+        finally:
+            self._preview_resume = None
+        if not preview_ok:
             self.status_label.setText("Run cancelled.")
+            self._resume_preloaded = {}
             return
+        # v17: this run's manifest — the resumed or re-run one, or a
+        # fresh one. Made here, after the preview was accepted, so a
+        # cancelled preview leaves no manifest behind.
+        if manifest is None:
+            if resume is not None:
+                manifest = resume[0]
+            else:
+                manifest = new_manifest(
+                    new_run_id(get_results_dir()), targets, templates,
+                    self.sys_id)
+        self._last_run_manifest = manifest
         # R18: this run's templates become each ticked model's usual
         # set. Saved here, after the preview was accepted — a
         # cancelled preview saves nothing. A re-run saves nothing:
@@ -7691,6 +8439,7 @@ class MainWindow(QMainWindow):
         self.export_html_button.setEnabled(False)
         self.rerun_failed_button.setEnabled(False)
         self.run_button.setEnabled(False)
+        self.resume_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.select_all_button.setEnabled(False)
         self.clear_button.setEnabled(False)
@@ -7716,6 +8465,10 @@ class MainWindow(QMainWindow):
             targets, templates, self.sys_id, self.machine, get_results_dir(),
             time_budget_seconds=self._time_budget_seconds(),
             pairs=pairs,
+            # v17: the mid-run restart starts Ollama with the saved
+            # models folder, like the Start Ollama button does.
+            models_folder=load_app_settings()["models_folder"] or None,
+            manifest=manifest,
         )
         self._update_delete_button()
         self.worker.model_started.connect(self.on_model_started)
@@ -7725,6 +8478,10 @@ class MainWindow(QMainWindow):
         self.worker.run_started.connect(self.on_run_started)
         self.worker.step_progress.connect(self.on_step_progress)
         self.worker.run_finished.connect(self.on_run_finished)
+        # v17: a resumed run shows the whole run — the done pairs
+        # load into the results before the worker starts.
+        if resume is not None:
+            self._preload_resume_results(resume[1], targets)
         self.worker.start()
         if pairs is None:
             log_event(
@@ -7755,7 +8512,8 @@ class MainWindow(QMainWindow):
         the suite, which stubs it so existing run tests pass through
         without a dialog."""
         preview = build_run_preview(
-            targets, templates, get_results_dir(), pairs)
+            targets, templates, get_results_dir(), pairs,
+            resume=getattr(self, "_preview_resume", None))
         dialog = RunPreviewDialog(self, preview["text"])
         return dialog.exec() == QDialog.Accepted
 
@@ -7777,10 +8535,28 @@ class MainWindow(QMainWindow):
         self.start_ollama_button.setEnabled(True)
         self.refresh_models()
         self.status_label.setText("Ollama is running.")
+        # v17: a run or a pull that waited for the start goes now.
+        # The run's preview still shows first — it happens inside
+        # _start_run_with, after the reachable check.
+        pending_run = self._pending_run
+        self._pending_run = None
+        pending_pull = self._pending_pull
+        self._pending_pull = None
+        if pending_run is not None:
+            self._start_run_with(*pending_run)
+        if pending_pull is not None:
+            self._begin_pull(pending_pull)
 
     def on_ollama_start_failed(self, message):
         self.starter = None
         self.start_ollama_button.setEnabled(True)
+        # v17: nothing waiting on the start can go now. A queued
+        # pull's name goes back in the box, like a failed pull.
+        self._pending_run = None
+        pending_pull = self._pending_pull
+        self._pending_pull = None
+        if pending_pull is not None and not self.pull_input.text():
+            self.pull_input.setText(pending_pull)
         self.status_label.setText(message)
 
     # -- pull a model ----------------------------------------------------
@@ -7815,6 +8591,22 @@ class MainWindow(QMainWindow):
         """Start a pull worker for one model (R19). The Pull button
         stays enabled while a pull runs: pressing it with a new name
         queues that pull behind the running one."""
+        # v17: a pull needs Ollama answering. When it is down and
+        # local, start it and pull when it answers instead of
+        # failing at once. A remote address still fails plainly —
+        # it cannot be started from here.
+        if not ollama_reachable() and ollama_address_is_local():
+            self._pending_pull = name
+            if self.starter is None:
+                self.pull_status.setText(
+                    "Ollama is not running. Starting it now; "
+                    "your pull will begin when it answers.")
+                self.start_ollama()
+            else:
+                self.pull_status.setText(
+                    "Ollama is starting. Your pull will begin "
+                    "when it answers.")
+            return
         self._pull_resuming = name in self.pull_interrupted
         self.pull_cancel_button.setEnabled(True)
         self.pull_bar.setRange(0, 100)
@@ -8085,6 +8877,12 @@ class MainWindow(QMainWindow):
         self.results[name]["templates"][run_data["template"]] = run_data
 
     def on_model_done(self, name, result):
+        # v17: a resumed run folds the model's done pairs back in,
+        # so the table shows the whole run, not just the resumed
+        # part. The preloaded entry itself is dropped either way.
+        preloaded = self._resume_preloaded.pop(name, None)
+        if preloaded:
+            merge_resume_result(result, preloaded)
         self.results[name] = result
         self.result_order.append(name)
         row = self._row_for(name)
@@ -8180,6 +8978,11 @@ class MainWindow(QMainWindow):
         self._update_delete_button()
         # A finished run completes the checklist's third step.
         self.refresh_checklist()
+        # v17: a run that ended early leaves a resumable manifest,
+        # so the Resume button is re-checked now; and the preloaded
+        # pairs of a resumed run are spent.
+        self._resume_preloaded = {}
+        self.refresh_resume_button()
 
     def _show_finish_label(self, elapsed):
         """R13: the finish moment — one headline naming the best
@@ -9345,6 +10148,58 @@ def _split_names(value):
     return [part.strip() for part in (value or "").split(",") if part.strip()]
 
 
+def ensure_ollama_headless():
+    """v17: make sure a local Ollama is answering before a headless
+    run — starting it when it is down. Returns None when Ollama
+    answers (or a start made it answer), else a plain error. A
+    remote address is never started from here."""
+    if ollama_reachable():
+        return None
+    if not ollama_address_is_local():
+        return OLLAMA_DOWN_RUN_MESSAGE
+    ok, message = start_ollama_process(
+        load_app_settings()["models_folder"] or None)
+    if not ok:
+        return message
+    if not ollama_reachable():
+        return "Ollama started but stopped answering. Try again."
+    return None
+
+
+def headless_targets_for_labels(labels):
+    """v17 (resume): the known targets for the given labels — Ollama
+    models screened like the window does, provider models from the
+    saved providers. Labels that match nothing come back as missing,
+    for the caller to report; nothing here errors."""
+    providers, _warnings = load_providers()
+    provider_targets = {}
+    for provider in providers:
+        for model_entry in provider.get("models", []):
+            label = provider_label(provider["name"], model_entry["id"])
+            provider_targets[label] = provider_target(provider, model_entry)
+    targets = {}
+    missing = []
+    for label in labels:
+        if label in provider_targets:
+            targets[label] = provider_targets[label]
+    ollama_labels = [label for label in labels
+                     if label not in provider_targets]
+    if ollama_labels:
+        available, _source = list_models()
+        caps_cache = load_capabilities()
+        screened = False
+        for label in ollama_labels:
+            if label not in available:
+                missing.append(label)
+                continue
+            caps = screen_ollama_model(label, caps_cache)
+            screened = True
+            targets[label] = ollama_target(label, caps)
+        if screened:
+            save_capabilities(caps_cache)
+    return targets, missing
+
+
 def resolve_headless_targets(names):
     """Turn --models names into benchmark targets.
 
@@ -9371,7 +10226,9 @@ def resolve_headless_targets(names):
         # Provider-only runs skip this check — they do not need
         # Ollama at all, same as the window.
         if not ollama_reachable():
-            return None, OLLAMA_DOWN_RUN_MESSAGE
+            error = ensure_ollama_headless()
+            if error is not None:
+                return None, error
         available, _source = list_models()
         caps_cache = load_capabilities()
         screened = False
@@ -9400,39 +10257,115 @@ def run_headless(args):
 
     No QApplication is created here — only a QCoreApplication, which
     needs no window and no display, to run the worker's event loop.
+
+    With --resume, the latest incomplete run (or the run-id given)
+    picks up where it left off: only its pending and failed pairs
+    run, and the done pairs load from their run files.
     """
-    model_names = _split_names(args.models)
-    template_ids = _split_names(args.templates)
-    if not model_names:
-        print("Headless mode needs --models: the models to test, "
-              "e.g. --models qwen3:0.6b")
-        return 1
-    if not template_ids:
-        print("Headless mode needs --templates: the test templates "
-              "to run, e.g. --templates coding,math")
-        return 1
+    results_dir = get_results_dir()
     templates, warnings = load_templates()
     for warning in warnings:
         print(f"Warning: {warning}")
     by_id = {t["id"]: t for t in templates}
-    chosen = []
-    for template_id in template_ids:
-        template = by_id.get(template_id)
-        if template is None:
-            print(f"Template not found: {template_id}.")
-            print("Templates I know about: " + ", ".join(sorted(by_id)))
+    resume = getattr(args, "resume", None)
+    preloaded = {}
+    manifest = None
+    pairs = None
+    if resume is not None:
+        if resume == "__latest__":
+            manifest = latest_resumable_manifest(results_dir)
+            if manifest is None:
+                print("No run to resume.")
+                return 1
+        else:
+            manifest = load_manifest(results_dir, resume)
+            if manifest is None:
+                print(f"No run with id {resume}.")
+                return 1
+            if not manifest_is_resumable(manifest):
+                print(f"Run {resume} already finished.")
+                return 1
+        # A resumed run may need Ollama: start it first, so the
+        # models in the manifest can be listed and screened.
+        if any(t.get("kind") == "ollama"
+               for t in manifest.get("targets", [])):
+            error = ensure_ollama_headless()
+            if error is not None:
+                print(error)
+                return 1
+        labels = [t["label"] for t in manifest.get("targets", [])]
+        targets_by_label, _missing = headless_targets_for_labels(labels)
+        targets, pair_set, preloaded, notes = build_resume_plan(
+            manifest, targets_by_label, by_id, results_dir)
+        if not pair_set:
+            # The plan may have marked pairs skipped (a model or
+            # template gone): save that, so the run stops offering
+            # a resume with nothing in it.
+            save_manifest(results_dir, manifest)
+            print("Nothing left to resume in that run.")
+            for note in notes:
+                print(note)
             return 1
-        chosen.append(template)
-    targets, error = resolve_headless_targets(model_names)
-    if error is not None:
-        print(error)
-        return 1
-    results_dir = get_results_dir()
+        started = (manifest.get("started") or "").replace("T", " ")
+        print(f"Resuming the run from {started}...")
+        for note in notes:
+            print(note)
+        # The worker filters by pairs, so it takes all the templates.
+        chosen = templates
+        pairs = pair_set
+    else:
+        model_names = _split_names(args.models)
+        template_ids = _split_names(args.templates)
+        if not model_names:
+            print("Headless mode needs --models: the models to test, "
+                  "e.g. --models qwen3:0.6b")
+            return 1
+        if not template_ids:
+            print("Headless mode needs --templates: the test templates "
+                  "to run, e.g. --templates coding,math")
+            return 1
+        chosen = []
+        for template_id in template_ids:
+            template = by_id.get(template_id)
+            if template is None:
+                print(f"Template not found: {template_id}.")
+                print("Templates I know about: " + ", ".join(sorted(by_id)))
+                return 1
+            chosen.append(template)
+        targets, error = resolve_headless_targets(model_names)
+        if error is not None:
+            print(error)
+            return 1
     machine = machine_info()
     sys_id = system_id(machine)
     results = {}
     order = []
     run_files = []
+    # v17: models whose pairs are all done already get their rows
+    # from their run files, before the worker starts.
+    if preloaded:
+        running_labels = {t["label"] for t in targets}
+        for label, runs in preloaded.items():
+            if label in running_labels:
+                continue
+            result = {
+                "name": label, "status": "done",
+                "templates": dict(runs),
+                "overall_score": None,
+                "avg_decode_tok_s": None,
+                "avg_ttft_s": None,
+                "avg_prompt_tok_s": None,
+                "size_ram": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "estimated_cost_usd": None,
+                "price_input_per_1m": None,
+                "price_output_per_1m": None,
+            }
+            merge_resume_result(result)
+            results[label] = result
+            order.append(label)
 
     core_app = QCoreApplication(sys.argv)
     # A no-op timer keeps the event loop waking up, so Ctrl+C reaches
@@ -9442,7 +10375,11 @@ def run_headless(args):
     keepalive.timeout.connect(lambda: None)
     keepalive.start()
 
-    worker = BenchWorker(targets, chosen, sys_id, machine, results_dir)
+    worker = BenchWorker(targets, chosen, sys_id, machine, results_dir,
+                         # v17: the mid-run restart starts Ollama with
+                         # the saved models folder, like the window.
+                         models_folder=load_app_settings()["models_folder"] or None,
+                         pairs=pairs, manifest=manifest)
 
     def on_model_started(name):
         print(f"Testing {name}...")
@@ -9459,6 +10396,10 @@ def run_headless(args):
             print(f"  {template_name}: {score:.0f}%")
 
     def on_model_done(name, result):
+        # v17: a resumed run folds the model's done pairs back in.
+        extra = preloaded.get(name)
+        if extra:
+            merge_resume_result(result, extra)
         results[name] = result
         order.append(name)
 
@@ -9559,6 +10500,12 @@ def main():
         help="comma-separated template ids to run in headless mode, "
         "e.g. coding,math",
     )
+    parser.add_argument(
+        "--resume", nargs="?", const="__latest__", metavar="RUN-ID",
+        help="resume an incomplete run in headless mode: the latest "
+        "one, or the run-id given. --models and --templates are not "
+        "needed with it",
+    )
     args = parser.parse_args()
     # The media folders exist from the first launch, window or not.
     ensure_media_dirs()
@@ -9573,9 +10520,9 @@ def main():
     apply_saved_settings_to_env()
     if args.headless:
         sys.exit(run_headless(args))
-    if args.models or args.templates:
-        print("--models and --templates only apply with --headless; "
-              "opening the window.", file=sys.stderr)
+    if args.models or args.templates or args.resume is not None:
+        print("--models, --templates and --resume only apply with "
+              "--headless; opening the window.", file=sys.stderr)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     # R21: the saved text size applies before the window is built,

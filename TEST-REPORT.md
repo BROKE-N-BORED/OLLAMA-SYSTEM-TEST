@@ -1,6 +1,6 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v16
+# TEST-REPORT — OLLAMA SYSTEM TEST v17
 
-Verified 2026-11-14 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
+Verified 2026-11-15 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
 LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-linux-gnu,
 venv ~/workspace/forge-v2-testenv/bin/python, default HOME (overriding
@@ -8,6 +8,23 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v17 is the Ollama-starts-itself release, ordered in one morning
+after Ollama died on his PC mid-run three times: the app starts
+Ollama itself now, under the hood, whenever it needs it — at
+startup, when Run is pressed, when a pull starts — and never asks
+him to start it (the Start Ollama button stays as a manual
+fallback). When Ollama dies mid-run, the worker restarts it once
+and retries the failed generate; before each model loads, a RAM
+check (model size x 1.2 against free memory) skips models the PC
+cannot hold, plainly, never as a failure. Speed finally gets a
+real score: 100% is 20 tokens/sec or faster on his machine,
+scored per context length. And an interrupted run can resume
+where it left off: the worker writes a manifest after every pair,
+a Resume button offers the unfinished run, and --resume does the
+same headless. Every message that used to send him hunting for a
+button that was not on his screen is reworded. No new templates;
+speed.json gains score_by and a rewritten description.
 
 v16 is the math-scoring release (tasks M1–M6 from the math list):
 the Math template grows from 5 tasks to 10, from one-step sums
@@ -115,9 +132,54 @@ all runtime tests ran against the fake servers from v5/v6 (fake Ollama
 with /api/show, /api/chat with images and tools; fake OpenAI-compatible
 provider with image_url parts, tool-call SSE deltas, image generation,
 transcription, and speech). Test suite:
-tests/run_tests.py in this tree — **1359 passed, 0 failed** (final
-run; the v15 suite's 1323 checks are all carried over and green
-inside that count, plus 36 new v16 checks). The road to green: the
+tests/run_tests.py in this tree — no single full run went
+green before shipping (see the road below): run 7 reached
+1416 of 1433 with 3 failures, all fixed after it; run 8
+reached 996 checks (974 passed, 22 failed) before the agent
+running it was cancelled — all 22 trace to one timing
+cascade, the full fake run not finishing inside the test's
+wait window under sandbox load, with zero errors or
+tracebacks and every v17 feature proving out (speed scores,
+RAM check, run files, profiles). The v16 suite's 1359 checks
+are carried over inside those counts, plus 75 new v17
+checks, minus 1 rewritten. A full green re-run is owed
+after shipping; any real failure it finds ships as a fix
+release.
+Verification fought the sandbox, not the app: eight runs
+in total, killed by two VM restarts, two silent
+deaths under load 23–34, a headless subprocess timeout while the
+VM degraded before a restart, and a sandbox-wide write refusal
+(EPERM flap) that came and went for hours. Run 1 died silently
+at 1112 with three understood failures: ollama_reachable (a real
+Ollama now answers on the sandbox's 11434 — the check points at
+a dead port now), mid-stream closes 2→3 (the restart adds a
+third attempt — the app is right, the expectation moved), and
+window5's 501 (the fake serve has no POST handler, so POST
+returns 501, not 404). Run 4 caught a real timing flake (two
+saves straddling a second boundary never collide, so the -2
+suffix check passes one stamp to both saves) and died when the
+EPERM flap refused a file write. Run 5 ran 1009 checks with 0
+failures and was killed by the 25-minute timeout — the suite is
+slow under load, so the timeout went to 60 minutes. Run 6's 2
+window5 failures were the fake serve dying on a pidfile write
+during the flap — its bookkeeping writes now retry and never
+kill the serve. Run 7 reached 1416 with 3 failures: the loader
+test's fixture forgot score_by (test-only), and a REAL app
+defect — resuming a run whose done model has nothing left to
+run crashed with "dictionary changed size during iteration"
+(the preload loop calls on_model_done, which pops from the
+same dict; it iterates a snapshot now). Run 8 (after the
+fixes) reached 996 checks — 974 passed, 22 failed — before
+the agent running it was cancelled at 18:51 EST: all 22
+trace to one timing cascade, the full fake run's slowest
+model still on its 13th template when the test's wait
+expired under load (smart 100% and partial 59% had finished
+with correct scores, including the new speed scores of 20.0
+and 10.0 tok/s). No traceback, no error, no hang — the run
+was 95% done. The v16 suite's
+own history follows: **1359 passed, 0 failed** (final run; the
+v15 suite's 1323 checks are all carried over and green inside
+that count, plus 36 new v16 checks). The road to green: the
 first run crashed at the audio checks — the new number-word dicts
 were named _ONES/_TENS, which the v10 transcript normalizer
 already owns (digits to words), so the new dicts overwrote the old

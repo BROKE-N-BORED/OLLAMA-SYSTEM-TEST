@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v16
+# OLLAMA SYSTEM TEST v17
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,16 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v17 is the Ollama-starts-itself release, no new templates: the app
+starts Ollama on its own whenever it needs it — on opening, before
+a run, before a pull — so there is nothing to start by hand. If
+Ollama dies while a model loads, the run restarts it once and
+retries; a model too big for the free RAM is skipped with a plain
+reason instead of run into an out-of-memory kill. Speed gets a
+real score now (100% is 20 tokens per second or faster on this
+machine), and a run that stops part-way can be resumed from where
+it left off — a Resume button next to Run, or --resume headless.
 
 v16 is a math-scoring release, no UI changes: the Math template
 grows from 5 tasks to 10, from one-step sums to multi-step
@@ -258,6 +268,11 @@ rebuilds the profiles), prints a plain summary, and exits 0 when the
 run finished or 1 when it did not (unknown model or template, Ollama
 not running, or the run stopped). `--help` lists every flag.
 
+`--resume` picks up an unfinished run headless: `--headless --resume`
+resumes the latest one, `--headless --resume <run-id>` resumes a
+specific one. No `--models` or `--templates` needed — the run
+remembers what it was doing. Only the pairs it did not finish run.
+
 ## Capability screening
 
 When the model list loads, the app asks Ollama what each model can do
@@ -281,15 +296,19 @@ never drags the model's score down.
 
 ## If Ollama is not running
 
-The app checks before every run that touches a local model. If Ollama
-is down, the run will not start — press Start Ollama and the app will
-start it for you, wait for it to answer (up to 30 seconds), then refresh
-the model list. If it cannot start Ollama, it will say so: run
-`ollama serve` in a terminal to see the error.
+You do not start Ollama — the app does. It starts Ollama itself
+whenever it needs it: on opening, on Refresh, before a run, and
+before a pull. If Ollama is not installed, install it first; the
+app cannot do that part.
 
-If Ollama stops answering in the middle of a run, the run stops right
-there — it will not plough on through the rest of the models. Start
-Ollama again, press Refresh, and Run again.
+If Ollama stops answering in the middle of a run — usually because
+a model too big for the free RAM took it down while loading — the
+run restarts Ollama once and retries the failed call. If it dies
+a second time, the run stops there, and the Resume button picks
+it up from where it stopped. Before each model, the app also
+checks the free RAM against the model's size: a model too big to
+load is skipped with a plain reason ("needs ~X RAM, Y free. Close
+other apps and run again") instead of being run into a crash.
 
 Provider-only runs do not need Ollama at all: if you tick only provider
 models, the run goes ahead even while Ollama is down.
@@ -410,7 +429,8 @@ environment variable before starting Ollama.
   folder so you can listen. Provider only.
 
 Templates are JSON files in the `templates` folder. You can add your own:
-copy one, change the id, name, and tasks, and press Refresh. A broken
+copy one, change the id, name, and tasks, and press Refresh on the
+Models tab. A broken
 template file is skipped with a warning, it never crashes the app. A
 template can name a `capability` (vision, tools, image_generation,
 audio, long_context) — only models with that capability can run it.
@@ -439,6 +459,14 @@ The system folder comes from your machine (CPU, RAM, OS), so when you
 upgrade your PC one day, the new results go in a new folder and the old
 ones stay untouched. Run files are never overwritten or edited. If two
 runs ever land in the same second, the second one gets -2 on the name.
+
+Each run also writes a manifest, updated after every pair:
+
+    results/_runs/<run-id>.json
+
+It records what the run was doing and which pairs are done, failed,
+or still to run — that is what Resume reads. A manifest is never
+edited by hand; deleting one just means that run cannot be resumed.
 
 Each run file records the provider (`ollama` for local models, the
 provider name otherwise), the model id, and — for provider runs — the
@@ -496,10 +524,13 @@ else you run. These are your own models on your own machine.
 
 ## If something goes wrong
 
-- "Ollama is not running": press Start Ollama in the app, or start
-  Ollama yourself, then press Refresh.
-- "could not reach Ollama. Start it, then press Refresh": Ollama
-  stopped answering. Start it again, press Refresh, and Run again.
+- "Ollama is not running": the app starts Ollama itself when it
+  needs it — press Run again and it will. If it cannot start
+  Ollama, it says why.
+- "could not reach Ollama. Try again and the app will start it.":
+  Ollama stopped answering. Run again and the app restarts it;
+  if a run stopped part-way, the Resume button picks it up where
+  it left off.
 - "provider X did not answer": the provider could not be reached.
   Check the base URL on the Providers tab, or try Test connection.
 - "provider X rejected the key": the API key is wrong or revoked.

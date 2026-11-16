@@ -1,9 +1,9 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v16 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v17 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1323 v15 checks are carried over; the v16 checks
-cover the math scoring rework (M1-M6): last-number scoring, per-task
-tolerance, ten math tasks with a difficulty gradient, partial credit
-for right setup, number words, and fractions plus scientific notation.
+answers per model. All 1359 v16 checks are carried over; the v17 checks
+cover Ollama auto-start (Fix 1), Speed's real score (Fix 2), the mid-run
+restart and RAM check, pull auto-start, and run resume (manifests,
+Resume button, --resume headless).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -60,6 +60,16 @@ os.environ["OST_RESULTS_DIR"] = RESULTS_DIR
 os.environ["OST_PROVIDERS_FILE"] = PROVIDERS_FILE
 os.environ["OST_CAPABILITIES_FILE"] = CAPABILITIES_FILE
 os.environ["OST_LOGS_DIR"] = LOGS_DIR
+# v17: the RAM check reads MemAvailable through this override, so the
+# suite is not at the mercy of the sandbox's free RAM (which can sit
+# under a gigabyte — every fake model would be skipped). 16 GB free
+# lets every fake model run; the RAM-skip checks point it at a small
+# fixture of their own.
+MEMINFO_FILE = os.path.join(VERIFY_DIR, "meminfo-test")
+with open(MEMINFO_FILE, "w", encoding="utf-8") as _meminfo:
+    _meminfo.write("MemTotal:       16777216 kB\n"
+                   "MemAvailable:   16777216 kB\n")
+os.environ["OST_MEMINFO_FILE"] = MEMINFO_FILE
 sys.path.insert(0, PKG_DIR)
 sys.path.insert(0, VERIFY_DIR)
 
@@ -173,10 +183,26 @@ def write_fake_ollama():
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 MODELS = ["serve-model-a:2b", "serve-model-b:1b"]
+
+
+def _note(path, mode, text):
+    # Bookkeeping writes (pidfile, call log, env file) must never
+    # kill the serve: the sandbox occasionally refuses a write
+    # for a minute at a time (EPERM flap, Nov 2026), and a dead
+    # serve fails the starter. Retry briefly, then carry on
+    # without the note.
+    for _attempt in range(6):
+        try:
+            with open(path, mode) as handle:
+                handle.write(text)
+            return
+        except OSError:
+            time.sleep(0.5)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -216,16 +242,13 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         pidfile = os.environ.get("FAKE_OLLAMA_PIDFILE")
         if pidfile:
-            with open(pidfile, "w") as handle:
-                handle.write(str(os.getpid()))
+            _note(pidfile, "w", str(os.getpid()))
         calls = os.environ.get("FAKE_OLLAMA_CALLS")
         if calls:
-            with open(calls, "a") as handle:
-                handle.write("serve\\n")
+            _note(calls, "a", "serve\\n")
         envfile = os.environ.get("FAKE_OLLAMA_ENVFILE")
         if envfile:
-            with open(envfile, "w") as handle:
-                handle.write(os.environ.get("OLLAMA_MODELS", "unset"))
+            _note(envfile, "w", os.environ.get("OLLAMA_MODELS", "unset"))
         port = urlparse(os.environ.get("OLLAMA_HOST", "")).port or 11434
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         server.daemon_threads = True
@@ -301,8 +324,20 @@ def main():
           == app.UNREACHABLE_HINT)
     check("describe_error model error unchanged",
           app.describe_error(app.OllamaError("model exploded")) == "model exploded")
-    check("ollama_reachable false with no server",
-          app.ollama_reachable() is False)
+    # The check runs against a dead port, not the default address:
+    # another Ollama may be answering on this machine (a real one
+    # runs on the sandbox's 11434 now), and "no server" must mean
+    # no server.
+    prior_host_reachable = os.environ.get("OLLAMA_HOST")
+    try:
+        os.environ["OLLAMA_HOST"] = f"http://127.0.0.1:{free_port()}"
+        check("ollama_reachable false with no server",
+              app.ollama_reachable() is False)
+    finally:
+        if prior_host_reachable is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host_reachable
 
     # ---------- unit tests: slugs, machine, system id ----------
     check("slugify_model",
@@ -692,9 +727,15 @@ def main():
         "tasks": [], "template_score": 100.0, "passed": 5, "total": 5,
         "avg_decode_tok_s": 20.0,
     }
-    path1 = app.save_run_file(RESULTS_DIR, "fake-smart:2b", sid, dict(run_data))
+    # v17: one stamp for both saves, so the collision is forced.
+    # Two bare saves can straddle a second boundary under load
+    # and never collide at all (run 4 flaked exactly that way).
+    stamp = datetime.now()
+    path1 = app.save_run_file(RESULTS_DIR, "fake-smart:2b", sid,
+                              dict(run_data), stamp=stamp)
     hash1 = file_hash(path1)
-    path2 = app.save_run_file(RESULTS_DIR, "fake-smart:2b", sid, dict(run_data))
+    path2 = app.save_run_file(RESULTS_DIR, "fake-smart:2b", sid,
+                              dict(run_data), stamp=stamp)
     check("second save makes a second file", path1 != path2 and os.path.exists(path2),
           f"{path1} vs {path2}")
     check("first file bytes unchanged", file_hash(path1) == hash1)
@@ -955,7 +996,9 @@ def main():
     expected = {
         "fake-smart:2b": ("100%", "20.0", "done"),
         "fake-partial:3b": ("59%", "10.0", "done"),
-        "fake-dumb:1b": ("0%", "5.0", "done"),
+        # v17: Speed scores now, so dumb's 5 tok/s is 25% on Speed
+        # and its overall is 25/14 = 2%, not 0%.
+        "fake-dumb:1b": ("2%", "5.0", "done"),
     }
     for name, (score, toks, status) in expected.items():
         row = row_for(window, name)
@@ -983,7 +1026,8 @@ def main():
     detail = window.detail_view.toPlainText()
     check("detail shows smart coding 100%", "Coding: 100% (5/5)" in detail, detail[:400])
     check("detail shows per-task pass", "pass  fibonacci" in detail, detail[:400])
-    check("detail shows speed unscored", "Speed: no scoring" in detail, detail[:400])
+    # v17: Speed scores now — smart's 20 tok/s is 100% on all 3 lengths.
+    check("detail shows speed scored", "Speed: 100% (3/3), 20.0 tok/s" in detail, detail[:400])
     # Click the dumb row and check its detail.
     dumb_row = row_for(window, "fake-dumb:1b")
     window.table.cellClicked.emit(dumb_row, 0)
@@ -1044,7 +1088,8 @@ def main():
         run = partial_run[tid]
         if run.get("template_score") is not None:
             # v16: math is 10 tasks now, partial gets 5 of them.
-            want16 = 50.0 if tid == "math" else 60.0
+            # v17: Speed scores too — partial's 10 tok/s is 50%.
+            want16 = 50.0 if tid in ("math", "speed") else 60.0
             check(f"partial {tid} {want16:.0f}%",
                   run["template_score"] == want16,
                   str(run.get("template_score")))
@@ -1061,7 +1106,10 @@ def main():
     for tid in sorted(dumb_run):
         run = dumb_run[tid]
         if run.get("template_score") is not None:
-            check(f"dumb {tid} 0%", run["template_score"] == 0.0,
+            # v17: Speed scores — dumb's 5 tok/s is 25%.
+            want17 = 25.0 if tid == "speed" else 0.0
+            check(f"dumb {tid} {want17:.0f}%",
+                  run["template_score"] == want17,
                   str(run.get("template_score")))
     partial_dir = os.path.join(RESULTS_DIR, "fake-partial_3b", sid)
     dumb_dir = os.path.join(RESULTS_DIR, "fake-dumb_1b", sid)
@@ -1432,8 +1480,11 @@ def main():
           table_text(window3, smart_row, 5) if smart_row is not None else "no row")
     check("mid-stream partial never attempted",
           row_for(window3, "fake-partial:3b") is None)
-    check("mid-stream close happened twice (warmup + retry)",
-          server3.mid_stream_closes == 2, f"got {server3.mid_stream_closes}")
+    # v17: the restart adds a third attempt (warmup + retry +
+    # restart-retry) — the run still aborts, and the model after
+    # the dead one is still never attempted.
+    check("mid-stream close happened three times (warmup + retry + restart)",
+          server3.mid_stream_closes == 3, f"got {server3.mid_stream_closes}")
     check("window responsive after mid-stream abort",
           window3.isVisible() and window3.run_button.isEnabled())
     window3.close()
@@ -1486,35 +1537,49 @@ def main():
     killer.join(timeout=10)
     server4.server_close()
 
-    # ---------- pre-run check: API dead, CLI fallback list, Run blocked ----------
+    # ---------- v17: run queues behind the auto-start ----------
+    # API dead, CLI fallback list, Run pressed: the run waits while
+    # Ollama starts itself, then runs. The fake serve answers
+    # /api/tags but not /api/generate, so the model fails plainly
+    # on the warmup — the point is the run started with no click
+    # but Run.
     os.environ["PATH"] = FAKEBIN + os.pathsep + ORIGINAL_PATH
     os.environ["OLLAMA_HOST"] = f"http://127.0.0.1:{free_port()}"
+    pidfile = os.path.join(VERIFY_DIR, "fake-ollama.pid")
+    os.environ["FAKE_OLLAMA_PIDFILE"] = pidfile
     window5 = app.MainWindow()
     window5.show()
     wait_until(lambda: window5.model_list.count() == 2, timeout=10, app=qt_app)
-    check("pre-run check window lists CLI models", window5.model_list.count() == 2,
+    check("run-queue window lists CLI models", window5.model_list.count() == 2,
           str(window5.model_list.count()))
-    check("pre-run check run button enabled", window5.run_button.isEnabled())
+    check("run-queue run button enabled", window5.run_button.isEnabled())
     set_checked_list(window5.model_list, {"cli-model-a:2b"})
     set_checked_templates(window5, {"speed"})
     window5.run_button.click()
-    qt_app.processEvents()
-    time.sleep(0.5)
-    qt_app.processEvents()
-    check("pre-run check blocks the worker", window5.worker is None)
-    check("pre-run check status is the Ollama-down run message",
-          window5.status_label.text() == app.OLLAMA_DOWN_RUN_MESSAGE,
-          window5.status_label.text())
-    check("pre-run check table stays empty", window5.table.rowCount() == 0,
-          str(window5.table.rowCount()))
-    check("pre-run check run button stays enabled", window5.run_button.isEnabled())
+    queued = wait_until(
+        lambda: window5.worker is not None
+        or row_for(window5, "cli-model-a:2b") is not None,
+        timeout=45, app=qt_app,
+    )
+    check("run queues behind the auto-start", queued)
+    done5 = wait_until(
+        lambda: window5.worker is None and window5.run_button.isEnabled(),
+        timeout=120, app=qt_app,
+    )
+    check("queued run completes", done5)
+    row5 = row_for(window5, "cli-model-a:2b")
+    # The fake serve has no POST handler at all, so the generate
+    # call gets a 501, not a 404.
+    check("queued run model failed on the missing generate endpoint",
+          row5 is not None
+          and table_text(window5, row5, 5) == "failed: Ollama returned HTTP 501",
+          table_text(window5, row5, 5) if row5 is not None else "no row")
+    kill_pidfile(pidfile)
 
     # ---------- Start Ollama: success, then already-running ----------
     fake_port = free_port()
     os.environ["OLLAMA_HOST"] = f"http://127.0.0.1:{fake_port}"
-    pidfile = os.path.join(VERIFY_DIR, "fake-ollama.pid")
     callsfile = os.path.join(VERIFY_DIR, "serve-calls.txt")
-    os.environ["FAKE_OLLAMA_PIDFILE"] = pidfile
     os.environ["FAKE_OLLAMA_CALLS"] = callsfile
     if os.path.exists(callsfile):
         os.remove(callsfile)
@@ -1552,6 +1617,11 @@ def main():
     del os.environ["FAKE_OLLAMA_CALLS"]
 
     # ---------- Start Ollama: timeout (serve never brings a server up) ----------
+    # v17: the auto-start in __init__ already exercises the timeout
+    # path — the window opens with Ollama down, starts the sleeping
+    # serve itself, and times out. Do NOT click the button too: a
+    # second click would spawn a second `sleep 120` the pidfile
+    # cannot kill.
     app.START_OLLAMA_TIMEOUT = 3.0
     app.START_OLLAMA_POLL = 0.2
     os.environ["PATH"] = FAKEBIN_SLEEP + os.pathsep + ORIGINAL_PATH
@@ -1560,7 +1630,6 @@ def main():
     os.environ["FAKE_OLLAMA_PIDFILE"] = pidfile2
     window6 = app.MainWindow()
     window6.show()
-    window6.start_ollama_button.click()
     timed_out = wait_until(
         lambda: window6.status_label.text() == app.START_OLLAMA_TIMEOUT_MSG,
         timeout=30, app=qt_app,
@@ -1590,12 +1659,18 @@ def main():
     qt_app.processEvents()
 
     # ---------- ollama down (no binary, no server): v2 window4 ----------
+    # v17: the window tries to start Ollama itself and reports there
+    # is no binary to start — the status is the missing-binary
+    # message, not the plain down message.
     window8 = app.MainWindow()
     window8.show()
     wait_until(lambda: window8.model_list.count() == 0, timeout=10, app=qt_app)
     check("ollama down: no models", window8.model_list.count() == 0)
-    check("ollama down: status message exact",
-          window8.status_label.text() == app.OLLAMA_DOWN_MESSAGE,
+    missing8 = wait_until(
+        lambda: window8.status_label.text() == app.START_OLLAMA_MISSING_MSG,
+        timeout=30, app=qt_app,
+    )
+    check("ollama down: status is the missing-binary message", missing8,
           window8.status_label.text())
     check("ollama down: run disabled", not window8.run_button.isEnabled())
     check("ollama down: start Ollama still enabled",
@@ -2605,8 +2680,11 @@ def main():
     check("provider-only run status is Done",
           "Done." in windowP.status_label.text(), windowP.status_label.text())
 
-    # ---------- Qt app: mixed run still blocked when Ollama is down ----------
+    # ---------- Qt app: mixed run still blocked with a REMOTE Ollama down ----------
+    # v17: a local Ollama starts itself, so the blocked-run case is a
+    # remote address — unreachable, and never auto-started.
     os.environ["PATH"] = FAKEBIN + os.pathsep + ORIGINAL_PATH
+    os.environ["OLLAMA_HOST"] = "http://ollama.invalid:11434"
     windowP.refresh_models()
     wait_until(lambda: windowP.model_list.count() == 7, timeout=10, app=qt_app)
     set_checked_list(windowP.model_list, {
@@ -2617,11 +2695,12 @@ def main():
     qt_app.processEvents()
     time.sleep(0.5)
     qt_app.processEvents()
-    check("mixed run with Ollama down is blocked", windowP.worker is None)
+    check("mixed run with remote Ollama down is blocked", windowP.worker is None)
     check("mixed run blocked status is the Ollama-down run message",
           windowP.status_label.text() == app.OLLAMA_DOWN_RUN_MESSAGE,
           windowP.status_label.text())
     os.environ["PATH"] = ORIGINAL_PATH
+    os.environ["OLLAMA_HOST"] = f"http://127.0.0.1:{free_port()}"
 
     # ---------- Qt app: the API key appears nowhere in results ----------
     windowP.save_button.click()
@@ -3404,7 +3483,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 16", app.__version__ == "16",
+    check("__version__ is 17", app.__version__ == "17",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3418,8 +3497,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v16",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v16",
+    check("title bar shows OLLAMA SYSTEM TEST v17",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v17",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -3656,6 +3735,9 @@ def main():
     json_files = []
     profiles = []
     for root, _dirs, files in os.walk(headless_results):
+        # v17: the run manifest lives under _runs — it is not a run file.
+        if "_runs" in root.split(os.sep):
+            continue
         for name in files:
             if name.endswith(".json"):
                 json_files.append(os.path.join(root, name))
@@ -3728,8 +3810,10 @@ def main():
             OLLAMA_HOST=f"http://127.0.0.1:{free_port()}"),
         capture_output=True, text=True, timeout=120)
     check("headless exits 1 when Ollama is down",
+          # v17: headless tries to start Ollama itself; the sandbox
+          # has no ollama binary, so the start reports that.
           ollama_down.returncode == 1
-          and "Ollama is not running" in ollama_down.stdout,
+          and "Ollama is not installed" in ollama_down.stdout,
           f"exit {ollama_down.returncode}\n{ollama_down.stdout[-300:]}")
     server7h.shutdown()
     server7h.server_close()
@@ -4833,10 +4917,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v16",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v16",
+        check("title bar shows v17",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v17",
               window9.windowTitle())
-        check("__version__ is 16", app.__version__ == "16", app.__version__)
+        check("__version__ is 17", app.__version__ == "17", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -5379,7 +5463,9 @@ def main():
         window12.refresh_models()
         qt_app.processEvents()
         check("checklist steps open when Ollama is down",
-              window12.checklist_step1.text().startswith("○ Start Ollama")
+              # v17: the app starts Ollama itself — the step says so.
+              window12.checklist_step1.text().startswith(
+                  "○ Ollama is not running yet")
               and window12.checklist_step2.text().startswith(
                   "○ Pull a model"),
               window12.checklist_step1.text() + " / "
@@ -7524,6 +7610,665 @@ def main():
             os.environ.pop("OLLAMA_HOST", None)
         else:
             os.environ["OLLAMA_HOST"] = prior_host16
+
+    # ================= v17: Ollama starts itself, Speed scores, resume =====
+    # ---------- v17 unit: speed credit, local address, loader, manifest ---
+    check("speed_credit 0 tok/s is 0",
+          app.speed_credit(0) == 0.0, str(app.speed_credit(0)))
+    check("speed_credit 10 tok/s is 0.5",
+          app.speed_credit(10) == 0.5, str(app.speed_credit(10)))
+    check("speed_credit 20 tok/s is 1.0",
+          app.speed_credit(20) == 1.0, str(app.speed_credit(20)))
+    check("speed_credit 40 tok/s caps at 1.0",
+          app.speed_credit(40) == 1.0, str(app.speed_credit(40)))
+    check("speed_credit None (failed job) is 0",
+          app.speed_credit(None) == 0.0, str(app.speed_credit(None)))
+    check("speed full-score anchor is 20 tok/s",
+          app.SPEED_FULL_SCORE_TOK_S == 20.0,
+          str(app.SPEED_FULL_SCORE_TOK_S))
+    prior_host17 = os.environ.get("OLLAMA_HOST")
+    try:
+        os.environ.pop("OLLAMA_HOST", None)
+        check("local address: no host set is local",
+              app.ollama_address_is_local())
+        os.environ["OLLAMA_HOST"] = "http://127.0.0.1:11434"
+        check("local address: 127.0.0.1 is local",
+              app.ollama_address_is_local())
+        os.environ["OLLAMA_HOST"] = "http://localhost:11434"
+        check("local address: localhost is local",
+              app.ollama_address_is_local())
+        os.environ["OLLAMA_HOST"] = "http://[::1]:11434"
+        check("local address: ::1 is local", app.ollama_address_is_local())
+        os.environ["OLLAMA_HOST"] = "http://192.168.1.5:11434"
+        check("local address: a LAN address is not local",
+              not app.ollama_address_is_local())
+        os.environ["OLLAMA_HOST"] = "http://ollama.invalid:11434"
+        check("local address: a remote name is not local",
+              not app.ollama_address_is_local())
+    finally:
+        if prior_host17 is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host17
+    # The loader accepts score_by "speed" and drops anything else.
+    templates17 = os.path.join(SCRATCH, "templates17")
+    os.makedirs(templates17, exist_ok=True)
+    with open(os.path.join(templates17, "good.json"), "w",
+              encoding="utf-8") as handle:
+        json.dump({"id": "good-speed", "name": "Good Speed",
+                   "scored": False, "context_lengths": [1024],
+                   "score_by": "speed"}, handle)
+    with open(os.path.join(templates17, "bad.json"), "w",
+              encoding="utf-8") as handle:
+        json.dump({"id": "bad-speed", "name": "Bad Speed",
+                   "scored": False, "context_lengths": [1024],
+                   "score_by": "bogus"}, handle)
+    loaded17, warns17 = app.load_templates(templates17)
+    check("loader keeps a speed-scored template",
+          any(t["id"] == "good-speed"
+              and t.get("score_by") == "speed" for t in loaded17),
+          str(loaded17))
+    check("loader drops an unknown score_by with a warning",
+          not any(t["id"] == "bad-speed" for t in loaded17)
+          and any("score_by" in w for w in warns17), str(warns17))
+    # The real Speed template carries score_by and stays unscored.
+    speed17 = next((t for t in templates if t["id"] == "speed"), None)
+    check("speed template has score_by speed and stays unscored",
+          speed17 is not None and speed17.get("score_by") == "speed"
+          and speed17["scored"] is False, str(speed17))
+    # meminfo: the fixture reads 16 GB; a missing file reads None.
+    check("meminfo fixture reads 16 GB",
+          app.mem_available_bytes() == 16777216 * 1024,
+          str(app.mem_available_bytes()))
+    prior_meminfo17 = os.environ.get("OST_MEMINFO_FILE")
+    try:
+        os.environ["OST_MEMINFO_FILE"] = os.path.join(
+            SCRATCH, "meminfo-missing")
+        check("meminfo missing reads None",
+              app.mem_available_bytes() is None)
+    finally:
+        if prior_meminfo17 is None:
+            os.environ.pop("OST_MEMINFO_FILE", None)
+        else:
+            os.environ["OST_MEMINFO_FILE"] = prior_meminfo17
+    # Manifest helpers: round-trip, resumable, latest, plan, merge.
+    results17u = os.path.join(SCRATCH, "results17-unit")
+    os.makedirs(results17u, exist_ok=True)
+    targets17u = [
+        {"label": "fake-smart:2b", "kind": "ollama",
+         "model": "fake-smart:2b", "provider_name": None},
+        {"label": "gone-model:9b", "kind": "ollama",
+         "model": "gone-model:9b", "provider_name": None},
+    ]
+    templates17u = [{"id": "coding", "name": "Coding"},
+                    {"id": "math", "name": "Math"}]
+    manifest17u = app.new_manifest("20261115-120000", targets17u,
+                                   templates17u, "sys-unit")
+    check("new manifest has every pair pending",
+          manifest17u["pairs"]
+          == {"fake-smart:2b|coding": "pending",
+              "fake-smart:2b|math": "pending",
+              "gone-model:9b|coding": "pending",
+              "gone-model:9b|math": "pending"},
+          str(manifest17u["pairs"]))
+    check("manifest targets carry no provider entry",
+          all("provider" not in entry
+              for entry in manifest17u["targets"]),
+          str(manifest17u["targets"]))
+    check("a manifest with pending pairs is resumable",
+          app.manifest_is_resumable(manifest17u))
+    app.save_manifest(results17u, manifest17u)
+    reloaded17u = app.load_manifest(results17u, "20261115-120000")
+    check("manifest round-trips through disk",
+          reloaded17u is not None
+          and reloaded17u["pairs"] == manifest17u["pairs"],
+          str(reloaded17u))
+    check("load_manifest returns None for an unknown id",
+          app.load_manifest(results17u, "no-such-run") is None)
+    check("the _runs folder never lists as a model",
+          "_runs" not in app.list_history_models(results17u),
+          str(app.list_history_models(results17u)))
+    done17u = app.new_manifest("20261115-110000", targets17u[:1],
+                               templates17u, "sys-unit")
+    done17u["pairs"] = {key: "done" for key in done17u["pairs"]}
+    done17u["status"] = "done"
+    app.save_manifest(results17u, done17u)
+    check("a manifest with all pairs done is not resumable",
+          not app.manifest_is_resumable(done17u))
+    check("latest resumable manifest is the unfinished one",
+          (app.latest_resumable_manifest(results17u) or {}).get("run_id")
+          == "20261115-120000")
+    # The plan: gone pairs skipped with a note, the rest to run.
+    smart_target17u = app.ollama_target("fake-smart:2b", {"text"})
+    plan_targets17u, plan_pairs17u, plan_pre17u, plan_notes17u = (
+        app.build_resume_plan(
+            manifest17u, {"fake-smart:2b": smart_target17u},
+            {"coding": templates17u[0], "math": templates17u[1]},
+            results17u))
+    check("resume plan runs only the available pairs",
+          plan_pairs17u == {("fake-smart:2b", "coding"),
+                            ("fake-smart:2b", "math")},
+          str(plan_pairs17u))
+    check("resume plan notes the missing model",
+          any("gone-model:9b" in note and "no longer installed" in note
+              for note in plan_notes17u), str(plan_notes17u))
+    check("resume plan marks the gone pairs skipped in the manifest",
+          manifest17u["pairs"]["gone-model:9b|coding"] == "skipped"
+          and manifest17u["pairs"]["gone-model:9b|math"] == "skipped",
+          str(manifest17u["pairs"]))
+    check("resume plan targets are only the models with pairs",
+          [t["label"] for t in plan_targets17u] == ["fake-smart:2b"],
+          str(plan_targets17u))
+    # Merge: done pairs fold into the result, scores recomputed.
+    result17u = {
+        "name": "fake-smart:2b", "status": "done",
+        "templates": {"coding": {
+            "template": "coding", "template_name": "Coding",
+            "template_score": 100.0, "tasks": [
+                {"decode_tok_s": 20.0, "ttft_s": 0.1,
+                 "prompt_tok_s": 40.0}],
+            "prompt_tokens": 10, "completion_tokens": 20,
+            "total_tokens": 30, "estimated_cost_usd": None}},
+        "overall_score": 100.0, "avg_decode_tok_s": 20.0,
+        "avg_ttft_s": 0.1, "avg_prompt_tok_s": 40.0,
+        "prompt_tokens": 10, "completion_tokens": 20,
+        "total_tokens": 30, "estimated_cost_usd": None,
+    }
+    app.merge_resume_result(result17u, {"math": {
+        "template": "math", "template_name": "Math",
+        "template_score": 50.0, "tasks": [
+            {"decode_tok_s": 10.0, "ttft_s": 0.2,
+             "prompt_tok_s": 20.0}],
+        "prompt_tokens": 5, "completion_tokens": 5,
+        "total_tokens": 10, "estimated_cost_usd": None}})
+    check("merge folds the done pairs into the result",
+          set(result17u["templates"]) == {"coding", "math"}
+          and result17u["overall_score"] == 75.0
+          and result17u["avg_decode_tok_s"] == 15.0
+          and result17u["total_tokens"] == 40,
+          str(result17u.get("overall_score")))
+
+    # ---------- v17 GUI: restart, RAM check, resume, headless --resume ----
+    results17 = os.path.join(SCRATCH, "results17")
+    os.makedirs(results17, exist_ok=True)
+    prior_results17 = os.environ.get("OST_RESULTS_DIR")
+    prior_host17b = os.environ.get("OLLAMA_HOST")
+    server17, thread17 = fake_ollama.start_server()
+    host17, port17 = server17.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host17}:{port17}"
+    os.environ["OST_RESULTS_DIR"] = results17
+    window17 = None
+    window17b = None
+    try:
+        window17 = app.MainWindow()
+        window17.show()
+        wait_until(lambda: window17.model_list.count() == 4,
+                   timeout=10, app=qt_app)
+        check("v17 window lists the four fake models",
+              window17.model_list.count() == 4,
+              str(window17.model_list.count()))
+        speed_label17 = None
+        for row17 in range(window17.template_list.count()):
+            item17 = window17.template_list.item(row17)
+            if item17.data(Qt.UserRole) == "speed":
+                speed_label17 = item17.text()
+        check("template list labels Speed with its lengths",
+              speed_label17 == "Speed (3 lengths)", str(speed_label17))
+        check("Resume disabled with no run yet",
+              not window17.resume_button.isEnabled())
+
+        # Mid-run restart, in its own results dir so its unfinished
+        # manifest does not linger into the resume checks.
+        results17restart = os.path.join(SCRATCH, "results17-restart")
+        os.makedirs(results17restart, exist_ok=True)
+        os.environ["OST_RESULTS_DIR"] = results17restart
+        real_start17 = app.start_ollama_process
+        restart_calls17 = []
+
+        def _revive17(models_folder=None):
+            restart_calls17.append(models_folder)
+            server17.dead = False
+            return True, ""
+
+        try:
+            app.start_ollama_process = _revive17
+            server17.dead = True
+            set_checked_list(window17.model_list, {"fake-smart:2b"})
+            set_checked_templates(window17, {"coding"})
+            window17.run_button.click()
+            done17r = wait_until(
+                lambda: window17.worker is None
+                and window17.save_button.isEnabled(),
+                timeout=120, app=qt_app)
+            check("restart run completes after one death", done17r)
+            check("restart run status is Done",
+                  "Done." in window17.status_label.text(),
+                  window17.status_label.text())
+            smart_row17 = row_for(window17, "fake-smart:2b")
+            check("restart run model completes",
+                  smart_row17 is not None
+                  and table_text(window17, smart_row17, 5) == "done",
+                  table_text(window17, smart_row17, 5)
+                  if smart_row17 is not None else "no row")
+            check("restart was attempted exactly once",
+                  len(restart_calls17) == 1, str(len(restart_calls17)))
+        finally:
+            app.start_ollama_process = real_start17
+            server17.dead = False
+
+        restart_calls17b = []
+
+        def _revive_then_die17(models_folder=None):
+            restart_calls17b.append(models_folder)
+            server17.dead = False
+
+            def _die_later():
+                time.sleep(0.3)
+                server17.dead = True
+
+            threading.Thread(target=_die_later, daemon=True).start()
+            return True, ""
+
+        try:
+            app.start_ollama_process = _revive_then_die17
+            server17.dead = True
+            set_checked_list(window17.model_list, {"fake-smart:2b"})
+            set_checked_templates(window17, {"coding"})
+            window17.run_button.click()
+            done17r2 = wait_until(
+                lambda: window17.worker is None
+                and window17.run_button.isEnabled(),
+                timeout=120, app=qt_app)
+            check("second-death run finishes", done17r2)
+            check("second-death run status is the Ollama-died message",
+                  window17.status_label.text() == app.OLLAMA_DIED_MESSAGE,
+                  window17.status_label.text())
+            check("second death did not trigger a second restart",
+                  len(restart_calls17b) == 1, str(len(restart_calls17b)))
+        finally:
+            app.start_ollama_process = real_start17
+            server17.dead = False
+        os.environ["OST_RESULTS_DIR"] = results17
+
+        # RAM check: too big is skipped, the run carries on.
+        results17ram = os.path.join(SCRATCH, "results17-ram")
+        os.makedirs(results17ram, exist_ok=True)
+        meminfo_small17 = os.path.join(SCRATCH, "meminfo-small")
+        with open(meminfo_small17, "w", encoding="utf-8") as handle:
+            handle.write("MemTotal:       16777216 kB\n"
+                         "MemAvailable:    1572864 kB\n")
+        prior_meminfo17b = os.environ.get("OST_MEMINFO_FILE")
+        try:
+            os.environ["OST_MEMINFO_FILE"] = meminfo_small17
+            os.environ["OST_RESULTS_DIR"] = results17ram
+            set_checked_list(window17.model_list,
+                             {"fake-smart:2b", "fake-dumb:1b"})
+            set_checked_templates(window17, {"math"})
+            window17.run_button.click()
+            done17ram = wait_until(
+                lambda: window17.worker is None
+                and window17.save_button.isEnabled(),
+                timeout=120, app=qt_app)
+            check("RAM-skip run completes", done17ram)
+            smart_row17ram = row_for(window17, "fake-smart:2b")
+            check("model too big for free RAM is skipped, not failed",
+                  smart_row17ram is not None
+                  and table_text(window17, smart_row17ram, 5).startswith(
+                      "skipped: needs"),
+                  table_text(window17, smart_row17ram, 5)
+                  if smart_row17ram is not None else "no row")
+            dumb_row17ram = row_for(window17, "fake-dumb:1b")
+            check("the run carries on with the next model",
+                  dumb_row17ram is not None
+                  and table_text(window17, dumb_row17ram, 5) == "done",
+                  table_text(window17, dumb_row17ram, 5)
+                  if dumb_row17ram is not None else "no row")
+            check("a skipped model writes no run files",
+                  not os.path.isdir(
+                      os.path.join(results17ram, "fake-smart_2b")))
+            # Unreadable meminfo: the check stays off, the run proceeds.
+            os.environ["OST_MEMINFO_FILE"] = os.path.join(
+                SCRATCH, "meminfo-missing")
+            set_checked_list(window17.model_list, {"fake-smart:2b"})
+            set_checked_templates(window17, {"math"})
+            window17.run_button.click()
+            done17ram2 = wait_until(
+                lambda: window17.worker is None
+                and window17.save_button.isEnabled(),
+                timeout=120, app=qt_app)
+            smart_row17ram2 = row_for(window17, "fake-smart:2b")
+            check("unreadable meminfo runs the model anyway",
+                  done17ram2 and smart_row17ram2 is not None
+                  and table_text(window17, smart_row17ram2, 5) == "done",
+                  table_text(window17, smart_row17ram2, 5)
+                  if smart_row17ram2 is not None else "no row")
+        finally:
+            if prior_meminfo17b is None:
+                os.environ.pop("OST_MEMINFO_FILE", None)
+            else:
+                os.environ["OST_MEMINFO_FILE"] = prior_meminfo17b
+            os.environ["OST_RESULTS_DIR"] = results17
+
+        # Resume: cancel after one pair, resume runs only the rest.
+        set_checked_list(window17.model_list, {"fake-smart:2b"})
+        set_checked_templates(window17, {"coding", "math"})
+        window17.run_button.click()
+        coding_done17 = wait_until(
+            lambda: "coding" in window17.results.get(
+                "fake-smart:2b", {}).get("templates", {}),
+            timeout=60, app=qt_app)
+        check("first pair finished before the cancel", coding_done17)
+        if window17.worker is not None:
+            window17.worker.request_cancel()
+        cancelled17 = wait_until(
+            lambda: window17.worker is None
+            and window17.run_button.isEnabled(),
+            timeout=60, app=qt_app)
+        check("cancelled run ends", cancelled17)
+        manifest17a = app.latest_resumable_manifest(results17)
+        check("a cancelled run leaves a resumable manifest",
+              manifest17a is not None
+              and manifest17a["pairs"].get("fake-smart:2b|coding") == "done"
+              and manifest17a["pairs"].get("fake-smart:2b|math") == "pending",
+              str((manifest17a or {}).get("pairs")))
+        check("Resume button offers the unfinished run",
+              window17.resume_button.isEnabled()
+              and window17.resume_button.text()
+              == "Resume last run (1 of 2 pairs left)",
+              window17.resume_button.text())
+        gen_before_resume17a = server17.generate_count
+        window17.resume_button.click()
+        resumed17a = wait_until(
+            lambda: window17.worker is None
+            and window17.save_button.isEnabled(),
+            timeout=120, app=qt_app)
+        check("resumed run completes", resumed17a)
+        check("resume ran only the missing pair",
+              server17.generate_count - gen_before_resume17a == 11,
+              str(server17.generate_count - gen_before_resume17a))
+        smart17a = window17.results.get("fake-smart:2b", {})
+        check("resumed run shows the whole run, not just the resumed part",
+              set(smart17a.get("templates", {})) == {"coding", "math"}
+              and smart17a.get("overall_score") == 100.0,
+              str(sorted(smart17a.get("templates", {}))))
+        check("Resume disabled once the run is finished",
+              not window17.resume_button.isEnabled())
+
+        # Resume: failed pairs are retried, done pairs are not.
+        set_checked_list(window17.model_list,
+                         {"fake-smart:2b", "fake-broken:1b"})
+        set_checked_templates(window17, {"coding"})
+        window17.run_button.click()
+        done17b = wait_until(
+            lambda: window17.worker is None
+            and window17.save_button.isEnabled(),
+            timeout=120, app=qt_app)
+        check("failed-pairs run completes", done17b)
+        manifest17b = app.latest_resumable_manifest(results17)
+        check("a failed pair leaves a resumable manifest",
+              manifest17b is not None
+              and manifest17b["pairs"].get("fake-broken:1b|coding") == "failed"
+              and manifest17b["pairs"].get("fake-smart:2b|coding") == "done",
+              str((manifest17b or {}).get("pairs")))
+        smart_dir17b = os.path.join(results17, "fake-smart_2b", sid)
+        smart_files17b = sorted(os.listdir(smart_dir17b))
+        smart_hash17b = file_hash(os.path.join(
+            smart_dir17b,
+            [f for f in smart_files17b if f.endswith("-coding.json")][-1]))
+        gen_before_resume17b = server17.generate_count
+        window17.resume_button.click()
+        resumed17b = wait_until(
+            lambda: window17.worker is None
+            and window17.save_button.isEnabled(),
+            timeout=120, app=qt_app)
+        check("failed-pairs resume completes", resumed17b)
+        check("resume retried only the failed pair",
+              server17.generate_count - gen_before_resume17b == 2,
+              str(server17.generate_count - gen_before_resume17b))
+        smart_files17b_after = sorted(os.listdir(smart_dir17b))
+        check("the done pair was not re-run",
+              smart_files17b_after == smart_files17b
+              and file_hash(os.path.join(
+                  smart_dir17b,
+                  [f for f in smart_files17b_after
+                   if f.endswith("-coding.json")][-1]))
+              == smart_hash17b,
+              str(smart_files17b_after))
+
+        # Resume works across a fresh window object.
+        window17.close()
+        window17.deleteLater()
+        qt_app.processEvents()
+        window17 = None
+        window17b = app.MainWindow()
+        window17b.show()
+        wait_until(lambda: window17b.model_list.count() == 4,
+                   timeout=10, app=qt_app)
+        check("a fresh window offers the unfinished run",
+              window17b.resume_button.isEnabled()
+              and window17b.resume_button.text()
+              == "Resume last run (1 of 2 pairs left)",
+              window17b.resume_button.text())
+        window17b.resume_button.click()
+        resumed17c = wait_until(
+            lambda: window17b.worker is None
+            and window17b.save_button.isEnabled(),
+            timeout=120, app=qt_app)
+        check("fresh-window resume completes", resumed17c)
+        smart17c = window17b.results.get("fake-smart:2b", {})
+        check("fresh-window resume shows the whole run",
+              set(smart17c.get("templates", {})) == {"coding"}
+              and smart17c.get("overall_score") == 100.0,
+              str(sorted(smart17c.get("templates", {}))))
+        broken17c = window17b.results.get("fake-broken:1b", {})
+        check("fresh-window resume retried the failed model",
+              broken17c.get("status", "").startswith("failed"),
+              str(broken17c.get("status")))
+
+        # Resume skips a deleted model, plainly.
+        results17c = os.path.join(SCRATCH, "results17-crafted")
+        os.makedirs(results17c, exist_ok=True)
+        manifest17c = app.new_manifest(
+            "20261115-130000",
+            [{"label": "fake-smart:2b", "kind": "ollama",
+              "model": "fake-smart:2b", "provider_name": None},
+             {"label": "gone-model:9b", "kind": "ollama",
+              "model": "gone-model:9b", "provider_name": None}],
+            [{"id": "coding", "name": "Coding"}], "sys-unit")
+        app.save_manifest(results17c, manifest17c)
+        os.environ["OST_RESULTS_DIR"] = results17c
+        window17b.refresh_models()
+        wait_until(lambda: window17b.resume_button.isEnabled(),
+                   timeout=10, app=qt_app)
+        check("Resume offers a crafted run with a deleted model",
+              window17b.resume_button.isEnabled()
+              and window17b.resume_button.text()
+              == "Resume last run (2 of 2 pairs left)",
+              window17b.resume_button.text())
+        window17b.resume_button.click()
+        resumed17d = wait_until(
+            lambda: window17b.worker is None
+            and window17b.save_button.isEnabled(),
+            timeout=120, app=qt_app)
+        check("crafted resume completes", resumed17d)
+        check("crafted resume ran only the installed model",
+              window17b.table.rowCount() == 1
+              and window17b.table.item(0, 0).text() == "fake-smart:2b",
+              str(window17b.table.rowCount()))
+        check("crafted resume marked the gone pair skipped",
+              (app.load_manifest(results17c, "20261115-130000") or {})
+              .get("pairs", {}).get("gone-model:9b|coding") == "skipped")
+        os.environ["OST_RESULTS_DIR"] = results17
+
+        # Headless --resume, while the fake server is still up.
+        help17 = subprocess.run(
+            [sys.executable, "-u", "ollama_system_test.py", "--headless",
+             "--help"],
+            cwd=PKG_DIR, env=dict(os.environ),
+            capture_output=True, text=True, timeout=120)
+        check("--help documents --resume",
+              "--resume" in help17.stdout, help17.stdout)
+        empty17 = os.path.join(SCRATCH, "results17-empty")
+        os.makedirs(empty17, exist_ok=True)
+
+        def headless17_env(results_dir):
+            env = dict(os.environ)
+            env.pop("DISPLAY", None)
+            env.pop("QT_QPA_PLATFORM", None)
+            env["OLLAMA_HOST"] = f"http://{host17}:{port17}"
+            env["OST_RESULTS_DIR"] = results_dir
+            env["OST_PROVIDERS_FILE"] = os.path.join(
+                SCRATCH, "headless17-providers.json")
+            env["OST_CAPABILITIES_FILE"] = os.path.join(
+                SCRATCH, "headless17-caps.json")
+            return env
+
+        no_resume17 = subprocess.run(
+            [sys.executable, "-u", "ollama_system_test.py", "--headless",
+             "--resume"],
+            cwd=PKG_DIR, env=headless17_env(empty17),
+            capture_output=True, text=True, timeout=120)
+        check("headless --resume with no run exits 1, plainly",
+              no_resume17.returncode == 1
+              and "No run to resume." in no_resume17.stdout
+              and "Traceback" not in no_resume17.stderr,
+              f"exit {no_resume17.returncode}\n{no_resume17.stdout[-300:]}")
+        bad_id17 = subprocess.run(
+            [sys.executable, "-u", "ollama_system_test.py", "--headless",
+             "--resume", "no-such-run"],
+            cwd=PKG_DIR, env=headless17_env(results17),
+            capture_output=True, text=True, timeout=120)
+        check("headless --resume with a bad id exits 1, plainly",
+              bad_id17.returncode == 1
+              and "No run with id no-such-run." in bad_id17.stdout
+              and "Traceback" not in bad_id17.stderr,
+              f"exit {bad_id17.returncode}\n{bad_id17.stdout[-300:]}")
+        resume17h = subprocess.run(
+            [sys.executable, "-u", "ollama_system_test.py", "--headless",
+             "--resume"],
+            cwd=PKG_DIR, env=headless17_env(results17),
+            capture_output=True, text=True, timeout=300)
+        check("headless --resume completes the run",
+              resume17h.returncode == 0
+              and "Resuming the run from" in resume17h.stdout
+              and "Traceback" not in resume17h.stderr,
+              f"exit {resume17h.returncode}\n"
+              f"{resume17h.stdout[-400:]}\n{resume17h.stderr[-400:]}")
+        run_id17b = (manifest17b or {}).get("run_id")
+        specific17 = subprocess.run(
+            [sys.executable, "-u", "ollama_system_test.py", "--headless",
+             "--resume", run_id17b],
+            cwd=PKG_DIR, env=headless17_env(results17),
+            capture_output=True, text=True, timeout=300)
+        check("headless --resume <run-id> resumes that run",
+              specific17.returncode == 0
+              and "Resuming the run from" in specific17.stdout,
+              f"exit {specific17.returncode}\n"
+              f"{specific17.stdout[-400:]}")
+    finally:
+        if window17 is not None:
+            window17.close()
+            window17.deleteLater()
+        if window17b is not None:
+            window17b.close()
+            window17b.deleteLater()
+        qt_app.processEvents()
+        server17.shutdown()
+        server17.server_close()
+        if prior_results17 is None:
+            os.environ.pop("OST_RESULTS_DIR", None)
+        else:
+            os.environ["OST_RESULTS_DIR"] = prior_results17
+        if prior_host17b is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host17b
+
+    # ---------- v17: refresh auto-starts Ollama, pulls queue behind it -----
+    # A fake ollama that serves but lists nothing: refresh has no CLI
+    # fallback, so the auto-start is the only way the models appear.
+    fakebin_nolist17 = os.path.join(SCRATCH, "fakebin-nolist")
+    os.makedirs(fakebin_nolist17, exist_ok=True)
+    with open(os.path.join(FAKEBIN, "ollama"), encoding="utf-8") as handle:
+        fakebin_src17 = handle.read()
+    fakebin_src17 = fakebin_src17.replace(
+        '        print("NAME ID SIZE MODIFIED")\n'
+        '        print("cli-model-a:2b abcdef 1.5 GB 2 days ago")\n'
+        '        print("cli-model-b:1b 123456 900 MB 3 days ago")\n',
+        "")
+    nolist_path17 = os.path.join(fakebin_nolist17, "ollama")
+    with open(nolist_path17, "w", encoding="utf-8") as handle:
+        handle.write(fakebin_src17)
+    os.chmod(nolist_path17, 0o755)
+    prior_path17 = os.environ.get("PATH")
+    prior_host17c = os.environ.get("OLLAMA_HOST")
+    window17r = None
+    window17p = None
+    try:
+        pidfile17r = os.path.join(SCRATCH, "fake-ollama17r.pid")
+        os.environ["FAKE_OLLAMA_PIDFILE"] = pidfile17r
+        os.environ["PATH"] = fakebin_nolist17 + os.pathsep + ORIGINAL_PATH
+        os.environ["OLLAMA_HOST"] = f"http://127.0.0.1:{free_port()}"
+        window17r = app.MainWindow()
+        window17r.show()
+        started17r = wait_until(
+            lambda: window17r.model_list.count() == 2
+            and window17r.status_label.text() == "Ollama is running.",
+            timeout=45, app=qt_app)
+        check("refresh auto-starts Ollama with no click", started17r,
+              window17r.status_label.text())
+        served17r = {window17r.model_list.item(r).text()
+                     for r in range(window17r.model_list.count())}
+        check("auto-started Ollama lists its models",
+              served17r == {"serve-model-a:2b", "serve-model-b:1b"},
+              str(served17r))
+        kill_pidfile(pidfile17r)
+        window17r.close()
+        window17r.deleteLater()
+        window17r = None
+        qt_app.processEvents()
+
+        # A pull with Ollama down queues behind the auto-start, then
+        # runs: the fake serve has no /api/pull, so it fails plainly
+        # — the point is the pull was attempted, not blocked.
+        pidfile17p = os.path.join(SCRATCH, "fake-ollama17p.pid")
+        os.environ["FAKE_OLLAMA_PIDFILE"] = pidfile17p
+        os.environ["PATH"] = FAKEBIN + os.pathsep + ORIGINAL_PATH
+        os.environ["OLLAMA_HOST"] = f"http://127.0.0.1:{free_port()}"
+        window17p = app.MainWindow()
+        window17p.show()
+        wait_until(lambda: window17p.model_list.count() == 2,
+                   timeout=10, app=qt_app)
+        window17p.pull_input.setText("pull-model:1b")
+        window17p.pull_button.click()
+        pulled17 = wait_until(
+            lambda: window17p.pull_status.text().startswith("Pull failed:"),
+            timeout=45, app=qt_app)
+        check("a pull queues behind the auto-start, then runs",
+              pulled17, window17p.pull_status.text())
+        served17p = {window17p.model_list.item(r).text()
+                     for r in range(window17p.model_list.count())}
+        check("the pull's auto-start listed the served models",
+              served17p == {"serve-model-a:2b", "serve-model-b:1b"},
+              str(served17p))
+        kill_pidfile(pidfile17p)
+    finally:
+        if window17r is not None:
+            window17r.close()
+            window17r.deleteLater()
+        if window17p is not None:
+            window17p.close()
+            window17p.deleteLater()
+        qt_app.processEvents()
+        os.environ.pop("FAKE_OLLAMA_PIDFILE", None)
+        if prior_path17 is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = prior_path17
+        if prior_host17c is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host17c
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview

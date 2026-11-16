@@ -1,5 +1,43 @@
 # Changelog
 
+## v17 (2026-11-15)
+
+Ollama starts itself, Speed gets a real score, and a run that
+stops part-way can be resumed where it left off. No new templates.
+
+- Ollama auto-start. The app starts Ollama itself, under the
+  hood, whenever it needs it — on opening, on Refresh, before a
+  run, and before a pull. Nothing for the user to do, no button
+  to hunt for. Local addresses only (localhost, 127.0.0.1, ::1);
+  a remote address is never started from here. The Start Ollama
+  button stays as a manual fallback. Every "start it yourself"
+  message is reworded: no message names a button that is not on
+  the screen where it appears.
+- Mid-run restart. If Ollama dies while a model is loading — the
+  out-of-memory kill on an 8 GB machine — the run restarts it
+  once and retries the failed call, instead of failing the run.
+  A second death in the same run still ends it, and the run can
+  then be resumed.
+- RAM check before each model. Before a model's first template,
+  the app compares the model's size times 1.2 against the free
+  RAM; a model too big to load is skipped with a plain reason
+  ("needs ~X RAM, Y free. Close other apps and run again"), never
+  a failure, and the run carries on. Provider models skip the
+  check; an unreadable memory reading runs the model anyway.
+- Speed gets a real score. Speed is no longer "(no scoring)":
+  100% is 20 tokens per second or faster on this machine — just
+  above the fastest small models on the target PC — scored per
+  context length (1K, 8K, 32K). The score counts in the overall,
+  the profiles, and Compare, like any other template.
+- Resume. Every run writes a manifest (results/_runs/<run-id>.json)
+  updated after each pair, so a run stopped by a crash, a cancel,
+  or Ollama dying can be resumed from where it stopped: a Resume
+  button next to Run offers the latest unfinished run, and
+  --resume does the same headless. Done pairs are never re-run;
+  failed pairs are retried; the done pairs load from their run
+  files so the table shows the whole run. A model or template
+  that no longer exists is skipped with a plain note.
+
 ## v16 (2026-11-14)
 
 Math scoring rework (tasks M1–M6 from the math list). No UI

@@ -2,10 +2,26 @@
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 MODELS = ["serve-model-a:2b", "serve-model-b:1b"]
+
+
+def _note(path, mode, text):
+    # Bookkeeping writes (pidfile, call log, env file) must never
+    # kill the serve: the sandbox occasionally refuses a write
+    # for a minute at a time (EPERM flap, Nov 2026), and a dead
+    # serve fails the starter. Retry briefly, then carry on
+    # without the note.
+    for _attempt in range(6):
+        try:
+            with open(path, mode) as handle:
+                handle.write(text)
+            return
+        except OSError:
+            time.sleep(0.5)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -45,16 +61,13 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         pidfile = os.environ.get("FAKE_OLLAMA_PIDFILE")
         if pidfile:
-            with open(pidfile, "w") as handle:
-                handle.write(str(os.getpid()))
+            _note(pidfile, "w", str(os.getpid()))
         calls = os.environ.get("FAKE_OLLAMA_CALLS")
         if calls:
-            with open(calls, "a") as handle:
-                handle.write("serve\n")
+            _note(calls, "a", "serve\n")
         envfile = os.environ.get("FAKE_OLLAMA_ENVFILE")
         if envfile:
-            with open(envfile, "w") as handle:
-                handle.write(os.environ.get("OLLAMA_MODELS", "unset"))
+            _note(envfile, "w", os.environ.get("OLLAMA_MODELS", "unset"))
         port = urlparse(os.environ.get("OLLAMA_HOST", "")).port or 11434
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         server.daemon_threads = True
