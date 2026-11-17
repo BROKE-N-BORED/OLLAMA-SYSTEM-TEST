@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v19
+# OLLAMA SYSTEM TEST v20
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,16 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v20 fixes two text-size defects found during v19 verification, no new
+templates: bigger text now actually re-sizes the text in the open
+window (before, changing the size in Settings moved nothing until
+restart — the tile numbers keep their bigger bold look at any size),
+Cancel in Settings puts back the size that was showing when the
+dialog opened instead of the startup default, and the Profiles tab
+scrolls, so at bigger text with runs saved the
+window stays on a 1366x768 screen instead of forcing itself to
+1313x822.
 
 v19 simplifies the Providers tab and Settings, no new templates:
 adding a cloud provider is four steps — pick the service (the app

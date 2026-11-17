@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v19
+# TEST-REPORT — OLLAMA SYSTEM TEST v20
 
 Verified 2026-11-17 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
@@ -8,6 +8,22 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v20 fixes two text-size defects found during v19 verification,
+both proven by probe before fixing. No new templates; no new
+dependencies. Bigger text now applies live: changing the size in
+Settings used to move the application font but no open window's
+widgets — the text only grew after a restart, so the live preview
+was dead (even window.setFont did not move existing widgets in
+this PySide6 build). The size is now set on every widget
+directly, and the bento tile captions and values keep their
+relative sizes (caption one point smaller, values bigger and
+bold) at any size. And the Profiles tab scrolls: at 14 pt with
+runs saved, the tiles and fixed-height charts forced the window
+minimum to 1313x822 — taller than a 768 px screen. The tab now
+lives in a scroll area (the same treatment the Providers tab got
+in v18) and its intro line wraps, so the window minimum at 14 pt
+with runs is 1293x578 and the window stays on a 1366x768 screen.
 
 v19 is the Providers tab simplification + Settings auto-config
 release. No new templates; no new dependencies; providers.json
@@ -162,6 +178,38 @@ at the limit with a plain "time budget reached" status, default off;
 and the current results export to CSV and HTML, with a Compare tab
 putting two models' per-template scores side by side. No new
 templates, no template changes.
+
+v20 suite: 1556 passed, 0 failed (run 7, log
+~/workspace/ost-v20-verify/v20-run7.log). The v19 suite's 1538
+checks are carried over inside that count, plus 18 new v20
+checks (live apply on the open window's widgets, tile relative
+sizes live and on restore, the Settings spin path, Cancel
+restoring the size — including the size it opened with, after
+the drive found Cancel restoring the startup default instead
+—, the Profiles scroll area and the window minimum at 14 pt
+with runs). The road: run 1 died at 384 checks with no
+summary — the process aborted on "QThread: Destroyed while
+thread is still running" in the v17 run-queue section, a load
+flake (the VM was at load 9.4 with other threads' suites
+running; the v18/v19 green logs show no such line, and run 2
+passed the same section). Run 2 from a fresh copy went 1554/0
+green with zero QThread lines — but that tree predated the
+Cancel fix and its 2 checks, so a green run on the final tree
+was still owed. Run 3 hit a load-timing cascade (the full fake
+run missed its 300 s wait under load 16, 24 failures from that
+one cause) and then died at check 790 on an uncaught
+TimeoutExpired from a headless subprocess (120 s, load 14).
+Run 4 reached 1193/0 before a VM restart killed it. Run 5 went
+1555/1 — the single failure was the Xvfb geometry probe, which
+failed only because the restart had wiped the /tmp/ost-v20
+directory the launch used (a launch error, not the app; the
+probe passed in run 6 with the directory in place). Run 6 went
+1550/6, all 6 the full-run wait again under load 15-18. Run 7
+from a fresh copy of the final tree went 1556/0 green with
+zero QThread lines. The GUI drive went 14/14
+(~/workspace/ost-v20-verify/gui-drive-v20c.log, Xvfb
+1366x768): both fixes verified by hand and by eye, plus the
+Cancel fix the drive itself found.
 
 v19 suite: 1538 passed, 0 failed (run 3, log
 ~/workspace/ost-v19-verify/v19-run3.log). The v18 suite's 1481

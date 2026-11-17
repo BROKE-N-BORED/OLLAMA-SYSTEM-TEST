@@ -160,7 +160,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "19"
+__version__ = "20"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -990,7 +990,15 @@ def default_font_point_size():
 
 def apply_font_size(point_size):
     """Set the application's text size (R21). 0 restores the font
-    the application started with. A no-op without a QApplication."""
+    the application started with. A no-op without a QApplication.
+    v20: setting the application font alone does not reach widgets
+    that already exist in this PySide6 build — probed: a label
+    created before the call keeps 9 pt while a new one gets 14 pt,
+    and even window.setFont does not move it. So the new size is
+    also set on every widget directly. Widgets carrying a
+    font_size_delta property (bento tile captions and values) keep
+    their relative size above the new base instead of collapsing
+    to it; font_bold keeps the value bold."""
     global _DEFAULT_FONT
     app = QApplication.instance()
     if not isinstance(app, QApplication):
@@ -998,11 +1006,21 @@ def apply_font_size(point_size):
     if _DEFAULT_FONT is None:
         _DEFAULT_FONT = QFont(app.font())
     if not point_size:
-        app.setFont(QFont(_DEFAULT_FONT))
-        return
-    font = QFont(_DEFAULT_FONT)
-    font.setPointSize(max(8, min(20, int(point_size))))
-    app.setFont(font)
+        base = QFont(_DEFAULT_FONT)
+    else:
+        base = QFont(_DEFAULT_FONT)
+        base.setPointSize(max(8, min(20, int(point_size))))
+    app.setFont(base)
+    for widget in QApplication.allWidgets():
+        delta = widget.property("font_size_delta")
+        if delta is None:
+            widget.setFont(base)
+            continue
+        font = QFont(base)
+        font.setPointSize(max(8, base.pointSize() + int(delta)))
+        if widget.property("font_bold"):
+            font.setBold(True)
+        widget.setFont(font)
 
 
 def tok_s(count, duration_ns):
@@ -7079,6 +7097,10 @@ def make_bento_tile(caption, hero=False):
     caption_font = caption_label.font()
     caption_font.setPointSize(max(8, caption_font.pointSize() - 1))
     caption_label.setFont(caption_font)
+    # v20: the relative sizes are properties, so apply_font_size
+    # can re-derive them when the text size changes live instead
+    # of collapsing every label to the base size.
+    caption_label.setProperty("font_size_delta", -1)
     caption_label.setWordWrap(True)
     layout.addWidget(caption_label)
     value_label = QLabel("n/a")
@@ -7089,6 +7111,8 @@ def make_bento_tile(caption, hero=False):
         value_font.pointSize() + (8 if hero else 4)
     )
     value_label.setFont(value_font)
+    value_label.setProperty("font_size_delta", 8 if hero else 4)
+    value_label.setProperty("font_bold", True)
     layout.addWidget(value_label)
     layout.addStretch()
     return frame, caption_label, value_label
@@ -7233,7 +7257,13 @@ class SettingsDialog(QDialog):
         # a reduce-motion switch, in Settings as well as at first
         # boot. The size applies live while the dialog is open, so
         # the user sees it before saving; Cancel puts it back.
-        self._font_at_open = default_font_point_size()
+        # v20: the size in effect when the dialog opened — the live
+        # size, not the startup default. Before, Cancel after
+        # applying 14 pt put 9 pt back (found by the v20 drive).
+        live_size = QApplication.instance().font().pointSize()
+        self._font_at_open = (
+            live_size if live_size > 0 else default_font_point_size()
+        )
         layout.addWidget(QLabel("Accessibility:"))
         bigger_row = QHBoxLayout()
         self.bigger_text_button = QPushButton("Bigger text")
@@ -7561,12 +7591,31 @@ class MainWindow(QMainWindow):
         # ---- Profiles tab ----
         profiles_tab = QWidget()
         tabs.addTab(profiles_tab, "Profiles")
-        profiles_layout = QVBoxLayout(profiles_tab)
-        profiles_layout.addWidget(QLabel(
+        # v20: the tab scrolls (the RV8 treatment from the
+        # Providers tab). At bigger text the tiles and the
+        # fixed-height charts push the tab's minimum past the
+        # screen (1309x717 at 14 pt with runs); the scroll
+        # area's minimum is small, so the window can stay on a
+        # 1366x768 screen and the tab scrolls instead.
+        profiles_scroll = QScrollArea()
+        profiles_scroll.setWidgetResizable(True)
+        profiles_scroll.setFrameShape(QFrame.NoFrame)
+        profiles_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff)
+        profiles_content = QWidget()
+        profiles_layout = QVBoxLayout(profiles_content)
+        profiles_scroll.setWidget(profiles_content)
+        profiles_tab_layout = QVBoxLayout(profiles_tab)
+        profiles_tab_layout.addWidget(profiles_scroll)
+        profiles_intro = QLabel(
             "Each model gets a profile: its scores, strengths, and weaknesses, "
             "built from every run it has ever done. Profiles rebuild themselves "
             "after each run."
-        ))
+        )
+        # v20: wrapped — the unwrapped line was the tab's width
+        # driver at bigger text.
+        profiles_intro.setWordWrap(True)
+        profiles_layout.addWidget(profiles_intro)
         profile_top = QHBoxLayout()
         self.profile_model_combo = QComboBox()
         # Grow to fit the longest model name; without this the picker

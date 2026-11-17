@@ -1,5 +1,28 @@
 # Changelog
 
+## v20 (2026-11-17)
+
+Two text-size defects found during v19 verification, both proven by
+probe before fixing. No new templates; no new dependencies.
+
+- Bigger text now applies live. Changing the text size in Settings
+  used to move the application font but no open window's widgets —
+  the text only grew after a restart, so the live preview was dead.
+  The size is now set on every widget directly, and the bento tile
+  captions and values keep their relative sizes (caption one point
+  smaller, values bigger and bold) at any size. Cancel still puts
+  the opening size back.
+- Cancel in Settings now puts back the size that was in effect
+  when the dialog opened, not the startup default. Before, with
+  14 pt applied, opening Settings, trying 20 pt, and pressing
+  Cancel left the window at 9 pt. Found by the v20 GUI drive.
+- The Profiles tab scrolls. At 14 pt with runs saved, the tiles and
+  fixed-height charts forced the window minimum to 1313x822 —
+  taller than a 768 px screen. The tab now lives in a scroll area
+  (the same treatment the Providers tab got in v18) and its intro
+  line wraps, so the window minimum at 14 pt with runs is 1293x578
+  and the window stays on a 1366x768 screen.
+
 ## v19 (2026-11-17)
 
 Providers tab simplification + Settings auto-config. The providers

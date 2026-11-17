@@ -1,17 +1,12 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v19 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v20 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1481 v18 checks are carried over, with the
-provider-UI tests rewritten for the wizard and the detected Settings;
-the v19 checks cover the step-by-step add flow (known provider fills
-the address, Other reveals it, local servers skip the key, test lists
-the models, tick and finish, duplicate name caught on step 1, bad key
-fails plainly, add-models mode returns only the ticked ids), the
-nothing-picked-by-default guard (focus alone picks nothing), the calm
-empty state, ONE Save (Add models stages, the file changes only on
-Save), Advanced (collapsed by default, edits stage at once, bad price
-refused), and the detected Settings (address and folder found, fields
-hidden until overridden, saved overrides start ticked, env-locked
-fields disabled). 1538 checks in total, all green (run 3).
+answers per model. All 1538 v19 checks are carried over; the v20
+checks cover the live bigger-text fix (the open window's widgets
+re-size, tile captions and values keep their relative sizes, the
+Settings spin path, Cancel restoring the size) and the Profiles
+tab fitting the screen at 14 pt with runs (scroll area, small tab
+minimum, window minimum inside 1366x768, resize to 720 tall).
+1556 checks in total, all green (run 7).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -3532,7 +3527,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 19", app.__version__ == "19",
+    check("__version__ is 20", app.__version__ == "20",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3546,8 +3541,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v19",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v19",
+    check("title bar shows OLLAMA SYSTEM TEST v20",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v20",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4966,10 +4961,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v19",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v19",
+        check("title bar shows v20",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v20",
               window9.windowTitle())
-        check("__version__ is 19", app.__version__ == "19", app.__version__)
+        check("__version__ is 20", app.__version__ == "20", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -9351,6 +9346,185 @@ def main():
             os.environ.pop("OST_CAPABILITIES_FILE", None)
         else:
             os.environ["OST_CAPABILITIES_FILE"] = prior_caps19
+
+    # ---------- v20: live bigger text + Profiles fits the screen -----
+    # Both defects were found during v19 verification and proven by
+    # probe: apply_font_size moved the app font but no open window's
+    # widgets, and the Profiles tab forced the window minimum to
+    # 1313x822 at 14 pt with runs. Fabricated runs (same shape as
+    # v14) so the Profiles tab has tiles and charts to show.
+    from PySide6.QtWidgets import QScrollArea as QScrollArea20
+
+    def write_run20(folder, model, template, name, score, speed,
+                    stamp):
+        path = os.path.join(
+            folder, f"{stamp.replace(':', '-')}-{template}.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "model": model, "template": template,
+                "template_name": name, "template_score": score,
+                "avg_decode_tok_s": speed, "timestamp": stamp,
+                "system_id": "sys1",
+            }, handle)
+
+    results20 = os.path.join(SCRATCH, "results20")
+    smart_dir20 = os.path.join(results20, "fake-smart-2b", "sys1")
+    os.makedirs(smart_dir20, exist_ok=True)
+    write_run20(smart_dir20, "fake-smart:2b", "math", "Math", 100.0,
+                20.0, "2026-11-13T10:00:00")
+    write_run20(smart_dir20, "fake-smart:2b", "coding", "Coding", 40.0,
+                18.0, "2026-11-13T11:00:00")
+    write_run20(smart_dir20, "fake-smart:2b", "math", "Math", 80.0,
+                22.0, "2026-11-14T09:00:00")
+    prior_results20 = os.environ.get("OST_RESULTS_DIR")
+    prior_providers20 = os.environ.get("OST_PROVIDERS_FILE")
+    prior_caps20 = os.environ.get("OST_CAPABILITIES_FILE")
+    prior_host20 = os.environ.get("OLLAMA_HOST")
+    os.environ["OST_RESULTS_DIR"] = results20
+    os.environ["OST_PROVIDERS_FILE"] = os.path.join(
+        SCRATCH, "providers20.json")
+    os.environ["OST_CAPABILITIES_FILE"] = os.path.join(
+        SCRATCH, "capabilities20.json")
+    server20, _t20 = fake_ollama.start_server()
+    host20, port20 = server20.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host20}:{port20}"
+    window20 = app.MainWindow()
+    window20.show()
+    wait_until(lambda: window20.model_list.count() == 4,
+               timeout=10, app=qt_app)
+    prior_font20 = qt_app.font().pointSize()
+    default20 = app.default_font_point_size()
+    try:
+        # Defect 1: the live apply must reach the OPEN window's
+        # widgets, not just the app font — the v15 checks only
+        # read qt_app.font(), which is why this stayed broken.
+        check("open window label starts at the default size",
+              window20.status_label.font().pointSize() == prior_font20,
+              str(window20.status_label.font().pointSize()))
+        app.apply_font_size(14)
+        qt_app.processEvents()
+        check("live apply re-sizes the open window's labels",
+              window20.status_label.font().pointSize() == 14,
+              str(window20.status_label.font().pointSize()))
+        check("live apply re-sizes the Providers tab too",
+              window20.provider_empty_label.font().pointSize() == 14,
+              str(window20.provider_empty_label.font().pointSize()))
+        # Tiles: pick the model with runs on the Profiles tab.
+        window20.tabs.setCurrentIndex(window20.TAB_PROFILES)
+        for row20 in range(window20.profile_model_combo.count()):
+            if (window20.profile_model_combo.itemData(row20)
+                    == "fake-smart-2b"):
+                window20.profile_model_combo.setCurrentIndex(row20)
+        qt_app.processEvents()
+        check("tiles show at 14 pt with runs",
+              window20.profile_tiles.isVisible())
+        check("hero value keeps its relative size live",
+              window20.profile_hero_value.font().pointSize() == 22
+              and window20.profile_hero_value.font().bold(),
+              f"{window20.profile_hero_value.font().pointSize()} "
+              f"bold {window20.profile_hero_value.font().bold()}")
+        check("small tile values keep their relative size live",
+              window20.profile_best_value.font().pointSize() == 18
+              and window20.profile_speed_value.font().pointSize() == 18,
+              f"{window20.profile_best_value.font().pointSize()} "
+              f"{window20.profile_speed_value.font().pointSize()}")
+        caps20 = [c for c in window20.profile_tiles.findChildren(QLabel)
+                  if c.property("font_size_delta") == -1]
+        check("tile captions keep their relative size live",
+              len(caps20) == 5
+              and all(c.font().pointSize() == 13 for c in caps20),
+              str([c.font().pointSize() for c in caps20]))
+        # Defect 2: the Profiles tab fits the screen at 14 pt
+        # with runs — it forced 1313x822 before v20.
+        page20 = window20.tabs.widget(window20.TAB_PROFILES)
+        check("Profiles tab lives in a scroll area",
+              page20.findChild(QScrollArea20) is not None)
+        hint20 = page20.minimumSizeHint()
+        check("Profiles tab minimum is small at 14 pt with runs",
+              hint20.width() <= 200 and hint20.height() <= 200,
+              f"{hint20.width()}x{hint20.height()}")
+        win_min20 = window20.minimumSizeHint()
+        check("window minimum fits 1366x768 at 14 pt with runs",
+              win_min20.width() <= 1366 and win_min20.height() <= 768,
+              f"{win_min20.width()}x{win_min20.height()}")
+        window20.resize(980, 720)
+        qt_app.processEvents()
+        check("window can resize to 720 tall at 14 pt with runs",
+              window20.height() == 720, str(window20.height()))
+        check("window width stays on a 1366 screen at 14 pt",
+              window20.width() <= 1366, str(window20.width()))
+        # Restoring the size restores the open window too.
+        app.apply_font_size(0)
+        qt_app.processEvents()
+        check("restoring the size restores the open window's labels",
+              window20.status_label.font().pointSize() == default20,
+              str(window20.status_label.font().pointSize()))
+        check("restoring the size restores the tile values",
+              window20.profile_hero_value.font().pointSize()
+              == default20 + 8
+              and window20.profile_best_value.font().pointSize()
+              == default20 + 4,
+              f"{window20.profile_hero_value.font().pointSize()} "
+              f"{window20.profile_best_value.font().pointSize()}")
+        # The path Joshua uses: the Settings spin, live, then
+        # Cancel putting the opening size back.
+        dialog20 = app.SettingsDialog(app.load_app_settings(), window20)
+        dialog20.show()
+        qt_app.processEvents()
+        dialog20.font_spin.setValue(14)
+        qt_app.processEvents()
+        check("Settings spin re-sizes the open window live",
+              window20.status_label.font().pointSize() == 14,
+              str(window20.status_label.font().pointSize()))
+        dialog20.reject()
+        qt_app.processEvents()
+        check("cancelling Settings restores the open window's size",
+              window20.status_label.font().pointSize() == default20,
+              str(window20.status_label.font().pointSize()))
+        # Cancel with a non-default size already applied puts THAT
+        # size back, not the startup default (found by the drive:
+        # _font_at_open used to be the startup default, so Cancel
+        # after applying 14 pt put 9 pt back).
+        app.apply_font_size(14)
+        qt_app.processEvents()
+        dialog20b = app.SettingsDialog(app.load_app_settings(), window20)
+        dialog20b.show()
+        qt_app.processEvents()
+        dialog20b.font_spin.setValue(20)
+        qt_app.processEvents()
+        check("spin to 20 pt grows the open window live",
+              window20.status_label.font().pointSize() == 20,
+              str(window20.status_label.font().pointSize()))
+        dialog20b.reject()
+        qt_app.processEvents()
+        check("cancelling Settings restores the size it opened with",
+              window20.status_label.font().pointSize() == 14,
+              str(window20.status_label.font().pointSize()))
+        app.apply_font_size(0)
+    finally:
+        app.apply_font_size(prior_font20)
+        if window20 is not None:
+            window20.close()
+            window20.deleteLater()
+            qt_app.processEvents()
+        server20.shutdown()
+        server20.server_close()
+        if prior_results20 is None:
+            os.environ.pop("OST_RESULTS_DIR", None)
+        else:
+            os.environ["OST_RESULTS_DIR"] = prior_results20
+        if prior_providers20 is None:
+            os.environ.pop("OST_PROVIDERS_FILE", None)
+        else:
+            os.environ["OST_PROVIDERS_FILE"] = prior_providers20
+        if prior_caps20 is None:
+            os.environ.pop("OST_CAPABILITIES_FILE", None)
+        else:
+            os.environ["OST_CAPABILITIES_FILE"] = prior_caps20
+        if prior_host20 is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host20
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview
