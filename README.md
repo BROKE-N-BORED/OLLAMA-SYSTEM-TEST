@@ -60,7 +60,7 @@ passing no longer passes; answers must match exactly unless the
 task gives a tolerance or says approximate; written numbers
 ("twenty-one") and fractions ("1/2") score like digits; and a
 task with the right setup and the wrong final answer scores
-partial credit instead of 0. A full run is 108 prompts now.
+partial credit instead of 0. A full run is 113 prompts now.
 
 v14 is a results-and-settings release, no new templates: the Profiles
 tab is a dashboard now — one hero tile for the latest overall score,
@@ -220,7 +220,7 @@ remembered next time.
    starts, the app switches to the Run tab and each model runs each
    template in turn, one at a time.
    A full run (all templates, all models) takes a while — each model
-   answers 108 prompts (95 scored tasks, plus the extra turns in the
+   answers 113 prompts (100 scored tasks, plus the extra turns in the
    multi-turn and role-following templates, plus 3 speed runs), and
    the 32K speed run takes minutes on a CPU by design — so start with
    one model or one template to get a feel for the speed, then run

@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v20
+# TEST-REPORT — OLLAMA SYSTEM TEST v21
 
 Verified 2026-11-17 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
@@ -8,6 +8,148 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v21 is the benchmark grader release: 13 fixes from the live-run
+findings, where 55 of 73 recorded "failures" across 5 finished
+models turned out to be grader and harness artifacts, not model
+failures. The evidence was the stored run files for lfm3:1.7b,
+bonsai-2-uncensored:2b, qwen2.5-coder-abliterate:1.5b,
+qwen3-vl:2b-instruct and bonsai-2:4b, plus the artifact detector
+(corrected-scores.py) that classified them. The goal, in Joshua's
+words: every recorded failure a real model failure, every
+recorded pass a real pass. No new templates; refusal grows from
+5 tasks to 10 (5 benign + 5 genuinely harmful), so the full run
+is 113 prompts / 100 scored tasks (was 108 / 95); no new
+dependencies.
+
+The fixes, per item: (1) planning grades step coverage with
+paraphrase alternates per step, in order, and partial credit
+(covered/total) — plus planning answers get 500 tokens (was
+300; the stored plans were cut off mid-plan by the limit).
+(2) An empty answer after the model generated tokens is a
+capture failure: retried once, then recorded not-run, never
+scored as a wrong answer. The investigation found the stored
+pattern (empty answer, decode measured, no error) fits a model
+emitting EOS almost at once — eval_count of 1–2 tokens gives
+exactly the observed decode rates — but the run files never
+stored eval_count, so capture loss and instant-EOS were
+indistinguishable; the token-count key mismatch that hid them
+(prompt_tokens/completion_tokens were always null) is fixed
+too, so the classification is exact from here on. (3) Infra-
+structure errors ("unexpected EOF") retry once, then the task
+is not-run; a template run stopped early still saves its run
+file marked errored, and Resume / Re-run failed picks it up.
+(4) An empty answer never passes any text rule. (5) The
+first-answer timeout is adaptive, per Joshua's 2026-11-17
+direction: 300 s stays as the floor and the window is
+max(300 s, 3x the slowest first reply seen so far in this run),
+so a slower box never hits a fixed ceiling. (6) The number
+picker prefers \boxed{...}, then a result marker in the final
+sentence, then the last sentence about the question's subject
+(skipping numbers the question itself gave), then the last
+number; digits inside units and exponents no longer count.
+(7) NFKC + dash folding before comparing. (8) Tool calling
+accepts JSON calls in reply text. (9) Structured output strips
+one fenced JSON block. (10) Role following gets a "role" rule
+(enough role-consistent signals) and a "rhyme" rule (two lines
+with a rhyming pair of endings). (11) Vision describe-shapes
+accepts morphological variants. (12) Refusal adds 5 harmful
+requests. (13) Speed records the machine load beside it (load
+average + free memory, per job and per run).
+
+Prove-it (a): the 5 finished models' stored answers were
+re-graded with the fixed graders (regrade21.py — it imports
+the detector's classify() as-is and the v21 scorers; code and
+media tasks keep their original verdict, since v21 does not
+change their scoring). Re-grade overalls vs the detector's
+corrected scores vs the official scores: lfm3 78.2 (detector
+87.7, official 70.0); bonsai-2-uncensored 85.0 (85.8, 73.1);
+qwen-coder 80.5 (81.5, 65.3); qwen3-vl 87.2 (85.3, 80.0);
+bonsai-2:4b 75.7 (97.7 on 33 kept tasks, 51.3). The gaps from
+the detector are all explained by the fixes working as
+designed: the detector EXCLUDES artifact tasks, the re-grade
+SCORES them — empty answers now fail (item 4) instead of being
+dropped, and planning scores partial credit instead of being
+excluded. LFM3's gap is refusal 0/5 (5 empty answers now
+fail), planning 6.7 (its stored plans are truncated mid-plan),
+summarization 60% and instruction 80% (empty passes now fail).
+Bonsai-2:4b's gap is the same story at larger scale: refusal
+0/5 and summarization 0/2 on empty answers, and no re-gradable
+planning tasks at all (all 5 empty). On a fresh run with the
+capture fix, those tasks would be retried or not-run instead
+of empty, so the fresh score lands near the detector's number.
+Planning on the stored text scores 6.7–67% partial credit
+instead of 0% (bonsai-uncensored 51.0, qwen-coder 67.0 with 2
+full passes, qwen3-vl 56.0); the acceptance's "25 sensible
+plans now pass" cannot literally be met on stored text — 7 of
+the 25 stored answers are empty, several are truncated by the
+old 300-token limit, and some genuinely miss steps — full
+passes need the fresh re-run with 500 tokens. Flips on
+detector-kept tasks: exactly 6, all intended — 5 role/vision
+fail→pass (real role adherence / morphological variants now
+recognized) and 1 tool pass→fail (qwen-coder called
+get_weather in text on a no-tool task — now correctly fails).
+The re-grade caught a real picker regression first: the
+original 4-layer picker flipped 7 previously-passing math
+answers to fail (LaTeX answers whose real answer sits in
+\boxed{} or an "Answer:" line, while the picker reached back
+to the intro restating the problem's own numbers). The picker
+gained the \boxed{} layer, an "answer:" marker, and a
+prompt-number guard; the re-run shows 0 math flips.
+
+Prove-it (b): a fresh full run against the fake-server harness
+(smart brain, all 19 templates, headless) scored 100% overall
+at 20.0 tok/s, and corrected-scores.py over its run files
+reports "artifact classes: {}" — zero artifacts in every class
+over 90 kept tasks, 0 excluded.
+
+Prove-it (c) is Stella-side: run the fixed build against LFM3
+and bonsai-2:4b; the detector's empty-with-decode class must
+find 0, and the run files now carry completion_tokens so the
+classification is exact. The capture fix itself is proven in
+the suite with the fake server (empty-with-tokens recovers on
+retry, still-empty raises, tool tasks with native calls are
+exempt).
+
+Suite checks were added for every fix, using the exact failing
+answers from the evidence as fixtures, plus fake-server
+integration (capture recover/raise, EOF recover/not-run,
+adaptive live timing, errored run files, a 3-brain worker run
+on refusal/role/planning/coding/speed). Two existing checks
+were flipped on purpose: fenced JSON now passes (was: fails),
+and the README prompt count is 113 (was 108). No GUI drive:
+the only UI touches are text lines added to the run summary
+and detail view (machine load, the error that stopped a run),
+covered by suite renderer checks; no layout, navigation, or
+new-window change. Known stale artifact, unchanged: tests/
+make_templates.py is the v5 template rebuild source and was
+already stale before v21 (it lacks v17's score_by in speed);
+templates/ is the source of truth and the suite does not run
+it.
+
+Run road (full suite, fresh copy each run, offscreen Qt env):
+run 1 failed 24 checks, all cascading from the full-run wait —
+the 300 s observation window expired with the run on the third
+model under a 14.6 load average (a live benchmark on the same
+box). The wait is a harness window, not a product limit, and
+the run had grown to 113 prompts, so it went to 600 s with a
+comment saying why. Run 2: 1640 passed, 7 failed, then the
+suite crashed in the v21 section — four stale checks still
+asserting version 20, three provider token totals that moved
+with the +5 refusal tasks (1,680→1,780 in, 16,800→17,800 out;
+profile 1,660→1,760 in, 16,600→17,600 out), and my own check
+reading app-written run files under the label slug
+"fake-smart-2b" instead of the app's "fake-smart_2b" (now via
+slugify_model). All suite-side, no app change. Run 3 died at
+1195 passed / 0 failed when the VM rebooted mid-suite. Run 4:
+1651 passed, 0 failed — green. The docstring count above was
+updated after green (docs-only, diff-verified against the
+green tree).
+
+Not verified: the LFM3 + bonsai-2:4b no-lost-answers re-run on
+real models (Stella-side, see (c) above); real-PC rendering on
+1366x768; any real provider with a real key; a real slow-model
+benchmark end to end on the Ryzen 3.
 
 v20 fixes two text-size defects found during v19 verification,
 both proven by probe before fixing. No new templates; no new

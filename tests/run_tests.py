@@ -1,12 +1,18 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v20 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v21 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1538 v19 checks are carried over; the v20
-checks cover the live bigger-text fix (the open window's widgets
-re-size, tile captions and values keep their relative sizes, the
-Settings spin path, Cancel restoring the size) and the Profiles
-tab fitting the screen at 14 pt with runs (scroll area, small tab
-minimum, window minimum inside 1366x768, resize to 720 tall).
-1556 checks in total, all green (run 7).
+answers per model. All 1556 v20 checks are carried over; the v21
+checks cover the 13 benchmark grader fixes: planning step coverage
+with paraphrase alternates and partial credit, capture-failure
+retry/not-run on empty-with-tokens, infrastructure errors as
+not-run with errored run files, the empty-answer-never-passes
+guard, the adaptive first-reply timeout (300 s floor, 3x the
+slowest first reply seen), the layered final-answer number
+picker, Unicode NFKC + dash folding, JSON tool calls in reply
+text, fenced JSON in structured output, the role and rhyme
+rules, contains-all alternates, the two-direction refusal
+template (5 benign + 5 harmful), and the machine load recorded
+beside the speed.
+1651 checks in total, all green (run 4).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -379,7 +385,7 @@ def main():
           by_id["image_generation"].get("capability") == "image_generation")
     check("audio needs audio", by_id["audio"].get("capability") == "audio")
     for tid in ("multi_turn", "code_repair", "planning", "grounded_qa",
-                "refusal", "summarization", "structured_output",
+                "summarization", "structured_output",
                 "role_following"):
         check(f"{tid} has 5 tasks", len(by_id[tid]["tasks"]) == 5,
               str(len(by_id[tid].get("tasks", []))))
@@ -389,6 +395,14 @@ def main():
     check("math has 10 tasks (v16: grown from 5)",
           len(by_id["math"]["tasks"]) == 10,
           str(len(by_id["math"].get("tasks", []))))
+    check("refusal has 10 tasks (v21: 5 benign + 5 harmful)",
+          len(by_id["refusal"]["tasks"]) == 10,
+          str(len(by_id["refusal"].get("tasks", []))))
+    check("refusal has 5 comply and 5 refuse tasks",
+          sum(1 for t in by_id["refusal"]["tasks"]
+              if t.get("expected") == "comply") == 5
+          and sum(1 for t in by_id["refusal"]["tasks"]
+                  if t.get("expected") == "refuse") == 5)
     check("coding tasks are code rule",
           all(t["rule"] == "code" for t in by_id["coding"]["tasks"]))
 
@@ -992,9 +1006,15 @@ def main():
     chat_images_before_full = server.chat_images_seen
     chat_tools_before_full = server.chat_tools_seen
     window.run_button.click()
+    # v21: 600 s, not 300. The full run grew to 113 prompts (the
+    # refusal template went 5 -> 10 tasks), and this wait is only
+    # how long the suite watches the run finish — the product has
+    # no such limit. Under the sustained load of a live benchmark
+    # on the same box, 300 s cut the run off at the third model
+    # (run 1: 24 checks failed, all cascading from this wait).
     done = wait_until(
         lambda: window.worker is None and window.save_button.isEnabled(),
-        timeout=300, app=qt_app,
+        timeout=600, app=qt_app,
     )
     check("full run completes", done)
     check("status says Done", "Done." in window.status_label.text(),
@@ -1848,9 +1868,12 @@ def main():
           not app.score_schema('{"name": "Ada", "age": "36"}', person_schema)[0])
     check("schema bool is not an integer",
           not app.score_schema('{"name": "Ada", "age": true}', person_schema)[0])
-    check("schema fenced JSON fails (strict)",
-          not app.score_schema('```json\n{"name": "Ada", "age": 36}\n```',
-                               person_schema)[0])
+    check("schema fenced JSON passes (v21: fences stripped)",
+          app.score_schema('```json\n{"name": "Ada", "age": 36}\n```',
+                           person_schema)[0])
+    check("schema fenced JSON without the tag passes (v21)",
+          app.score_schema('```\n{"name": "Ada", "age": 36}\n```',
+                           person_schema)[0])
     check("schema prose-wrapped JSON fails (strict)",
           not app.score_schema('Here it is: {"name": "Ada", "age": 36}',
                                person_schema)[0])
@@ -2554,8 +2577,10 @@ def main():
         check("provider row has a measured speed",
               toks != "n/a" and float(toks) > 100, toks)
     detail = windowP.detail_view.toPlainText()
-    check("detail shows 1,680 prompt tokens", "1,680 in" in detail, detail[:300])
-    check("detail shows 16,800 completion tokens", "16,800 out" in detail, detail[:300])
+    # v21: 1,780/17,800, not 1,680/16,800 — refusal grew 5 -> 10
+    # tasks, 5 more provider calls at 20 in / 200 out each.
+    check("detail shows 1,780 prompt tokens", "1,780 in" in detail, detail[:300])
+    check("detail shows 17,800 completion tokens", "17,800 out" in detail, detail[:300])
     check("detail shows cost $0.01", "$0.01" in detail, detail[:300])
     check("detail shows per-template tokens",
           "100 in / 1,000 out" in detail, detail)
@@ -2600,8 +2625,10 @@ def main():
               "Latest overall score: 100%" in prof, prof[:500])
         check("provider profile names the provider",
               "Provider: fake-provider" in prof, prof[:300])
+        # v21: 1,760/17,600, not 1,660/16,600 — refusal grew 5 -> 10
+        # tasks (see the detail totals above).
         check("provider profile totals template tokens",
-              "Tokens used in template runs: 1,660 in, 16,600 out" in prof, prof)
+              "Tokens used in template runs: 1,760 in, 17,600 out" in prof, prof)
         check("provider profile totals template cost",
               "Estimated cost in template runs: $0.01" in prof, prof)
     windowP.grab().save(os.path.join(VERIFY_DIR, "screenshot-provider-results.png"))
@@ -3527,7 +3554,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 20", app.__version__ == "20",
+    check("__version__ is 21", app.__version__ == "21",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3541,8 +3568,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v20",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v20",
+    check("title bar shows OLLAMA SYSTEM TEST v21",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v21",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4961,10 +4988,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v20",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v20",
+        check("title bar shows v21",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v21",
               window9.windowTitle())
-        check("__version__ is 20", app.__version__ == "20", app.__version__)
+        check("__version__ is 21", app.__version__ == "21", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -5151,8 +5178,8 @@ def main():
         # ---------- v9 T15: README fixes + repo hygiene -----------------
         readme9 = open(os.path.join(PKG_DIR, "README.md"),
                        encoding="utf-8").read()
-        check("README states 108 prompts",
-              "108 prompts" in readme9)
+        check("README states 113 prompts",
+              "113 prompts" in readme9)
         check("README no longer says roughly 80",
               "roughly 80" not in readme9)
         check("README shows the window screenshot",
@@ -8605,8 +8632,13 @@ def main():
         # not "down".
         server18.headers_delay = 5
         real_first18 = app.FIRST_REPLY_TIMEOUT
+        # v21: the adaptive window remembers the 12 s call above
+        # (3 x 12.5 s would swallow this 5 s delay), so the
+        # observed slowest is reset for the patched-floor check.
+        real_slowest18 = app._SLOWEST_FIRST_REPLY_S
         try:
             app.FIRST_REPLY_TIMEOUT = 2
+            app._SLOWEST_FIRST_REPLY_S = 0.0
             slow_err18 = None
             try:
                 app.generate_once(
@@ -8620,11 +8652,13 @@ def main():
                   str(slow_err18))
         finally:
             app.FIRST_REPLY_TIMEOUT = real_first18
+            app._SLOWEST_FIRST_REPLY_S = real_slowest18
             server18.headers_delay = 0
         # RV1: slow models fail their warmup and the run carries on
         # with the next model — it does not end as "Ollama down".
         server18.headers_delay = 5
         app.FIRST_REPLY_TIMEOUT = 2
+        app._SLOWEST_FIRST_REPLY_S = 0.0
         try:
             set_checked_list(window18.model_list,
                              {"fake-smart:2b", "fake-partial:3b"})
@@ -8653,6 +8687,7 @@ def main():
                   window18.resume_button.isEnabled())
         finally:
             app.FIRST_REPLY_TIMEOUT = real_first18
+            app._SLOWEST_FIRST_REPLY_S = real_slowest18
             server18.headers_delay = 0
         # RV7 + RV10: during a long call the progress line's elapsed
         # time climbs on its own, and the run bar shows its %.
@@ -9525,6 +9560,645 @@ def main():
             os.environ.pop("OLLAMA_HOST", None)
         else:
             os.environ["OLLAMA_HOST"] = prior_host20
+
+    # ---------- v21: the 13 grader fixes -------------------------------
+    # The evidence is the 5 finished models' stored answers (see
+    # TEST-REPORT): 75% of recorded failures were grader/harness
+    # artifacts. Every check below uses one of the exact failing
+    # answers as its fixture, or the exact acceptance criterion.
+    planning21 = by_id["planning"]
+    tea21 = planning21["tasks"][0]["expected"]
+    check("planning paraphrase passes (bring to a boil)",
+          app.score_steps(
+              "Bring the water to a boil, pour the hot water over the "
+              "tea, add a tea bag, let the tea steep for five minutes, "
+              "then remove the tea bag.", tea21)[0])
+    check("planning paraphrase passes (heat + strain)",
+          app.score_steps(
+              "Heat the water in the kettle. Pour the water into the "
+              "cup. Add tea leaves. Steep for three minutes. Strain "
+              "the tea.", tea21)[0])
+    check("planning exact phrases still pass",
+          app.score_steps(
+              "First boil the water. Then pour the water. Add the tea "
+              "bag. Let it steep. Remove the tea bag.", tea21)[0])
+    check("planning missing a step still fails",
+          not app.score_steps(
+              "Bring the water to a boil, pour the hot water over the "
+              "tea, add a tea bag, let the tea steep.", tea21)[0])
+    check("planning coverage counts the steps covered",
+          app.steps_coverage(
+              "Bring the water to a boil, pour the hot water, add a "
+              "tea bag.", tea21)[:2] == (3, 5))
+    check("planning partial credit is the coverage fraction",
+          app.task_credit(
+              {"rule": "steps", "expected": tea21},
+              "Bring the water to a boil, pour the hot water, add a "
+              "tea bag, let the tea steep.", False) == 0.8)
+    check("planning template allows 500 tokens (was 300)",
+          planning21["num_predict"] == 500)
+    check("planning birthday paraphrase passes",
+          app.score_steps(
+              "Pick a date for the party, send out invitations to "
+              "everyone, order a cake from the bakery, and decorate "
+              "the room.", planning21["tasks"][1]["expected"])[0])
+
+    # Item 6: the number picker, on the three exact failing answers.
+    continents21 = by_id["knowledge"]["tasks"][4]
+    check("number picker: continents hedge parses to 7",
+          app.score_task(
+              continents21,
+              "There are currently seven recognized continents on "
+              "Earth. However, this number can vary depending on how "
+              "one defines the boundaries.")[0])
+    rectangle21 = by_id["math"]["tasks"][4]
+    check("number picker: rectangle exponent parses to 60",
+          app.score_task(
+              rectangle21,
+              "The area of a rectangle is calculated by multiplying "
+              "its length by its width. Therefore, the area is $12 "
+              "\\text{ cm} \\times 5 \\text{ cm} = 60 \\text{ cm}^2$.")[0])
+    pet_turn21 = by_id["multi_turn"]["tasks"][1]["turns"][1]
+    check("number picker: pet total parses to 4",
+          app.score_task(
+              pet_turn21,
+              "You have a total of four pets: three cats and one "
+              "dog.")[0])
+    check("number picker: taxi setup numbers do not win",
+          app.score_numeric_task(
+              "The taxi charges $3 to start and $2 per mile. 11 "
+              "miles is $22, plus $3 is $25, plus a $7.50 tip is "
+              "$32.50.",
+              {"expected": 32.5, "steps": [22, 25],
+               "prompt": "A taxi charges $3 to start and $2 for each "
+                         "mile. A ride is 11 miles, and the passenger "
+                         "leaves a $7.50 tip. What is the total fare?"})[0])
+    check("number extractor ignores unit exponents",
+          app._extract_numbers("The area is 60 cm^2.") == [60.0]
+          and app._extract_numbers("The area is 60 cm\u00b2.") == [60.0])
+    check("number extractor ignores digits glued to letters",
+          app._extract_numbers("H2O") == []
+          and app._extract_numbers("Qwen2.5") == [])
+    check("number extractor still reads a bare unit number",
+          app._extract_numbers("60cm") == [60.0])
+
+    # Item 7: Unicode normalization (non-breaking hyphen U+2011).
+    check("unicode: non-breaking hyphen matches a plain hyphen",
+          app.score_contains(
+              "The vault code given in the document is "
+              "**ZEBRA\u20117741**.", "ZEBRA-7741")[0])
+    check("unicode: the fold is symmetric",
+          app.score_contains("ZEBRA-7741", "ZEBRA\u20117741")[0]
+          and app._normalize("a\u2014b") == "a-b")
+    check("unicode: the stored locker code passes",
+          app.score_task(
+              by_id["long_context"]["tasks"][2],
+              "The locker combination is **VIOLET\u20119903**.")[0])
+
+    # Item 9: structured output in fences, on the template's own tasks.
+    fenced21_ok = True
+    for task21 in by_id["structured_output"]["tasks"]:
+        bare21 = fake_ollama.answer_for("smart", task21["prompt"])
+        fenced21 = "```json\n" + bare21 + "\n```"
+        if not app.score_task(task21, fenced21)[0]:
+            fenced21_ok = False
+    check("schema: all 5 fenced answers pass",
+          fenced21_ok)
+    check("schema: prose outside the fence still fails",
+          not app.score_schema(
+              "Here it is:\n```json\n{\"name\": \"Ada\", \"age\": 36}\n```",
+              {"type": "object"})[0])
+
+    # Item 10: role signals and rhyme, on the exact failing answers.
+    pirate21 = by_id["role_following"]["tasks"][0]
+    check("role: LFM3's full pirate voice passes",
+          app.score_task(
+              pirate21["turns"][1],
+              "Aye, I be a Captain of the Black Siren! I chart the "
+              "seas, plunder the treasure chests, and keep the crew "
+              "from mutinyin' at the helm. Now, what be yer tale, "
+              "scallywag?")[0])
+    check("role: one pirate word is not a pirate voice",
+          not app.score_task(pirate21["turns"][1], "I'm a pirate!")[0])
+    check("role: smart pirate answers still pass",
+          app.score_task(pirate21["turns"][0],
+                         "Ahoy, matey! Hello!")[0]
+          and app.score_task(pirate21["turns"][1],
+                             "I sail the seven seas, matey!")[0])
+    chef21 = by_id["role_following"]["tasks"][2]
+    check("role: a chef answer with food words passes",
+          app.score_task(
+              chef21["turns"][1],
+              "As a chef, I love serving food. Let me tell you about "
+              "the soup and fresh herbs.")[0])
+    check("role: an AI disclaimer with one food word fails",
+          not app.score_task(
+              chef21["turns"][1],
+              "As an AI, I don't have personal tastes, but I can tell "
+              "you about pasta and soup.")[0])
+    poet21 = by_id["role_following"]["tasks"][3]
+    check("rhyme: LFM3's rhyming poem passes",
+          app.score_task(
+              poet21["turns"][1],
+              "The stars shine out in endless space,\n"
+              "And dreams go drifting with the flow,\n"
+              "The moonlight turns the fields to gold,\n"
+              "The night wears dark and silver crowns,\n"
+              "The sky above begins to glow.")[0])
+    check("rhyme: 'rhyme rhyme' with no poem fails",
+          not app.score_task(poet21["turns"][1], "rhyme rhyme")[0])
+    check("rhyme: free verse with no rhyming pair fails",
+          not app.score_task(
+              poet21["turns"][1],
+              "The sky is indigo\nStars like a sheet\nThe moon sings "
+              "a song\nThe night is above\nDreams full of hope\nThe "
+              "stars call home\nThe night full of grace\nThe wind has "
+              "a voice")[0])
+    check("rhyme: the smart couplets pass",
+          app.score_task(
+              poet21["turns"][0],
+              "Hello, hello, the day is bright,\nI greet you now with "
+              "pure delight.")[0]
+          and app.score_task(
+              poet21["turns"][1],
+              "The night is dark, the stars shine bright,\nThe moon "
+              "above glows silver light.")[0])
+
+    # Item 11: morphological variants in contains_all.
+    check("contains_all: circular/square shapes pass",
+          app.score_task(
+              by_id["vision"]["tasks"][3],
+              "The image displays three red circular shapes arranged "
+              "horizontally above two blue square shapes.")[0])
+    check("contains_all: plain strings still work",
+          app.score_contains_all(
+              "The agent's name is MARLOWE and the town is LISBON.",
+              ["MARLOWE", "LISBON"])[0])
+
+    # Item 4: an empty answer never passes, whatever the rule.
+    check("empty answer never passes refusal",
+          app.score_task({"rule": "refusal", "expected": "comply"},
+                         "") == (False, "no answer recorded"))
+    check("empty answer never passes max_words",
+          not app.score_task({"rule": "max_words", "expected": 10},
+                             "")[0])
+    check("empty answer never passes contains",
+          not app.score_task({"rule": "contains", "expected": "x"},
+                             "   ")[0])
+    check("empty answer never passes numeric",
+          not app.score_task(
+              {"rule": "numeric", "expected": 5}, "")[0])
+    check("empty answer never passes steps",
+          not app.score_task(
+              {"rule": "steps", "expected": ["boil the water"]},
+              "")[0])
+    check("runner rules still defer on an empty answer",
+          app.score_task({"rule": "tool_call"}, "")[1]
+          == "rule 'tool_call' is scored by its runner, not from text")
+
+    # Item 5: the adaptive window, as pure math (the live check is
+    # below, against the fake server).
+    real_slowest21 = app._SLOWEST_FIRST_REPLY_S
+    try:
+        app._SLOWEST_FIRST_REPLY_S = 0.0
+        check("adaptive: no observations means the 300 s floor",
+              app.first_reply_timeout() == 300.0)
+        app._observe_first_reply(50.0)
+        check("adaptive: a fast machine keeps the floor",
+              app.first_reply_timeout() == 300.0)
+        app._observe_first_reply(200.0)
+        check("adaptive: a slow machine gets 3x its slowest reply",
+              app.first_reply_timeout() == 600.0)
+        app._observe_first_reply(100.0)
+        check("adaptive: the slowest observation wins",
+              app.first_reply_timeout() == 600.0)
+        app._observe_first_reply(None)
+        check("adaptive: a missing observation changes nothing",
+              app.first_reply_timeout() == 600.0)
+    finally:
+        app._SLOWEST_FIRST_REPLY_S = real_slowest21
+
+    # Item 13 + item 3 helpers: load, not-run reasons, renderers.
+    load21 = app.machine_load()
+    check("machine load reports the four fields",
+          set(load21) == {"load_1m", "load_5m", "load_15m",
+                          "mem_available_mb"}
+          and (load21["load_1m"] is None
+               or isinstance(load21["load_1m"], float)))
+    check("not-run reason names a missing test file",
+          app._not_run_reason({"tasks": [
+              {"passed": None, "detail": app.NOT_RUN_IMAGE}]})
+          == "test file missing")
+    check("not-run reason names the error that stopped the run",
+          app._not_run_reason({"tasks": [
+              {"passed": None,
+               "detail": "not run: unexpected EOF"}]})
+          == "unexpected EOF")
+    check("not-run reason is None when everything ran",
+          app._not_run_reason({"tasks": [
+              {"passed": True, "detail": ""}]}) is None)
+    errored_run21 = {
+        "model": "fake-smart:2b", "template": "coding",
+        "template_name": "Coding", "template_score": None,
+        "passed": None, "total": 1, "not_run": 4,
+        "errored": True, "error": "could not reach Ollama. Try again.",
+        "avg_decode_tok_s": 20.0, "load_1m": 1.23,
+        "mem_available_mb": 4096,
+        "tasks": [
+            {"id": "fibonacci", "passed": True, "decode_tok_s": 20.0,
+             "detail": ""},
+            {"id": "fizzbuzz", "passed": None, "decode_tok_s": None,
+             "detail": "not run: could not reach Ollama. Try again."},
+        ],
+    }
+    summary21 = app.render_run_summary(errored_run21)
+    check("summary names the error that stopped the run",
+          "Run stopped early: could not reach Ollama. Try again."
+          in summary21, summary21)
+    check("summary shows the machine load",
+          "Machine load: 1.23 (1-minute average), 4096 MB memory free"
+          in summary21, summary21)
+    check("an errored pair is a failed pair",
+          app.failed_run_pairs(
+              {"fake-smart:2b": {
+                  "status": "done",
+                  "templates": {"coding": errored_run21}}},
+              [app.ollama_target("fake-smart:2b")],
+              [by_id["coding"]])
+          == [(app.ollama_target("fake-smart:2b"), by_id["coding"])])
+    profile_runs21 = os.path.join(SCRATCH, "profile21")
+    good_dir21 = os.path.join(profile_runs21, "fake-smart-2b", "sys1")
+    os.makedirs(good_dir21, exist_ok=True)
+    for stamp21, data21 in (
+        ("2026-11-17-120000", {
+            "model": "fake-smart:2b", "template": "coding",
+            "template_name": "Coding", "template_score": 100.0,
+            "timestamp": "2026-11-17T12:00:00", "system_id": "sys1",
+            "avg_decode_tok_s": 20.0, "tasks": []}),
+        ("2026-11-17-130000", {
+            "model": "fake-smart:2b", "template": "coding",
+            "template_name": "Coding", "template_score": None,
+            "errored": True, "error": "could not reach Ollama",
+            "timestamp": "2026-11-17T13:00:00", "system_id": "sys1",
+            "avg_decode_tok_s": 20.0, "not_run": 4, "tasks": []}),
+    ):
+        with open(os.path.join(
+                good_dir21, f"{stamp21}-coding.json"),
+                "w", encoding="utf-8") as handle:
+            json.dump(data21, handle)
+    numbers21 = app.profile_numbers(profile_runs21, "fake-smart-2b")
+    coding_row21 = [row for row in numbers21["template_rows"]
+                    if row[0] == "Coding"][0]
+    check("a profile keeps the last finished run over an errored one",
+          coding_row21[1] == 100.0, str(coding_row21))
+
+    # ---------- v21 integration: fake server + worker -----------------
+    results21 = os.path.join(SCRATCH, "results21")
+    prior_results21 = os.environ.get("OST_RESULTS_DIR")
+    prior_host21 = os.environ.get("OLLAMA_HOST")
+    os.environ["OST_RESULTS_DIR"] = results21
+    server21, _t21 = fake_ollama.start_server()
+    host21, port21 = server21.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host21}:{port21}"
+    machine21 = app.machine_info()
+    # The app's folder slug for the model (":" becomes "_") — the
+    # run files it writes live under this, not the label.
+    smart_slug21 = app.slugify_model("fake-smart:2b")
+    try:
+        # Token aliases: an Ollama call now reports the same token
+        # keys the runner reads (every v20 run file stored nulls).
+        metrics21 = app.generate_once(
+            "fake-smart:2b", "Say hello in one sentence.", 64)
+        check("Ollama tokens are recorded, not null",
+              metrics21.get("prompt_tokens") == 20
+              and metrics21.get("completion_tokens") == 200
+              and metrics21.get("prompt_tokens")
+              == metrics21.get("prompt_eval_count")
+              and metrics21.get("completion_tokens")
+              == metrics21.get("eval_count"),
+              str({k: metrics21.get(k) for k in (
+                  "prompt_tokens", "completion_tokens")}))
+
+        # Item 5 live: with the floor patched to 2 s and the
+        # slowest reply seen at 2 s, the window is 6 s — a 4 s
+        # first token passes, an 8 s one fails slow.
+        real_first21 = app.FIRST_REPLY_TIMEOUT
+        real_slowest21b = app._SLOWEST_FIRST_REPLY_S
+        try:
+            app.FIRST_REPLY_TIMEOUT = 2
+            app._SLOWEST_FIRST_REPLY_S = 2.0
+            server21.headers_delay = 4
+            adaptive_ok21 = app.generate_once(
+                "fake-smart:2b", "Say hello in one sentence.", 64)
+            check("adaptive window admits a first token past the floor",
+                  bool((adaptive_ok21.get("answer") or "").strip()))
+            app._SLOWEST_FIRST_REPLY_S = 2.0
+            server21.headers_delay = 8
+            adaptive_err21 = None
+            try:
+                app.generate_once(
+                    "fake-smart:2b", "Say hello in one sentence.", 64)
+            except app.OllamaError as exc:
+                adaptive_err21 = exc
+            check("adaptive window still fails a first token past it",
+                  adaptive_err21 is not None
+                  and str(adaptive_err21) == app.SLOW_REPLY,
+                  str(adaptive_err21))
+        finally:
+            app.FIRST_REPLY_TIMEOUT = real_first21
+            app._SLOWEST_FIRST_REPLY_S = real_slowest21b
+            server21.headers_delay = 0
+
+        # Item 2: empty-with-tokens is a capture failure, retried
+        # once, then raised — never scored as a wrong answer.
+        worker21 = app.BenchWorker(
+            [], [], "sys21", machine21, results21)
+        smart21 = app.ollama_target("fake-smart:2b")
+        server21.empty_with_tokens = 1
+        recovered21 = worker21._generate(
+            smart21, "Say hello in one sentence.", 64)
+        check("one empty-with-tokens call recovers on retry",
+              bool((recovered21.get("answer") or "").strip()))
+        server21.empty_with_tokens = 99
+        capture_err21 = None
+        try:
+            worker21._generate(smart21, "Say hello in one sentence.", 64)
+        except app.OllamaError as exc:
+            capture_err21 = exc
+        check("empty-with-tokens twice raises a capture error",
+              capture_err21 is not None
+              and "capture failed" in str(capture_err21)
+              and "200 tokens" in str(capture_err21),
+              str(capture_err21))
+        server21.empty_with_tokens = 0
+        # A tool task's empty answer with native calls is a real
+        # answer, not a capture failure.
+        server21.empty_with_tokens = 99
+        tool_record21, _media21 = worker21._task_tools(
+            smart21, by_id["tool_calling"],
+            by_id["tool_calling"]["tasks"][0])
+        check("a native tool call exempts the empty answer",
+              tool_record21["passed"] is True, str(tool_record21))
+        server21.empty_with_tokens = 0
+        # The capture check itself, unit-level: few tokens is the
+        # model saying nothing (no retry, no error).
+        def _must_not_retry21():
+            raise AssertionError("no retry for few tokens")
+
+        few21 = worker21._check_capture(
+            smart21,
+            {"answer": "", "tool_calls": [],
+             "completion_tokens": 2, "dropped_chunks": 0},
+            _must_not_retry21,
+        )
+        check("empty with few tokens is not a capture failure",
+              few21.get("completion_tokens") == 2)
+
+        # Item 3: a transient EOF is retried once; a persistent one
+        # is not-run, never scored 0.
+        server21.eof_count = 1
+        eof_recovered21 = worker21._generate(
+            smart21, "Say hello in one sentence.", 64)
+        check("one EOF recovers on retry",
+              bool((eof_recovered21.get("answer") or "").strip()))
+        server21.eof_count = 99
+        eof_record21, _media21b = worker21._run_scored_task(
+            smart21, by_id["math"], by_id["math"]["tasks"][0])
+        check("a persistent EOF is not-run, not failed",
+              eof_record21["passed"] is None
+              and eof_record21["detail"] == "not run: unexpected EOF"
+              and app.is_not_run(eof_record21),
+              str(eof_record21))
+        server21.eof_count = 0
+
+        # Item 8 + item 4: tool calls in reply text, via a patched
+        # chat call (no fake brain writes JSON text).
+        tools_worker21 = app.BenchWorker(
+            [], [], "sys21", machine21, results21)
+
+        def _canned_chat21(answer):
+            def _chat(target, messages, num_predict, tools=None):
+                return {
+                    "answer": answer, "tool_calls": [],
+                    "decode_tok_s": 20.0, "prompt_tok_s": 10.0,
+                    "ttft_s": 0.5, "prompt_tokens": 20,
+                    "completion_tokens": 200,
+                }
+            return _chat
+
+        weather_task21 = by_id["tool_calling"]["tasks"][0]
+        tools_worker21._chat = _canned_chat21(
+            '{"name": "get_weather", "arguments": {"city": "Paris"}}')
+        json_tool21, _m21 = tools_worker21._task_tools(
+            smart21, by_id["tool_calling"], weather_task21)
+        check("a tool call written as JSON in text passes",
+              json_tool21["passed"] is True, str(json_tool21))
+        no_tool_task21 = by_id["tool_calling"]["tasks"][3]
+        json_no_tool21, _m21b = tools_worker21._task_tools(
+            smart21, by_id["tool_calling"], no_tool_task21)
+        check("a JSON call in text fails a no-tool task",
+              json_no_tool21["passed"] is False, str(json_no_tool21))
+        tools_worker21._chat = _canned_chat21("")
+        empty_tool21, _m21c = tools_worker21._task_tools(
+            smart21, by_id["tool_calling"], no_tool_task21)
+        check("no call and no answer never passes a tool task",
+              empty_tool21["passed"] is False
+              and empty_tool21["detail"] == "no answer recorded",
+              str(empty_tool21))
+        tools_worker21._chat = _canned_chat21(
+            '{"name": "add_numbers", "arguments": {"a": 12, "b": 30}}')
+        add_tool21, _m21d = tools_worker21._task_tools(
+            smart21, by_id["tool_calling"],
+            by_id["tool_calling"]["tasks"][4])
+        check("a JSON call in text passes with numeric args",
+              add_tool21["passed"] is True, str(add_tool21))
+
+        # The three rebuilt templates, end to end, three brains.
+        run21_results = {}
+        run21_finished = {"done": False}
+        run21_worker = app.BenchWorker(
+            [app.ollama_target("fake-smart:2b"),
+             app.ollama_target("fake-partial:3b"),
+             app.ollama_target("fake-dumb:1b")],
+            [by_id["refusal"], by_id["role_following"],
+             by_id["planning"], by_id["coding"], by_id["speed"]],
+            "sys21", machine21, results21)
+        run21_worker.model_done.connect(
+            lambda name, result: run21_results.__setitem__(name, result))
+        run21_worker.run_finished.connect(
+            lambda reason: run21_finished.__setitem__("done", reason))
+        run21_worker.start()
+        run21_ok = wait_until(lambda: run21_finished["done"],
+                              timeout=300, app=qt_app)
+        run21_worker.wait()
+        check("v21 template run finishes", run21_ok)
+        for brain21, want21 in (("fake-smart:2b", 100.0),
+                                ("fake-partial:3b", 60.0),
+                                ("fake-dumb:1b", 0.0)):
+            for tid21 in ("refusal", "role_following", "planning",
+                          "coding"):
+                got21 = run21_results.get(brain21, {}).get(
+                    "templates", {}).get(tid21, {}).get("template_score")
+                check(f"{brain21} scores {want21:.0f}% on {tid21}",
+                      got21 == want21, str(got21))
+        for brain21, want21 in (("fake-smart:2b", 100.0),
+                                ("fake-partial:3b", 50.0),
+                                ("fake-dumb:1b", 25.0)):
+            got21 = run21_results.get(brain21, {}).get(
+                "templates", {}).get("speed", {}).get("template_score")
+            check(f"{brain21} scores {want21:.0f}% on speed",
+                  got21 == want21, str(got21))
+        # Item 12: the refusal run file holds 10 tasks, 6 passed
+        # for partial (3 benign + 3 harmful).
+        partial_refusal21 = run21_results.get(
+            "fake-partial:3b", {}).get("templates", {}).get("refusal", {})
+        check("partial refusal is 6 of 10 tasks",
+              partial_refusal21.get("total") == 10
+              and partial_refusal21.get("passed") == 6,
+              str({k: partial_refusal21.get(k)
+                   for k in ("total", "passed")}))
+        # Item 13: the speed run file records the load beside the
+        # speed, per job and for the run.
+        smart_speed21 = run21_results.get(
+            "fake-smart:2b", {}).get("templates", {}).get("speed", {})
+        check("a speed run records the machine load",
+              smart_speed21.get("load_1m") is not None
+              and smart_speed21.get("mem_available_mb") is not None,
+              str({k: smart_speed21.get(k) for k in (
+                  "load_1m", "mem_available_mb")}))
+        check("each speed job records the load beside its speed",
+              all(task.get("load_1m") is not None
+                  for task in smart_speed21.get("tasks", [])),
+              str([t.get("load_1m")
+                   for t in smart_speed21.get("tasks", [])]))
+        # The token-alias fix, in a run file: real token counts.
+        smart_planning21 = run21_results.get(
+            "fake-smart:2b", {}).get("templates", {}).get("planning", {})
+        check("a run file records real token counts",
+              smart_planning21.get("prompt_tokens") is not None
+              and smart_planning21.get("completion_tokens") is not None
+              and smart_planning21.get("completion_tokens") == 1000,
+              str({k: smart_planning21.get(k) for k in (
+                  "prompt_tokens", "completion_tokens")}))
+
+        # Item 3b (direct, deterministic): _run_template saves an
+        # errored file when Ollama dies mid-template, then
+        # re-raises — the record exists and the run still ends as
+        # ollama_down.
+        direct_worker21 = app.BenchWorker(
+            [], [], "sys21", machine21, results21)
+        real_scored21 = direct_worker21._run_scored_task
+        calls21 = {"n": 0}
+
+        def _dying_scored21(target, template, task):
+            calls21["n"] += 1
+            if calls21["n"] >= 2:
+                raise app.OllamaUnreachable("could not reach Ollama")
+            return real_scored21(target, template, task)
+
+        direct_worker21._run_scored_task = _dying_scored21
+        direct_err21 = None
+        try:
+            direct_worker21._run_template(smart21, by_id["coding"])
+        except app.OllamaUnreachable as exc:
+            direct_err21 = exc
+        check("a dying template re-raises after saving",
+              direct_err21 is not None
+              and getattr(direct_err21, "run_data", None) is not None
+              and getattr(direct_err21, "run_path", None) is not None)
+        direct_data21 = getattr(direct_err21, "run_data", {}) or {}
+        check("the direct errored record has 1 ran and 4 not-run",
+              direct_data21.get("errored") is True
+              and direct_data21.get("template_score") is None
+              and direct_data21.get("not_run") == 4
+              and len(direct_data21.get("tasks", [])) == 5,
+              str({k: direct_data21.get(k) for k in (
+                  "errored", "template_score", "not_run")}))
+        check("the direct errored file is on disk",
+              os.path.exists(getattr(direct_err21, "run_path", "") or ""))
+
+        # Item 3b (end to end): Ollama dies mid-template during a
+        # real worker run — the run ends ollama_down, the template
+        # is marked errored, and the pair stays pending. The exact
+        # not-run count depends on where the kill lands, so the
+        # count is a floor, not an exact number.
+        server21.generate_done = 0
+
+        def _kill21():
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if server21.generate_done >= 1:
+                    break
+                time.sleep(0.05)
+            server21.dead = True
+            server21.shutdown()
+            server21.server_close()
+
+        killer21 = threading.Thread(target=_kill21, daemon=True)
+        killer21.start()
+        died21_results = {}
+        died21_finished = {"done": False}
+        died21_worker = app.BenchWorker(
+            [app.ollama_target("fake-smart:2b")],
+            [by_id["coding"]], "sys21", machine21, results21)
+        died21_worker.model_done.connect(
+            lambda name, result: died21_results.__setitem__(name, result))
+        died21_worker.run_finished.connect(
+            lambda reason: died21_finished.__setitem__("done", reason))
+        died21_worker.start()
+        died21_ok = wait_until(lambda: died21_finished["done"],
+                               timeout=120, app=qt_app)
+        died21_worker.wait()
+        killer21.join(timeout=10)
+        check("a run with Ollama dying mid-template finishes",
+              died21_ok)
+        check("a run with Ollama dying ends as ollama_down",
+              died21_finished["done"] == "ollama_down",
+              str(died21_finished["done"]))
+        died_coding21 = died21_results.get(
+            "fake-smart:2b", {}).get("templates", {}).get("coding", {})
+        check("the dying template's record is marked errored",
+              died_coding21.get("errored") is True
+              and died_coding21.get("template_score") is None
+              and (died_coding21.get("not_run") or 0) >= 1,
+              str({k: died_coding21.get(k) for k in (
+                  "errored", "template_score", "not_run")}))
+        coding_files21 = [
+            f for f in os.listdir(
+                os.path.join(results21, smart_slug21, "sys21"))
+            if f.endswith("-coding.json")]
+        coding_data21 = []
+        for name21 in coding_files21:
+            with open(os.path.join(
+                    results21, smart_slug21, "sys21", name21),
+                    encoding="utf-8") as handle:
+                coding_data21.append(json.load(handle))
+        check("an errored run file is on disk",
+              any(d.get("errored") is True for d in coding_data21),
+              str(coding_files21))
+        check("the finished coding run is still on disk",
+              any(d.get("template_score") == 100.0
+                  for d in coding_data21))
+        check("the errored pair stays pending for a resume",
+              died21_worker._manifest.get("pairs", {}).get(
+                  app.pair_key("fake-smart:2b", "coding")) == "pending",
+              str(died21_worker._manifest.get("pairs")))
+        numbers21b = app.profile_numbers(results21, smart_slug21)
+        coding_row21b = [row for row in numbers21b["template_rows"]
+                         if row[0] == "Coding"][0]
+        check("the profile still shows the finished coding run",
+              coding_row21b[1] == 100.0, str(coding_row21b))
+    finally:
+        server21.shutdown()
+        server21.server_close()
+        if prior_results21 is None:
+            os.environ.pop("OST_RESULTS_DIR", None)
+        else:
+            os.environ["OST_RESULTS_DIR"] = prior_results21
+        if prior_host21 is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host21
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview

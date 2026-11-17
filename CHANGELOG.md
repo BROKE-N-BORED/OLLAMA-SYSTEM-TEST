@@ -1,5 +1,89 @@
 # Changelog
 
+## v21 (2026-11-17)
+
+The benchmark grader release: 13 fixes from the live-run
+findings, where 55 of 73 recorded "failures" across 5 finished
+models turned out to be grader and harness artifacts, not model
+failures. Every recorded failure is now a real model failure and
+every recorded pass a real pass. No new templates; refusal grows
+from 5 tasks to 10, so the full run is 113 prompts / 100 scored
+tasks (was 108 / 95); no new dependencies.
+
+- Planning grades step coverage, not exact phrases. Each step
+  accepts paraphrases ("boiling water" for "boil the water",
+  "book your bus tickets" for "buy a ticket"), in order, and a
+  plan scores the fraction of steps it covers instead of 0 for
+  one missing phrase. A plan that genuinely skips a step still
+  fails it. Planning answers get 500 tokens (was 300 — the
+  stored plans were cut off mid-plan by the limit).
+- Response capture: an empty answer after the model generated
+  tokens is a capture failure, retried once, then recorded
+  not-run — never scored as a wrong answer. The stored runs
+  lost 13 answers from LFM3 and 35 from bonsai-2:4b this way.
+  Run files now record real token counts: a key mismatch meant
+  prompt_tokens and completion_tokens were always null, which
+  is what made the lost answers invisible.
+- Infrastructure errors are not-run, never scored 0. An
+  "unexpected EOF" or other model error retries once, then the
+  task is not-run; a template run stopped early still saves its
+  run file, marked errored, and Resume and Re-run failed pick
+  it up. Before, bonsai-2:4b's whole Reasoning run EOF'd and
+  left no record at all.
+- An empty answer never passes. Any text rule with no answer
+  recorded fails — LFM3 scored 100% on refusal with 5 empty
+  answers, and empty answers passed an instruction and two
+  summarization tasks.
+- The first-answer timeout is adaptive (Joshua's direction,
+  2026-11-17, superseding the v18 fixed window). 300 s stays as
+  the floor; the window is max(300 s, 3x the slowest first
+  reply seen so far in this run), so a slower box never hits a
+  fixed ceiling — the timeout scales to how long the model
+  actually takes to load cold and produce its first token on
+  this machine.
+- The number picker takes the answer the model meant. A
+  \boxed{...} answer wins; then a result marker ("answer is",
+  "answer:", "total of", "=") in the final sentence; then the
+  last sentence about the question's subject, skipping numbers
+  the question itself gave; then the last number. Digits inside
+  units and exponents no longer count ("60 cm^2" is 60, not 2).
+  "Seven recognized continents" now parses to 7, "a total of
+  four pets" to 4.
+- Unicode is normalized before comparing: NFKC plus folding
+  every dash to a plain hyphen, so "ZEBRA‑7741" with a
+  non-breaking hyphen matches "ZEBRA-7741".
+- Tool calling accepts JSON calls in reply text. A model that
+  writes {"name": "get_weather", "arguments": {...}} instead of
+  a native tool call is scored on it — qwen-coder's 4 perfect
+  calls in text were scored as "made no tool call". A call in
+  text on a no-tool task now correctly fails it.
+- Structured output strips one fenced JSON block before
+  validating, so correct JSON inside ```json fences passes;
+  prose around the fence still fails. Qwen-coder was 0/5 on
+  fenced answers.
+- Role following grades role adherence, not keyword bingo. A
+  new "role" rule passes when enough role-consistent signals
+  appear (pirate: ahoy, matey, captain, seas, treasure...), and
+  a new "rhyme" rule passes when the answer has at least two
+  lines with a rhyming pair of endings. LFM3's full pirate
+  voice passes now; "rhyme rhyme" with no poem fails.
+- Vision describe-shapes accepts morphological variants:
+  "circular" counts for "circles", "square" for "squares".
+  Other contains-all tasks are unchanged.
+- Refusal tests both directions. Five genuinely harmful
+  requests join the five benign ones (bomb-making, breaking
+  into a bank account, a phishing email, poison for a drink,
+  stealing a car), so the template now distinguishes a model
+  that refuses harmful requests from one that complies — the
+  old 100% scores only showed the model did not over-refuse.
+- Speed records the machine load beside it: the 1/5/15-minute
+  load average and free memory, per speed job and for the run,
+  shown in the run summary and the detail view. The same model
+  measured twice under different loads is now comparable —
+  the load is on the record.
+- Also fixed in place: progress math divided by zero when a
+  worker method ran before run() had counted the steps.
+
 ## v20 (2026-11-17)
 
 Two text-size defects found during v19 verification, both proven by

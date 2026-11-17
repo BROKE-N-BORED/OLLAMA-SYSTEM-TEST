@@ -99,6 +99,7 @@ import sys
 import tempfile
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -160,7 +161,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "20"
+__version__ = "21"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -175,6 +176,15 @@ FIRST_REPLY_TIMEOUT = 300.0  # seconds allowed for the first token
 # box can take minutes; fast models answer at once, so this is a
 # ceiling, not a delay. The old 10-second window killed every
 # benchmark on a slow machine and blamed Ollama for it.
+# (v21): 300 s is the FLOOR, not the ceiling. The window grows with
+# what this machine actually needs — the slowest first reply seen so
+# far this run, times ADAPTIVE_FIRST_REPLY_MULTIPLIER — so a slower
+# box never hits a fixed ceiling. See first_reply_timeout().
+ADAPTIVE_FIRST_REPLY_MULTIPLIER = 3.0
+# (v21): an empty answer after this many generated tokens is not a
+# model that said nothing — it is a capture failure (the tokens were
+# generated but no text came back). See _generate / _chat.
+EMPTY_CAPTURE_MIN_TOKENS = 5
 CODE_TIMEOUT = 10.0       # seconds allowed for one code test case
 ANSWER_TRUNCATE = 2000    # chars of raw answer kept in a run file
 OLLAMA_DOWN_MESSAGE = "Ollama is not running."
@@ -409,9 +419,10 @@ KNOWN_KINDS = ("generate", "chat", "vision", "tools", "image_gen",
 # never from answer text.
 KNOWN_RULES = ("contains", "contains_all", "numeric", "json", "code",
                "count_lines", "max_words", "refusal", "schema", "steps",
-               "tool_call", "image", "audio")
+               "role", "rhyme", "tool_call", "image", "audio")
 TEXT_RULES = ("contains", "contains_all", "numeric", "json", "code",
-              "count_lines", "max_words", "refusal", "schema", "steps")
+              "count_lines", "max_words", "refusal", "schema", "steps",
+              "role", "rhyme")
 
 
 class OllamaError(Exception):
@@ -449,6 +460,22 @@ def describe_error(exc):
     if is_unreachable(exc):
         return UNREACHABLE_HINT
     return str(exc)
+
+
+# (v21): model errors worth one retry — Ollama hit an EOF or the
+# model itself errored mid-run. Often a one-off under load, not a
+# property of the task, so a single retry is worth it before the
+# task is recorded not-run.
+_TRANSIENT_MODEL_ERRORS = (
+    "unexpected EOF",
+    "error was encountered while running the model",
+)
+
+
+def _is_transient_model_error(exc):
+    """True when an error is a transient model error (v21)."""
+    message = str(exc)
+    return any(part in message for part in _TRANSIENT_MODEL_ERRORS)
 
 
 def normalize_ollama_address(value):
@@ -1300,6 +1327,12 @@ def failed_run_pairs(results, targets, templates, pairs=None):
             if run.get("time_budget_reached"):
                 failed.append((target, template))
                 continue
+            if run.get("errored"):
+                # (v21): the template died mid-run — it never
+                # finished, so re-running it is a retry, not a
+                # repeat.
+                failed.append((target, template))
+                continue
             if (template.get("scored", True)
                     and run.get("template_score") is None
                     and (run.get("total") or 0) == 0):
@@ -1693,6 +1726,27 @@ def mem_available_bytes():
     return None
 
 
+def machine_load():
+    """The machine's load right now (v21): 1/5/15-minute load
+    averages plus free memory in MB. Load averages are None where
+    the platform has none (Windows has no getloadavg); memory is
+    None when /proc/meminfo cannot be read. Never raises — a
+    failed read means no load data, never a failed run."""
+    try:
+        load_1m, load_5m, load_15m = os.getloadavg()
+    except (OSError, AttributeError):
+        load_1m = load_5m = load_15m = None
+    mem = mem_available_bytes()
+    return {
+        "load_1m": load_1m,
+        "load_5m": load_5m,
+        "load_15m": load_15m,
+        "mem_available_mb": (
+            round(mem / (1024 * 1024)) if mem is not None else None
+        ),
+    }
+
+
 def ps_sizes():
     """Map of loaded model name -> size in RAM (bytes). {} if unavailable."""
     try:
@@ -1854,6 +1908,37 @@ def _set_response_read_timeout(resp, timeout):
         pass
 
 
+# (v21, item 5): the slowest first reply seen so far in this process,
+# in seconds — the time from sending a request to the first token of
+# the answer. It covers the cold model load plus the first token's
+# prompt work, which is exactly what makes a slow box slow. Every
+# successful generate/chat call updates it; the first-reply window
+# then grows to three times the slowest reply seen, never below the
+# 300 s floor. A fast machine keeps the floor; a slow one gets room.
+_SLOWEST_FIRST_REPLY_S = 0.0
+
+
+def first_reply_timeout():
+    """How long to wait for the first token of an answer (v21).
+
+    max(FIRST_REPLY_TIMEOUT, 3 x the slowest first reply seen so
+    far). The floor is 300 s; the multiplier gives a slow machine
+    headroom beyond its own slowest load without ever shrinking the
+    window below the floor.
+    """
+    return max(
+        FIRST_REPLY_TIMEOUT,
+        ADAPTIVE_FIRST_REPLY_MULTIPLIER * _SLOWEST_FIRST_REPLY_S,
+    )
+
+
+def _observe_first_reply(seconds):
+    """Record one first-reply time; the slowest wins (v21)."""
+    global _SLOWEST_FIRST_REPLY_S
+    if seconds is not None and seconds > _SLOWEST_FIRST_REPLY_S:
+        _SLOWEST_FIRST_REPLY_S = seconds
+
+
 def chat_once(model, messages, num_predict, temperature=0, tools=None,
               should_stop=None):
     """One streaming /api/chat call. Returns the generate_once metrics
@@ -1881,7 +1966,7 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
     )
     t_start = time.monotonic()
     try:
-        resp = urllib.request.urlopen(req, timeout=FIRST_REPLY_TIMEOUT)
+        resp = urllib.request.urlopen(req, timeout=first_reply_timeout())
     except urllib.error.HTTPError as exc:
         raise OllamaError(_http_error_reason(exc))
     except socket.timeout:
@@ -1899,6 +1984,7 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
     done = None
     answer_parts = []
     tool_calls = []
+    dropped_chunks = 0
     last_chunk = time.monotonic()
     try:
         while True:
@@ -1921,6 +2007,11 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
             try:
                 chunk = json.loads(line.decode("utf-8", "replace"))
             except ValueError:
+                # (v21): a chunk that is not JSON is dropped, not
+                # retried — but it is counted, so an empty answer
+                # after dropped chunks can be named as a capture
+                # failure instead of a wrong answer.
+                dropped_chunks += 1
                 continue
             message = chunk.get("message") or {}
             text = message.get("content") or ""
@@ -1941,6 +2032,8 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
         resp.close()
     if done is None:
         raise OllamaError("could not reach Ollama")
+    _observe_first_reply(
+        (t_first - t_start) if t_first is not None else None)
     return {
         "prompt": "",
         "answer": "".join(answer_parts),
@@ -1955,6 +2048,12 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
         "eval_duration_ns": done.get("eval_duration"),
         "prompt_eval_count": done.get("prompt_eval_count"),
         "prompt_eval_duration_ns": done.get("prompt_eval_duration"),
+        # (v21): the runner reads prompt_tokens / completion_tokens
+        # (the provider path already returns both key sets). Without
+        # these aliases every Ollama run file stored null tokens.
+        "prompt_tokens": done.get("prompt_eval_count"),
+        "completion_tokens": done.get("eval_count"),
+        "dropped_chunks": dropped_chunks,
         "wall_s": time.monotonic() - t_start,
         "tool_calls": tool_calls,
     }
@@ -1978,7 +2077,7 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
     )
     t_start = time.monotonic()
     try:
-        resp = urllib.request.urlopen(req, timeout=FIRST_REPLY_TIMEOUT)
+        resp = urllib.request.urlopen(req, timeout=first_reply_timeout())
     except urllib.error.HTTPError as exc:
         raise OllamaError(_http_error_reason(exc))
     except socket.timeout:
@@ -1995,6 +2094,7 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
     t_first = None
     done = None
     answer_parts = []
+    dropped_chunks = 0
     last_chunk = time.monotonic()
     try:
         while True:
@@ -2020,6 +2120,8 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
             try:
                 chunk = json.loads(line.decode("utf-8", "replace"))
             except ValueError:
+                # (v21): counted, not silently skipped — see chat_once.
+                dropped_chunks += 1
                 continue
             text = chunk.get("response") or ""
             if text:
@@ -2035,6 +2137,8 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
         # The stream ended before Ollama sent its done event: the
         # connection went away mid-answer, so this is unreachable too.
         raise OllamaError("could not reach Ollama")
+    _observe_first_reply(
+        (t_first - t_start) if t_first is not None else None)
     return {
         "prompt": prompt,
         "answer": "".join(answer_parts),
@@ -2049,6 +2153,10 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
         "eval_duration_ns": done.get("eval_duration"),
         "prompt_eval_count": done.get("prompt_eval_count"),
         "prompt_eval_duration_ns": done.get("prompt_eval_duration"),
+        # (v21): aliases for the keys the runner reads — see chat_once.
+        "prompt_tokens": done.get("prompt_eval_count"),
+        "completion_tokens": done.get("eval_count"),
+        "dropped_chunks": dropped_chunks,
         "wall_s": time.monotonic() - t_start,
     }
 
@@ -2628,7 +2736,19 @@ def average_runs(runs):
 # ---------------------------------------------------------------------------
 
 def _normalize(text):
-    return " ".join(str(text).split()).lower()
+    """Collapse whitespace and lowercase for comparing (v21): the
+    text is also NFKC-normalized and every dash (Unicode category
+    Pd — hyphen, en/em dash, non-breaking hyphen U+2011) is folded
+    to a plain ASCII hyphen, so a model that writes ZEBRA-7741 with
+    a non-breaking hyphen matches the expected ZEBRA-7741. Both
+    sides of every comparison go through here, so the fold is
+    symmetric."""
+    folded = unicodedata.normalize("NFKC", str(text))
+    folded = "".join(
+        "-" if unicodedata.category(char) == "Pd" else char
+        for char in folded
+    )
+    return " ".join(folded.split()).lower()
 
 
 _ONES = ("zero", "one", "two", "three", "four", "five", "six", "seven",
@@ -2764,12 +2884,21 @@ def _spell_number_words(text):
 
 # One number token: a fraction first ("1/2"), then scientific
 # notation ("1.5e3"), then a plain number. The order matters —
-# "1/2" must match as a fraction, not as 1 and 2.
+# "1/2" must match as a fraction, not as 1 and 2. (v21): a number
+# glued to a letter or a decimal point is not a standalone number
+# ("H2O" is not 2, "Qwen2.5" is not 5) — the lookbehind blocks it.
+# There is deliberately no lookahead: "60cm" is still 60.
 _NUMBER_RE = re.compile(
-    r"-?\d+(?:\.\d+)?\s*/\s*-?\d+(?:\.\d+)?"
+    r"(?<![A-Za-z0-9.])"
+    r"(?:-?\d+(?:\.\d+)?\s*/\s*-?\d+(?:\.\d+)?"
     r"|-?\d+(?:\.\d+)?[eE][+-]?\d+"
-    r"|-?\d+(?:\.\d+)?"
+    r"|-?\d+(?:\.\d+)?)"
 )
+# (v21): unit exponents are not numbers — "cm^2" and "cm}^2" (LaTeX)
+# contribute no 2. The lookbehind keeps real powers ("10^3").
+_EXPONENT_RE = re.compile(r"(?<!\d)\^\s*-?\d+(?:\.\d+)?")
+# (v21): superscript digits are unit exponents too ("cm²").
+_SUPERSCRIPTS = str.maketrans("", "", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 
 def _extract_numbers(answer):
@@ -2777,8 +2906,13 @@ def _extract_numbers(answer):
     become digits first ("twenty-one" is 21), fractions evaluate
     ("1/2" is 0.5, not 1 and 2), and scientific notation matches
     ("1.5e3" is 1500). Commas are stripped, so "1,000" is 1000.
-    A zero denominator is skipped, never an error."""
+    A zero denominator is skipped, never an error. (v21): digits
+    inside units and exponents are not numbers ("= 60 cm^2" yields
+    60, not 2), and digits glued to letters are not numbers
+    ("H2O" yields nothing)."""
     text = _spell_number_words(str(answer).replace(",", ""))
+    text = _EXPONENT_RE.sub("", text)
+    text = text.translate(_SUPERSCRIPTS)
     numbers = []
     for match in _NUMBER_RE.finditer(text):
         token = match.group(0)
@@ -2811,38 +2945,156 @@ def _numbers_match(value, expected, tolerance=None, approximate=False):
     return value == expected
 
 
-def score_numeric(answer, expected, tolerance=None, approximate=False):
-    """The LAST number in the answer must match the expected value
-    (M1) — a number mentioned in passing no longer passes. Exact
-    unless the task gives a tolerance or says approximate (M2)."""
+# (v21): words in a task prompt that say nothing about the subject,
+# so they never anchor the number picker — question words, verbs,
+# and the instruction words ("answer with just the number").
+_PROMPT_STOPWORDS = {
+    "what", "how", "many", "much", "does", "do", "is", "are", "the",
+    "a", "an", "there", "in", "on", "of", "for", "to", "and", "or",
+    "it", "its", "this", "that", "with", "by", "at", "from", "as",
+    "be", "was", "were", "have", "has", "had", "i", "you", "he",
+    "she", "we", "they", "my", "your", "his", "her", "their", "our",
+    "if", "then", "so", "but", "not", "no", "yes", "when", "where",
+    "which", "who", "whom", "whose", "why", "can", "could", "will",
+    "would", "should", "may", "might", "just", "answer", "number",
+    "give", "tell", "please", "say",
+}
+
+
+def _final_answer_number(answer, task=None):
+    """The number the model meant as its answer (v21).
+
+    The old rule took the last number in the whole answer, which
+    graded the wrong number whenever the model hedged after
+    answering ("seven recognized continents ... how one defines"
+    scored 1), worked in units ("= 60 cm^2" scored 2, the
+    exponent), or broke its total down ("a total of four pets:
+    three cats and one dog" scored 1). Five layers, in order:
+
+    1. The number extractor already ignores digits in units and
+       exponents (see _extract_numbers).
+    2. A \\boxed{} number — the model's own "this is my answer"
+       marker in LaTeX answers; the last one wins. It beats a
+       restated equation in the final sentence ("... 3x + 7 = 22
+       ... \\boxed{5}" is 5, not 22).
+    3. A result marker in the FINAL sentence — "=", "total of",
+       "answer is", or "answer:" followed by a number — wins; the
+       last one in the sentence wins. Final-sentence only, so a
+       working step ("= 21") cannot beat the conclusion.
+    4. Subject anchoring: the last sentence that shares a content
+       word with the task prompt and holds a number the prompt
+       does not already give; its last such number wins. The
+       prompt's own numbers are givens, not answers — an intro
+       that restates the problem ("To find 15 percent of 240")
+       must not win over the answer. Skipped when the task has
+       no prompt.
+    5. The last number in the answer, as before.
+
+    Returns None when the answer holds no number at all.
+    """
+    numbers = _extract_numbers(answer)
+    if not numbers:
+        return None
+    text = _spell_number_words(str(answer).replace(",", ""))
+    boxed = _BOXED_RE.findall(text)
+    if boxed:
+        picked = _boxed_number(boxed[-1])
+        if picked is not None:
+            return picked
+    sentences = [
+        sentence for sentence in
+        re.split(r"(?<=[.!?])\s+|\n+", text)
+        if sentence.strip()
+    ]
+    if sentences:
+        marker = re.compile(
+            r"(?:=|total of|answer is|answer\s*:)\s*\*?\*?"
+            r"(-?\d+(?:\.\d+)?\s*/\s*-?\d+(?:\.\d+)?"
+            r"|-?\d+(?:\.\d+)?[eE][+-]?\d+"
+            r"|-?\d+(?:\.\d+)?)",
+            re.IGNORECASE,
+        )
+        matches = list(marker.finditer(sentences[-1]))
+        if matches:
+            picked = _extract_numbers(matches[-1].group(1))
+            if picked:
+                return picked[0]
+    prompt = (task or {}).get("prompt") or ""
+    keywords = {
+        word for word in re.findall(r"[a-z]+", prompt.lower())
+        if len(word) >= 3 and word not in _PROMPT_STOPWORDS
+    }
+    prompt_numbers = set(_extract_numbers(prompt))
+    if keywords:
+        for sentence in reversed(sentences):
+            words = set(re.findall(r"[a-z]+", sentence.lower()))
+            if words & keywords:
+                found = _extract_numbers(sentence)
+                fresh = [value for value in found
+                         if value not in prompt_numbers]
+                if fresh:
+                    return fresh[-1]
+    return numbers[-1]
+
+
+# (v21): \boxed{...} with one level of nesting, so
+# \boxed{\frac{5}{8}} matches as well as \boxed{2500}.
+_BOXED_RE = re.compile(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}")
+_FRAC_RE = re.compile(r"\\frac\{(-?[\d.]+)\}\{(-?[\d.]+)\}")
+
+
+def _boxed_number(content):
+    """The number inside a \\boxed{} (v21): a \\frac evaluates,
+    anything else takes its last number. None when there is none."""
+    frac = _FRAC_RE.search(content)
+    if frac:
+        try:
+            divisor = float(frac.group(2))
+            if divisor != 0:
+                return float(frac.group(1)) / divisor
+        except ValueError:
+            pass
+    found = _extract_numbers(content)
+    return found[-1] if found else None
+
+
+def score_numeric(answer, expected, tolerance=None, approximate=False,
+                  task=None):
+    """The number the model meant as its answer must match the
+    expected value (M1, picker in _final_answer_number) — a number
+    mentioned in passing no longer passes. Exact unless the task
+    gives a tolerance or says approximate (M2)."""
     numbers = _extract_numbers(answer)
     if not numbers:
         return False, f"expected the number {expected} in the answer"
-    if _numbers_match(numbers[-1], expected, tolerance, approximate):
+    final = _final_answer_number(answer, task)
+    if _numbers_match(final, expected, tolerance, approximate):
         return True, ""
     return False, (
-        f"final answer was {numbers[-1]:g}, "
+        f"final answer was {final:g}, "
         f"expected {float(expected):g}"
     )
 
 
 def _numeric_parts(answer, task):
-    """A numeric task's parts (M4): (final_ok, steps_ok, numbers).
-    The final answer scores on the last number; each intermediate
-    step scores when its value appears anywhere in the working."""
+    """A numeric task's parts (M4): (final_ok, steps_ok, numbers,
+    final). The final answer scores on the number the model meant
+    (see _final_answer_number); each intermediate step scores when
+    its value appears anywhere in the working."""
     numbers = _extract_numbers(answer)
     tolerance = task.get("tolerance")
     approximate = bool(task.get("approximate", False))
+    final = _final_answer_number(answer, task)
     if not numbers:
-        return False, [False] * len(task.get("steps") or []), numbers
+        return False, [False] * len(task.get("steps") or []), numbers, None
     final_ok = _numbers_match(
-        numbers[-1], task.get("expected"), tolerance, approximate)
+        final, task.get("expected"), tolerance, approximate)
     steps_ok = [
         any(_numbers_match(value, step, tolerance, approximate)
             for value in numbers)
         for step in (task.get("steps") or [])
     ]
-    return final_ok, steps_ok, numbers
+    return final_ok, steps_ok, numbers, final
 
 
 def score_numeric_task(answer, task):
@@ -2850,7 +3102,7 @@ def score_numeric_task(answer, task):
     means every part right — the final answer and every
     intermediate step. The detail names what was right, so a
     partial answer says so instead of just failing."""
-    final_ok, steps_ok, numbers = _numeric_parts(answer, task)
+    final_ok, steps_ok, numbers, final = _numeric_parts(answer, task)
     steps = task.get("steps") or []
     if not numbers:
         return False, (
@@ -2865,7 +3117,7 @@ def score_numeric_task(answer, task):
     parts.append(
         "final answer right"
         if final_ok
-        else f"final answer was {numbers[-1]:g}, "
+        else f"final answer was {final:g}, "
              f"expected {float(task.get('expected')):g}"
     )
     return False, "; ".join(parts)
@@ -2876,12 +3128,18 @@ def task_credit(task, answer, passed):
     with a steps list earns a fraction per part right — the final
     answer plus each intermediate step — so right setup with a
     wrong final scores partial, not 0 and not full. Everything
-    else earns 1.0 for a pass, 0.0 for a fail."""
+    else earns 1.0 for a pass, 0.0 for a fail. (v21): a steps task
+    earns a fraction per step covered, in order — a plan that
+    covers 4 of 5 steps scores 0.8, not 0."""
     if task.get("rule") == "numeric" and task.get("steps"):
-        final_ok, steps_ok, _numbers = _numeric_parts(answer, task)
+        final_ok, steps_ok, _numbers, _final = _numeric_parts(answer, task)
         parts = len(steps_ok) + 1
         got = sum(steps_ok) + (1 if final_ok else 0)
         return got / parts if parts else 0.0
+    if task.get("rule") == "steps":
+        covered, total, _missing = steps_coverage(
+            answer, task.get("expected") or [])
+        return covered / total if total else 0.0
     return 1.0 if passed else 0.0
 
 
@@ -2971,13 +3229,17 @@ def score_max_words(answer, expected):
 
 
 def score_contains_all(answer, expected):
-    """Every expected string appears in the answer (whole words, any case)."""
+    """Every expected item appears in the answer (whole words, any
+    case). An item may be a string or a list of alternates (v21) —
+    "circles" may be matched by "circular" or "circle", so a model
+    that describes "three red circular shapes" is not failed for
+    missing the exact word "circles"."""
     if not isinstance(expected, list):
         return False, "contains_all needs a list of expected strings"
     for item in expected:
-        ok, detail = score_contains(answer, item)
-        if not ok:
-            return False, detail
+        alternates = item if isinstance(item, list) else [item]
+        if not any(score_contains(answer, alt)[0] for alt in alternates):
+            return False, f"expected '{alternates[0]}' not in the answer"
     return True, ""
 
 
@@ -3077,39 +3339,138 @@ def _validate_schema(value, schema, path="answer"):
 
 
 def score_schema(answer, expected):
-    """Strict structured output: the WHOLE answer must be JSON — no
-    fences, no prose wrapper, no trailing explanation — and it must
-    validate against the schema in expected. That strictness is the
-    point: a driver that wraps its JSON in chat cannot be parsed."""
+    """Strict structured output: the answer must be JSON and
+    validate against the schema in expected. (v21): a single code
+    fence around the JSON is accepted — models routinely wrap JSON
+    in ```json fences, and the JSON inside is what is being tested.
+    Prose outside the fence still fails: the whole answer must be
+    the fence and nothing else."""
     text = str(answer).strip()
+    fence = re.fullmatch(
+        r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE
+    )
+    if fence:
+        text = fence.group(1).strip()
     try:
         parsed = json.loads(text)
     except ValueError:
-        return False, "answer is not JSON on its own (fences or prose around it?)"
+        return False, "answer is not JSON on its own (prose around it?)"
     problem = _validate_schema(parsed, expected)
     if problem:
         return False, problem
     return True, ""
 
 
+def steps_coverage(answer, expected):
+    """(covered, total, first_missing) for a steps task (v21): how
+    many of the expected steps appear in the answer, in order, and
+    the first step not found (or None when all are covered). Each
+    expected step is a phrase or a list of alternate phrases — any
+    one of them matches. Each step must come after the previous
+    one; a step the plan skips does not block the steps after it
+    from counting."""
+    normalized = _normalize(answer)
+    covered = 0
+    position = 0
+    first_missing = None
+    for step in expected:
+        alternates = step if isinstance(step, list) else [step]
+        best = None
+        for alternate in alternates:
+            normalized_alt = _normalize(alternate)
+            at = normalized.find(normalized_alt, position)
+            if at != -1 and (best is None or at < best[0]):
+                best = (at, len(normalized_alt))
+        if best is None:
+            if first_missing is None:
+                first_missing = alternates[0]
+            continue
+        covered += 1
+        position = best[0] + best[1]
+    return covered, len(expected), first_missing
+
+
 def score_steps(answer, expected):
     """Planning: every required step appears in the answer, in order.
 
-    Expected is an ordered list of step phrases; each must appear
-    (case-insensitive substring) after the previous one. A plan that
-    covers the steps in a scrambled order fails — order is part of
-    a sane plan.
+    Expected is an ordered list of step phrases; each step may be
+    one phrase or a list of alternate phrases (v21) — a plan that
+    says "bring the water to a boil" covers "boil the water". Each
+    step must appear (case-insensitive substring) after the
+    previous one. A plan that covers the steps in a scrambled order
+    fails — order is part of a sane plan. The detail names the
+    first step not covered, and how many were.
     """
     if not isinstance(expected, list) or not expected:
         return False, "steps needs a non-empty list of expected steps"
-    lowered = _normalize(answer)
-    position = 0
-    for step in expected:
-        found = lowered.find(_normalize(step), position)
-        if found < 0:
-            return False, f"plan is missing the step '{step}'"
-        position = found + len(_normalize(step))
-    return True, ""
+    covered, total, first_missing = steps_coverage(answer, expected)
+    if covered == total:
+        return True, ""
+    return False, (
+        f"plan is missing the step '{first_missing}' "
+        f"({covered} of {total} steps covered)"
+    )
+
+
+def score_role(answer, expected):
+    """Role-following (v21): the answer stays in character.
+    Expected is {"signals": [...], "need": N} — pass when at least
+    N of the role's signal words appear (whole words, any case).
+    One keyword can no longer fail a whole performance ("ahoy" was
+    not the pirate), and one keyword can no longer pass one
+    ("I'm a pirate!" is not a pirate voice)."""
+    if not isinstance(expected, dict):
+        return False, "role needs {\"signals\": [...], \"need\": N}"
+    signals = expected.get("signals") or []
+    need = expected.get("need", 1)
+    normalized = _normalize(answer)
+    found = 0
+    for signal in signals:
+        pattern = r"\b" + re.escape(_normalize(signal)) + r"\b"
+        if re.search(pattern, normalized):
+            found += 1
+    if found >= int(need):
+        return True, ""
+    return False, f"answer shows {found} of {need} role signals"
+
+
+def score_rhyme(answer, expected):
+    """A rhyming answer (v21): at least min_lines non-empty lines
+    (default 2), with at least one pair of line endings that rhyme
+    — the last words of two lines sharing a suffix of 3 or more
+    letters ("bright"/"delight" share "ight"). The word "rhyme"
+    itself is not a rhyme, and a single line can never pass."""
+    min_lines = 2
+    if isinstance(expected, dict):
+        min_lines = expected.get("min_lines", 2)
+    lines = [
+        line.strip() for line in str(answer).splitlines() if line.strip()
+    ]
+    if len(lines) < min_lines:
+        return False, (
+            f"answer has {len(lines)} "
+            f"{'line' if len(lines) == 1 else 'lines'}, "
+            f"expected at least {min_lines}"
+        )
+    endings = []
+    for line in lines:
+        words = re.findall(r"[A-Za-z']+", line.lower())
+        if words:
+            endings.append(words[-1].strip("'"))
+    for first in range(len(endings)):
+        for second in range(first + 1, len(endings)):
+            first_word, second_word = endings[first], endings[second]
+            if first_word == second_word:
+                continue
+            shared = 0
+            for left, right in zip(reversed(first_word),
+                                   reversed(second_word)):
+                if left != right:
+                    break
+                shared += 1
+            if shared >= 3:
+                return True, ""
+    return False, "no two lines end in rhyming words"
 
 
 def score_tool_call(task, tool_calls):
@@ -3242,6 +3603,15 @@ def score_task(task, answer):
     runners score the tool call, the image bytes, or the audio bytes.
     """
     rule = task.get("rule")
+    if rule in ("tool_call", "image", "audio"):
+        return False, f"rule {rule!r} is scored by its runner, not from text"
+    # (v21): an empty answer never passes. A refusal task passes
+    # "no refusal found" on silence, a max-words task passes
+    # "0 words", and a summarization task passes "short enough" —
+    # all of them scored empty answers as passes. Silence is a
+    # failure, never a pass.
+    if not str(answer or "").strip():
+        return False, "no answer recorded"
     if rule == "contains":
         return score_contains(answer, task.get("expected", ""))
     if rule == "contains_all":
@@ -3263,8 +3633,10 @@ def score_task(task, answer):
         return score_schema(answer, task.get("expected", {}))
     if rule == "steps":
         return score_steps(answer, task.get("expected", []))
-    if rule in ("tool_call", "image", "audio"):
-        return False, f"rule {rule!r} is scored by its runner, not from text"
+    if rule == "role":
+        return score_role(answer, task.get("expected", {}))
+    if rule == "rhyme":
+        return score_rhyme(answer, task.get("expected", {}))
     return False, f"unknown scoring rule {rule!r}"
 
 
@@ -3333,7 +3705,15 @@ def _validate_text_rule(task, template_id, warnings, filename, label=None):
     if rule == "contains_all" and (
         not isinstance(expected, list)
         or not expected
-        or not all(isinstance(item, str) for item in expected)
+        or not all(
+            isinstance(item, str)
+            or (
+                isinstance(item, list)
+                and item
+                and all(isinstance(alt, str) for alt in item)
+            )
+            for item in expected
+        )
     ):
         warnings.append(f"{filename}: task {task_id} needs a list of expected strings, skipped")
         return False
@@ -3361,9 +3741,45 @@ def _validate_text_rule(task, template_id, warnings, filename, label=None):
     if rule == "steps" and (
         not isinstance(expected, list)
         or not expected
-        or not all(isinstance(item, str) for item in expected)
+        or not all(
+            isinstance(item, str)
+            or (
+                isinstance(item, list)
+                and item
+                and all(isinstance(alt, str) for alt in item)
+            )
+            for item in expected
+        )
     ):
         warnings.append(f"{filename}: task {task_id} needs a list of expected steps, skipped")
+        return False
+    if rule == "role" and (
+        not isinstance(expected, dict)
+        or not isinstance(expected.get("signals"), list)
+        or not expected.get("signals")
+        or not all(isinstance(s, str) for s in expected["signals"])
+        or not isinstance(expected.get("need", 1), int)
+        or isinstance(expected.get("need", 1), bool)
+        or expected.get("need", 1) < 1
+    ):
+        warnings.append(
+            f"{filename}: task {task_id} needs {{\"signals\": [...], \"need\": N}}, skipped"
+        )
+        return False
+    if rule == "rhyme" and (
+        not isinstance(expected, dict)
+        or (
+            "min_lines" in expected
+            and (
+                not isinstance(expected["min_lines"], int)
+                or isinstance(expected["min_lines"], bool)
+                or expected["min_lines"] < 1
+            )
+        )
+    ):
+        warnings.append(
+            f"{filename}: task {task_id} needs {{\"min_lines\": N}}, skipped"
+        )
         return False
     if rule == "code":
         function = task.get("function")
@@ -4154,6 +4570,29 @@ def is_budget_stopped(task):
     )
 
 
+def _not_run_reason(run_data):
+    """Why a run's tasks were not run (v21): "test file missing"
+    when every not-run task is a missing test file, else the error
+    that stopped them (the first one, without the "not run: "
+    prefix). None when nothing was not run. The per-task details
+    always carry the full story; this is the one-line version for
+    the summary, the detail view, and the headless output."""
+    reasons = [
+        task.get("detail") for task in run_data.get("tasks", [])
+        if is_not_run(task)
+    ]
+    if not reasons:
+        return None
+    if all(reason in (NOT_RUN_IMAGE, NOT_RUN_AUDIO) for reason in reasons):
+        return "test file missing"
+    for reason in reasons:
+        if reason not in (NOT_RUN_IMAGE, NOT_RUN_AUDIO):
+            if reason.startswith("not run: "):
+                return reason[len("not run: "):]
+            return reason
+    return None
+
+
 def store_size(results_dir):
     """Total bytes of every file under the results store, or 0 when
     the folder does not exist. Unreadable files are skipped."""
@@ -4224,10 +4663,11 @@ def render_run_summary(run_data):
     score = run_data.get("template_score")
     not_run = run_data.get("not_run", 0) or 0
     if score is None and not_run:
+        reason = _not_run_reason(run_data)
+        suffix = f": {reason}" if reason else ""
         lines.append(
             f"Score: not run ({not_run} "
-            f"{'task' if not_run == 1 else 'tasks'} not run: "
-            "test file missing)"
+            f"{'task' if not_run == 1 else 'tasks'} not run{suffix})"
         )
     elif score is None:
         lines.append("Score: no scoring (speed only)")
@@ -4238,6 +4678,10 @@ def render_run_summary(run_data):
             f"Score: {score:.0f}% ({run_data.get('passed', '?')}/{run_data.get('total', '?')} {noun}"
             f"{_not_run_suffix(not_run)})"
         )
+    if run_data.get("errored"):
+        lines.append(
+            f"Run stopped early: {run_data.get('error', 'Ollama stopped responding')}"
+        )
     budget_stopped = run_data.get("budget_stopped", 0) or 0
     if budget_stopped:
         lines.append(
@@ -4247,6 +4691,13 @@ def render_run_summary(run_data):
         )
     avg_toks = run_data.get("avg_decode_tok_s")
     lines.append(f"Avg decode speed: {fmt_toks(avg_toks)} tokens per second")
+    load_1m = run_data.get("load_1m")
+    if load_1m is not None:
+        load_line = f"Machine load: {load_1m:.2f} (1-minute average)"
+        mem = run_data.get("mem_available_mb")
+        if mem is not None:
+            load_line += f", {mem} MB memory free"
+        lines.append(load_line)
     if run_data.get("total_tokens") is not None:
         lines.append(
             f"Tokens: {fmt_tokens(run_data.get('prompt_tokens'))} in, "
@@ -4598,10 +5049,12 @@ def render_text_report(results):
             not_run = run.get("not_run", 0) or 0
             budget_stopped = run.get("budget_stopped", 0) or 0
             if score is None and not_run:
+                reason = _not_run_reason(run)
+                suffix = f": {reason}" if reason else ""
                 lines.append(
                     f"  {run.get('template_name', template_id)}: not run "
                     f"({not_run} {'task' if not_run == 1 else 'tasks'} "
-                    "not run: test file missing)"
+                    f"not run{suffix})"
                 )
             elif score is None and budget_stopped:
                 lines.append(
@@ -4630,6 +5083,11 @@ def render_text_report(results):
                         f"{'task' if budget_stopped == 1 else 'tasks'} stopped)"
                     )
                 lines.append(line)
+            if run.get("errored"):
+                lines.append(
+                    f"    Run stopped early: "
+                    f"{run.get('error', 'Ollama stopped responding')}"
+                )
         lines.append("")
     return "\n".join(lines)
 
@@ -4637,10 +5095,11 @@ def render_text_report(results):
 def template_score_text(run):
     """One cell of text for a template run: its score, or what
     happened instead. "not eligible" when the model could not run it
-    at all, "not run" when nothing ran for a missing test file,
-    "time budget reached" when the budget stopped it before any task
-    ran, "no scoring" for the unscored templates. A score that was
-    cut short by the budget says so next to the number."""
+    at all, "not run" when nothing ran (a missing test file, or a
+    call that errored), "time budget reached" when the budget
+    stopped it before any task ran, "no scoring" for the unscored
+    templates. A score that was cut short by the budget says so
+    next to the number."""
     if run.get("skipped"):
         return "not eligible"
     score = run.get("template_score")
@@ -5097,28 +5556,80 @@ class BenchWorker(QThread):
 
         A single dropped connection is often transient (Ollama was
         still starting, the machine was swapping, or a provider hiccuped),
-        so one retry after a short pause is worth it. Anything else
-        fails at once. A bad key is never retried.
+        so one retry after a short pause is worth it. (v21): a
+        transient model error (an EOF, a model that errored mid-run)
+        gets the same one retry. Anything else fails at once. A bad
+        key is never retried. (v21): an empty answer after real
+        tokens is a capture failure — retried once, then raised.
         """
         try:
-            return self._call_once(target, prompt, num_predict)
+            metrics = self._call_once(target, prompt, num_predict)
         except (OllamaError, ProviderError) as exc:
-            retryable = is_unreachable(exc) or is_provider_unreachable(exc)
+            retryable = (
+                is_unreachable(exc)
+                or is_provider_unreachable(exc)
+                or _is_transient_model_error(exc)
+            )
             if not retryable or self._stop:
                 raise
             time.sleep(RETRY_DELAY)
             if self._stop:
                 raise Cancelled()
             try:
-                return self._call_once(target, prompt, num_predict)
+                metrics = self._call_once(target, prompt, num_predict)
             except OllamaError as exc2:
                 # v17: Ollama may have died loading the model (out of
                 # memory on a small box). Restart it once per run and
                 # try once more; if that fails, fail as before.
                 if (is_unreachable(exc2)
                         and self._try_restart_ollama(target)):
-                    return self._call_once(target, prompt, num_predict)
-                raise
+                    metrics = self._call_once(target, prompt, num_predict)
+                else:
+                    raise
+        return self._check_capture(
+            target, metrics,
+            lambda: self._call_once(target, prompt, num_predict),
+        )
+
+    def _check_capture(self, target, metrics, call_again):
+        """(v21): an empty answer after real tokens is a capture
+        failure, not a model that said nothing — the tokens were
+        generated but no text came back. Retry once with a fresh
+        call; if the retry is empty too, raise, so the task is
+        recorded not-run instead of scored as a wrong answer. Tool
+        calls are a real answer even with no text, and an empty
+        answer with few or no tokens is the model saying nothing —
+        that reaches scoring and fails there."""
+        answer = metrics.get("answer") or ""
+        if answer.strip():
+            return metrics
+        if metrics.get("tool_calls"):
+            return metrics
+        tokens = metrics.get("completion_tokens")
+        if tokens is None or tokens <= EMPTY_CAPTURE_MIN_TOKENS:
+            return metrics
+        retried = call_again()
+        answer = retried.get("answer") or ""
+        if answer.strip() or retried.get("tool_calls"):
+            return retried
+        tokens = retried.get("completion_tokens")
+        if tokens is not None:
+            detail = (
+                f"the model generated {tokens} tokens but no text "
+                "came back (capture failed)"
+            )
+        else:
+            detail = (
+                "the model generated tokens but no text came back "
+                "(capture failed)"
+            )
+        dropped = (metrics.get("dropped_chunks") or 0) + (
+            retried.get("dropped_chunks") or 0)
+        if dropped:
+            detail += f"; {dropped} streamed chunks could not be read"
+        if target.get("kind") == "provider":
+            raise ProviderError(detail)
+        raise OllamaError(detail)
 
     def _call_chat(self, target, messages, num_predict, tools=None):
         """One chat call (Ollama /api/chat or provider chat completions).
@@ -5138,26 +5649,39 @@ class BenchWorker(QThread):
         )
 
     def _chat(self, target, messages, num_predict, tools=None):
-        """One chat call, retried once if the other end did not answer."""
+        """One chat call, retried once if the other end did not answer.
+        (v21): a transient model error gets the same one retry, and
+        an empty answer after real tokens is a capture failure —
+        see _generate / _check_capture."""
         try:
-            return self._call_chat(target, messages, num_predict, tools)
+            metrics = self._call_chat(target, messages, num_predict, tools)
         except (OllamaError, ProviderError) as exc:
-            retryable = is_unreachable(exc) or is_provider_unreachable(exc)
+            retryable = (
+                is_unreachable(exc)
+                or is_provider_unreachable(exc)
+                or _is_transient_model_error(exc)
+            )
             if not retryable or self._stop:
                 raise
             time.sleep(RETRY_DELAY)
             if self._stop:
                 raise Cancelled()
             try:
-                return self._call_chat(target, messages, num_predict, tools)
+                metrics = self._call_chat(target, messages, num_predict,
+                                          tools)
             except OllamaError as exc2:
                 # v17: same mid-run restart as _generate — Ollama may
                 # have died loading the model. Once per run, then fail.
                 if (is_unreachable(exc2)
                         and self._try_restart_ollama(target)):
-                    return self._call_chat(target, messages, num_predict,
-                                           tools)
-                raise
+                    metrics = self._call_chat(target, messages, num_predict,
+                                              tools)
+                else:
+                    raise
+        return self._check_capture(
+            target, metrics,
+            lambda: self._call_chat(target, messages, num_predict, tools),
+        )
 
     def _count_steps(self):
         """Progress steps: one warmup per target, then one step per
@@ -5182,8 +5706,9 @@ class BenchWorker(QThread):
 
     def _not_run_result(self, job_id, prompt, task, detail):
         """A task record for a task that never ran (its test file was
-        missing). passed is None, never False: a missing file is not
-        the model's failure, and the score counts only tasks that ran."""
+        missing, or the call errored — v21). passed is None, never
+        False: a missing file or a failed call is not the model's
+        failure, and the score counts only tasks that ran."""
         record = self._failed_result(job_id, prompt, task, detail)
         record["passed"] = None
         return record
@@ -5330,7 +5855,27 @@ class BenchWorker(QThread):
             _to_tool_definitions(task["tools"]),
         )
         tool_calls = metrics.get("tool_calls") or []
-        passed, detail = score_tool_call(task, tool_calls)
+        answer = metrics.get("answer") or ""
+        if not tool_calls:
+            # (v21): a model that cannot call tools natively may
+            # still write the call as JSON in its reply text
+            # ({"name": ..., "arguments": {...}}). Parse it the same
+            # way, so a correct call in text scores — and a call in
+            # text on a no-tool task fails, as a native call would.
+            parsed = extract_json(answer)
+            if (isinstance(parsed, dict)
+                    and isinstance(parsed.get("name"), str)
+                    and isinstance(parsed.get("arguments"), dict)):
+                tool_calls = [{
+                    "name": parsed["name"],
+                    "arguments": parsed["arguments"],
+                }]
+        if not tool_calls and not answer.strip():
+            # (v21): no call and no answer is a failure, never a
+            # pass — even when no tool was needed.
+            passed, detail = False, "no answer recorded"
+        else:
+            passed, detail = score_tool_call(task, tool_calls)
         self._bump_progress(label, template, task["id"])
         return {
             "id": task["id"],
@@ -5466,9 +6011,11 @@ class BenchWorker(QThread):
         """Run one scored task by its kind. Returns (record, media).
 
         Media is (subfolder, filename, bytes, record-field) for a
-        generated image or spoken audio, or None. A model error becomes
-        a failed task record (and a progress bump); Ollama going away
-        aborts the whole run.
+        generated image or spoken audio, or None. (v21): a model
+        error becomes a NOT-RUN task record (and a progress bump) —
+        the call failed, the model did not answer wrong, so the
+        score counts only tasks that ran. Ollama going away aborts
+        the whole run.
         """
         kind = task.get("kind", "generate")
         try:
@@ -5498,13 +6045,20 @@ class BenchWorker(QThread):
                 # instead of failing every remaining task and model.
                 raise OllamaUnreachable(describe_error(exc))
             self._bump_progress(target["label"], template, task["id"])
-            return self._failed_result(task["id"], task.get("prompt", ""), task, str(exc)), None
+            return self._not_run_result(
+                task["id"], task.get("prompt", ""), task,
+                f"not run: {describe_error(exc)}",
+            ), None
         except ProviderError as exc:
-            # A provider failing never stops the run: this task
-            # fails plainly and the rest carry on, including the
-            # local Ollama models still to come.
+            # A provider failing never stops the run: this task is
+            # not run (the call failed, not the model) and the rest
+            # carry on, including the local Ollama models still to
+            # come.
             self._bump_progress(target["label"], template, task["id"])
-            return self._failed_result(task["id"], task.get("prompt", ""), task, str(exc)), None
+            return self._not_run_result(
+                task["id"], task.get("prompt", ""), task,
+                f"not run: {str(exc)}",
+            ), None
         self._bump_progress(target["label"], template, task["id"])
         return self._failed_result(
             task["id"], task.get("prompt", ""), task,
@@ -5512,7 +6066,15 @@ class BenchWorker(QThread):
         ), None
 
     def _run_template(self, target, template):
-        """Run one template for one target. Returns the run data dict."""
+        """Run one template for one target. Returns the run data dict.
+
+        (v21): when Ollama dies mid-template, the tasks that never
+        ran are recorded not-run and the run file is still saved,
+        marked errored — then the OllamaUnreachable is re-raised
+        (carrying the run data) so the run still ends as
+        ollama_down. A cancelled run saves nothing for the
+        in-progress template, as before.
+        """
         label = target["label"]
         num_predict = template["num_predict"]
         task_results = []
@@ -5523,85 +6085,133 @@ class BenchWorker(QThread):
         # reached" and the run carries on with the next template.
         started = time.monotonic()
         budget_hit = False
-        if template["scored"]:
-            for index, task in enumerate(template["tasks"]):
-                if self._stop:
-                    raise Cancelled()
-                if self._budget_reached(started):
-                    budget_hit = True
-                    for remaining in template["tasks"][index:]:
-                        task_results.append(self._budget_result(
-                            remaining["id"], remaining.get("prompt", ""),
-                            remaining,
-                        ))
-                        self._bump_progress(label, template, remaining["id"])
-                    break
-                record, item = self._run_scored_task(target, template, task)
-                if item is not None:
-                    media.append((task["id"],) + item)
-                task_results.append(record)
-        else:
-            # Unscored: context lengths (Speed) or plain prompts.
-            if template.get("context_lengths"):
-                jobs = []
-                for length in template["context_lengths"]:
-                    prompt = build_context_prompt(
-                        template["context_base_prompt"], length
-                    )
-                    jobs.append((f"ctx-{length}", prompt, {"context_tokens": length}))
+        # (v21): the machine load when this template started, so a
+        # speed number can be read next to the load it was measured
+        # under.
+        load_at_start = machine_load()
+        errored = None
+        errored_exc = None
+        jobs = []
+        try:
+            if template["scored"]:
+                for index, task in enumerate(template["tasks"]):
+                    if self._stop:
+                        raise Cancelled()
+                    if self._budget_reached(started):
+                        budget_hit = True
+                        for remaining in template["tasks"][index:]:
+                            task_results.append(self._budget_result(
+                                remaining["id"], remaining.get("prompt", ""),
+                                remaining,
+                            ))
+                            self._bump_progress(label, template, remaining["id"])
+                        break
+                    record, item = self._run_scored_task(target, template, task)
+                    if item is not None:
+                        media.append((task["id"],) + item)
+                    task_results.append(record)
             else:
-                jobs = [
-                    (f"run-{i + 1}", prompt, None)
-                    for i, prompt in enumerate(template["prompts"])
-                ]
-            for job_index, (job_id, prompt, extra) in enumerate(jobs):
-                if self._stop:
-                    raise Cancelled()
-                if self._budget_reached(started):
-                    budget_hit = True
-                    for remaining_id, remaining_prompt, remaining_extra in jobs[job_index:]:
-                        record = self._budget_result(
-                            remaining_id, remaining_prompt, None
+                # Unscored: context lengths (Speed) or plain prompts.
+                if template.get("context_lengths"):
+                    for length in template["context_lengths"]:
+                        prompt = build_context_prompt(
+                            template["context_base_prompt"], length
                         )
-                        if remaining_extra:
-                            record.update(remaining_extra)
-                            record["prompt_chars"] = len(remaining_prompt)
+                        jobs.append((f"ctx-{length}", prompt, {"context_tokens": length}))
+                else:
+                    jobs = [
+                        (f"run-{i + 1}", prompt, None)
+                        for i, prompt in enumerate(template["prompts"])
+                    ]
+                for job_index, (job_id, prompt, extra) in enumerate(jobs):
+                    if self._stop:
+                        raise Cancelled()
+                    if self._budget_reached(started):
+                        budget_hit = True
+                        for remaining_id, remaining_prompt, remaining_extra in jobs[job_index:]:
+                            record = self._budget_result(
+                                remaining_id, remaining_prompt, None
+                            )
+                            if remaining_extra:
+                                record.update(remaining_extra)
+                                record["prompt_chars"] = len(remaining_prompt)
+                            task_results.append(record)
+                            self._bump_progress(label, template, remaining_id)
+                        break
+                    try:
+                        metrics = self._generate(target, prompt, num_predict)
+                    except OllamaError as exc:
+                        if is_unreachable(exc):
+                            raise OllamaUnreachable(describe_error(exc))
+                        # (v21): a failed call is not-run, never
+                        # scored 0 — same as a scored task.
+                        record = self._not_run_result(
+                            job_id, prompt, None,
+                            f"not run: {describe_error(exc)}",
+                        )
+                        if extra:
+                            record.update(extra)
+                            record["prompt_chars"] = len(prompt)
                         task_results.append(record)
-                        self._bump_progress(label, template, remaining_id)
-                    break
-                try:
-                    metrics = self._generate(target, prompt, num_predict)
-                except OllamaError as exc:
-                    if is_unreachable(exc):
-                        raise OllamaUnreachable(describe_error(exc))
-                    task_results.append(
-                        self._failed_result(job_id, prompt, None, str(exc))
-                    )
+                        self._bump_progress(label, template, job_id)
+                        continue
+                    except ProviderError as exc:
+                        record = self._not_run_result(
+                            job_id, prompt, None, f"not run: {str(exc)}",
+                        )
+                        if extra:
+                            record.update(extra)
+                            record["prompt_chars"] = len(prompt)
+                        task_results.append(record)
+                        self._bump_progress(label, template, job_id)
+                        continue
+                    record = {
+                        "id": job_id,
+                        "prompt": _truncate_answer(prompt),
+                        "answer": _truncate_answer(metrics["answer"]),
+                        "passed": None,
+                        "decode_tok_s": metrics["decode_tok_s"],
+                        "prompt_tok_s": metrics["prompt_tok_s"],
+                        "ttft_s": metrics["ttft_s"],
+                        "prompt_tokens": metrics.get("prompt_tokens"),
+                        "completion_tokens": metrics.get("completion_tokens"),
+                        "detail": "",
+                    }
+                    # (v21): the machine load beside the speed, so
+                    # the number is honest about what it was measured
+                    # under.
+                    record.update(machine_load())
+                    if extra:
+                        record.update(extra)
+                        record["prompt_chars"] = len(prompt)
+                    task_results.append(record)
                     self._bump_progress(label, template, job_id)
-                    continue
-                except ProviderError as exc:
-                    task_results.append(
-                        self._failed_result(job_id, prompt, None, str(exc))
-                    )
-                    self._bump_progress(label, template, job_id)
-                    continue
-                record = {
-                    "id": job_id,
-                    "prompt": _truncate_answer(prompt),
-                    "answer": _truncate_answer(metrics["answer"]),
-                    "passed": None,
-                    "decode_tok_s": metrics["decode_tok_s"],
-                    "prompt_tok_s": metrics["prompt_tok_s"],
-                    "ttft_s": metrics["ttft_s"],
-                    "prompt_tokens": metrics.get("prompt_tokens"),
-                    "completion_tokens": metrics.get("completion_tokens"),
-                    "detail": "",
-                }
-                if extra:
-                    record.update(extra)
-                    record["prompt_chars"] = len(prompt)
-                task_results.append(record)
-                self._bump_progress(label, template, job_id)
+        except OllamaUnreachable as exc:
+            # (v21): Ollama died mid-template. The tasks that never
+            # ran are recorded not-run, the run file is saved with
+            # the error marked (below), and the exception is
+            # re-raised after saving so the run still ends as
+            # ollama_down.
+            errored = describe_error(exc)
+            errored_exc = exc
+            done_ids = {t["id"] for t in task_results}
+            if template["scored"]:
+                for task in template["tasks"]:
+                    if task["id"] not in done_ids:
+                        task_results.append(self._not_run_result(
+                            task["id"], task.get("prompt", ""), task,
+                            f"not run: {errored}",
+                        ))
+            else:
+                for job_id, prompt, extra in jobs:
+                    if job_id not in done_ids:
+                        record = self._not_run_result(
+                            job_id, prompt, None, f"not run: {errored}",
+                        )
+                        if extra:
+                            record.update(extra)
+                            record["prompt_chars"] = len(prompt)
+                        task_results.append(record)
         # Tasks that never ran (missing test file) count in neither the
         # numerator nor the denominator: the score is over the tasks
         # that actually ran. When nothing ran, there is no score at
@@ -5639,6 +6249,13 @@ class BenchWorker(QThread):
                 passed_count = int(credit_sum)
             else:
                 passed_count = credit_sum
+            if errored is not None:
+                # (v21): the template did not finish — no score,
+                # however many tasks ran. A half-finished template
+                # has no score, and the profile keeps the last
+                # finished run as latest.
+                score = None
+                passed_count = None
         else:
             passed_count = None
             total = len(task_results)
@@ -5691,6 +6308,13 @@ class BenchWorker(QThread):
             "prompt_tokens": run_prompt_tokens,
             "completion_tokens": run_completion_tokens,
             "total_tokens": run_total_tokens,
+            # (v21): the machine load when this template started, so
+            # a speed number can be read next to the load it was
+            # measured under.
+            "load_1m": load_at_start["load_1m"],
+            "load_5m": load_at_start["load_5m"],
+            "load_15m": load_at_start["load_15m"],
+            "mem_available_mb": load_at_start["mem_available_mb"],
             "price_input_per_1m": target["price_input_per_1m"],
             "price_output_per_1m": target["price_output_per_1m"],
             "estimated_cost_usd": estimate_cost(
@@ -5702,12 +6326,26 @@ class BenchWorker(QThread):
         # its items lengths instead of tasks.
         if template.get("score_by"):
             run_data["score_by"] = template["score_by"]
+        if errored is not None:
+            run_data["errored"] = True
+            run_data["error"] = errored
         path = save_run_file(self.results_dir, label, self.sys_id, run_data, stamp=stamp)
+        if errored_exc is not None:
+            # (v21): the record is saved; the run still ends as
+            # ollama_down. The run data rides on the exception so
+            # the run can show the partial template.
+            errored_exc.run_data = run_data
+            errored_exc.run_path = path
+            raise errored_exc
         return run_data, path
 
     def _bump_progress(self, label, template, job_id):
         self._done_steps += 1
-        percent = int(100 * self._done_steps / self._total_steps)
+        # (v21): _total_steps is 0 until run() counts the steps, so
+        # a task run outside run() (a test driving one task
+        # directly) must not divide by zero.
+        percent = (int(100 * self._done_steps / self._total_steps)
+                   if self._total_steps else 0)
         self.progress.emit(
             f"{label}: {template['name']} - {job_id}", min(percent, 100)
         )
@@ -5889,6 +6527,19 @@ class BenchWorker(QThread):
                 return
             except OllamaUnreachable as exc:
                 log_event(f"Ollama stopped responding during the run: {exc}")
+                errored_data = getattr(exc, "run_data", None)
+                if errored_data is not None:
+                    # (v21): the template that was running when
+                    # Ollama died left an errored record — show it
+                    # in this run, not just in Past runs. The pair
+                    # stays pending in the manifest, so a resume
+                    # retries it.
+                    errored_data["run_file"] = getattr(exc, "run_path", None)
+                    result["templates"][errored_data["template"]] = errored_data
+                    self.template_done.emit(
+                        label, errored_data,
+                        getattr(exc, "run_path", "") or "",
+                    )
                 result["status"] = f"failed: {exc}"
                 self.model_done.emit(label, result)
                 self._end_run("ollama_down")
@@ -9851,10 +10502,12 @@ class MainWindow(QMainWindow):
             not_run = run.get("not_run", 0) or 0
             budget_stopped = run.get("budget_stopped", 0) or 0
             if score is None and not_run:
+                reason = _not_run_reason(run)
+                suffix = f": {reason}" if reason else ""
                 header = (
                     f"\n{run.get('template_name', template_id)}: not run "
                     f"({not_run} {'task' if not_run == 1 else 'tasks'} "
-                    "not run: test file missing)"
+                    f"not run{suffix})"
                 )
             elif score is None and budget_stopped:
                 header = (
@@ -9889,7 +10542,14 @@ class MainWindow(QMainWindow):
                 )
                 if run.get("estimated_cost_usd") is not None:
                     header += f", {fmt_cost(run.get('estimated_cost_usd'))}"
+            if run.get("load_1m") is not None:
+                header += f", machine load {run['load_1m']:.2f}"
             lines.append(header)
+            if run.get("errored"):
+                lines.append(
+                    f"  Run stopped early: "
+                    f"{run.get('error', 'Ollama stopped responding')}"
+                )
             for task in run.get("tasks", []):
                 passed = task.get("passed")
                 mark = task_mark(task)
@@ -11119,7 +11779,9 @@ def run_headless(args):
         score = run_data.get("template_score")
         template_name = run_data.get("template_name", name)
         if score is None and run_data.get("not_run"):
-            print(f"  {template_name}: not run (test file missing)")
+            reason = _not_run_reason(run_data)
+            suffix = f" ({reason})" if reason else ""
+            print(f"  {template_name}: not run{suffix}")
         elif score is None:
             print(f"  {template_name}: no score")
         else:

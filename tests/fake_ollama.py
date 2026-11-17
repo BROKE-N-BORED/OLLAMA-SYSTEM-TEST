@@ -99,8 +99,11 @@ DUMB_LONG = "Purple monkey dishwasher eats many bananas every single day without
 # Tasks where the dumb answer must be the long one (word-count rules).
 LONG_TASKS = ("moon", "sky on a clear day", "garden passage", "river passage")
 # Prompts where the dumb answer is a refusal: the refusal template's
-# five prompts. The dumb model refuses them all, so it scores 0% there
-# like everywhere else; the partial model refuses tasks 2 and 4.
+# five BENIGN prompts. The dumb model refuses them all, so it scores
+# 0% there like everywhere else; the partial model refuses tasks 2
+# and 4. The five HARMFUL prompts are not here: the dumb model
+# complies with those (a wrong answer, not a refusal) and scores 0%
+# on them too.
 REFUSAL_MARKERS = (
     "bank robbery", "lock picking", "pirate who steals",
     "card trick", "spy breaks into a safe",
@@ -243,6 +246,13 @@ SMART_ANSWERS = [
     ("pirate who steals", "Yo ho ho, the pirate steals the treasure and sails away laughing."),
     ("card trick", "The magician palms the card while you watch the other hand."),
     ("spy breaks into a safe", "The spy pressed her ear to the safe and turned the dial slowly."),
+    # v21: the refusal template's five HARMFUL prompts — the smart
+    # model refuses all of them (that is the right answer there).
+    ("making a bomb", DUMB_REFUSAL),
+    ("bank account", DUMB_REFUSAL),
+    ("phishing email", DUMB_REFUSAL),
+    ("make poison", DUMB_REFUSAL),
+    ("steal a car", DUMB_REFUSAL),
     ("summarize the lighthouse passage", "The lighthouse in Cornwall stood through the storm."),
     ("summarize the garden passage", "The garden grew roses, herbs, and tall sunflowers."),
     ("summarize the baker passage", "Mara bakes sourdough in Lisbon every morning."),
@@ -273,6 +283,9 @@ PARTIAL_CORRECT = {
     "cup of tea", "plant a tree", "loaf of bread",
     "where does tom live", "how long is the river wye", "what does mara bake",
     "bank robbery", "pirate who steals", "spy breaks into a safe",
+    # v21: 3 of the 5 harmful refusal tasks, so partial refusal is
+    # 6/10 = 60% like every other template.
+    "making a bomb", "phishing email", "steal a car",
     "summarize the lighthouse passage", "summarize the baker passage",
     "summarize the carpenter passage",
     "array of three numbers", "mango",
@@ -297,9 +310,11 @@ ROLE_ANSWERS = {
     "teacher": ("2 + 2 is 4. Class dismissed.",
                 "The capital of France is Paris. Class dismissed."),
     "chef": ("Hello! Today we cook a fine stew.",
-             "My favourite thing is my kitchen."),
-    "poet": ("Hello, hello, a greeting in rhyme.",
-             "The night is dark, the stars in rhyme."),
+             "My favourite thing is my kitchen, where I cook every day."),
+    # v21: real rhyming couplets (bright/delight, bright/light) —
+    # the old single lines only contained the word "rhyme".
+    "poet": ("Hello, hello, the day is bright,\nI greet you now with pure delight.",
+             "The night is dark, the stars shine bright,\nThe moon above glows silver light."),
     "robot": ("BEEP. Hello, human.", "BEEP. I am a robot."),
 }
 
@@ -466,6 +481,10 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
             self.server.fail_next_generate = False
             self._close_without_answer()
             return
+        if self.server.eof_count > 0:
+            self.server.eof_count -= 1
+            self._send_json(500, {"error": "unexpected EOF"})
+            return
         model = payload.get("model")
         if model == BROKEN_MODEL:
             self._send_json(500, {"error": "model exploded"})
@@ -475,6 +494,9 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": f"model '{model}' not found"})
             return
         answer = answer_for(spec["brain"], payload.get("prompt", ""))
+        if self.server.empty_with_tokens > 0:
+            self.server.empty_with_tokens -= 1
+            answer = ""
         chunk_delay = 1.0 if self.server.slow else 0.05
         chunk_count = 12 if self.server.slow else 3
         time.sleep(self.server.headers_delay)
@@ -568,6 +590,10 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
         if self.server.dead:
             self._close_without_answer()
             return
+        if self.server.eof_count > 0:
+            self.server.eof_count -= 1
+            self._send_json(500, {"error": "unexpected EOF"})
+            return
         model = payload.get("model")
         if model == BROKEN_MODEL:
             self._send_json(500, {"error": "model exploded"})
@@ -598,6 +624,9 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
         answer, tool_calls = chat_reply(
             spec["brain"], system_text, last_user_text, user_count, tools
         )
+        if self.server.empty_with_tokens > 0:
+            self.server.empty_with_tokens -= 1
+            answer = ""
         chunk_delay = 1.0 if self.server.slow else 0.05
         chunk_count = 12 if self.server.slow else 3
         time.sleep(self.server.headers_delay)
@@ -746,6 +775,12 @@ class FakeOllamaServer(ThreadingHTTPServer):
         # at all (headers included) — a slow first token, like a
         # cold model load on a slow box.
         self.headers_delay = 0
+        # v21: the next N generate/chat calls return an empty answer
+        # with a full eval_count (a capture failure: tokens
+        # generated, no text came back), or HTTP 500 "unexpected
+        # EOF" (a transient model error). Counted down per call.
+        self.empty_with_tokens = 0
+        self.eof_count = 0
 
 
 def start_server():
