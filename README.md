@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v18
+# OLLAMA SYSTEM TEST v19
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,15 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v19 simplifies the Providers tab and Settings, no new templates:
+adding a cloud provider is four steps — pick the service (the app
+fills in the address), paste the key, test the connection, tick
+the models — with one save at the end, and the tab starts as a
+calm empty screen until you ask. Prices and capabilities live
+under Advanced, collapsed. Settings detect the Ollama address
+and the models folder instead of asking you to type them. Your
+existing providers keep working — the file format is unchanged.
 
 v18 is the slow-machine review release, no new templates: a cold
 model on a slow PC takes longer than 10 seconds for its first

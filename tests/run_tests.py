@@ -1,12 +1,17 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v18 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v19 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1436 v17 checks are carried over; the v18 checks
-cover the review fixes RV1–RV13 — the 300 s first-reply window and the
-slow/down distinction, the pull close-race and the dead-slot recovery,
-bare-address normalisation, uncached failed screenings, the named pull
-progress, the climbing elapsed time, the Providers scroll area, the
-blank try-it box, the idle bars, the Settings wording and size, and the
-empty-list placeholder. 1481 checks in total, all green (run 3).
+answers per model. All 1481 v18 checks are carried over, with the
+provider-UI tests rewritten for the wizard and the detected Settings;
+the v19 checks cover the step-by-step add flow (known provider fills
+the address, Other reveals it, local servers skip the key, test lists
+the models, tick and finish, duplicate name caught on step 1, bad key
+fails plainly, add-models mode returns only the ticked ids), the
+nothing-picked-by-default guard (focus alone picks nothing), the calm
+empty state, ONE Save (Add models stages, the file changes only on
+Save), Advanced (collapsed by default, edits stage at once, bad price
+refused), and the detected Settings (address and folder found, fields
+hidden until overridden, saved overrides start ticked, env-locked
+fields disabled). 1538 checks in total, all green (run 3).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -2398,6 +2403,24 @@ def main():
                   score == want, f"got {score:.0f}%")
 
     # ---------- Qt app: Providers tab, add provider and models ----------
+    # v19: adding a provider goes through the modal wizard, which a
+    # test cannot click through (exec() blocks the suite). The
+    # wizard itself is driven directly in the v19 section below;
+    # here a stub stands in for it, so this block tests what the
+    # window does with a finished provider: save, list, refresh.
+    def _stub_wizard_class(provider, model_ids=None):
+        class _StubWizard:
+            def __init__(self, parent=None, existing=None):
+                self.result_provider = provider
+                self.result_model_ids = model_ids
+
+            def exec(self):
+                from PySide6.QtWidgets import QDialog
+                return QDialog.Accepted
+
+        return _StubWizard
+
+    real_wizard = app.AddProviderDialog
     oserver, _t = fake_ollama.start_server()
     ohost, oport = oserver.server_address
     os.environ["OLLAMA_HOST"] = f"http://{ohost}:{oport}"
@@ -2414,53 +2437,49 @@ def main():
           windowP.provider_key_input.echoMode() == QLineEdit.Password)
     windowP.tabs.setCurrentIndex(6)
     qt_app.processEvents()
-    windowP.provider_name_input.setText("fake-provider")
-    windowP.provider_url_input.setText(f"http://{phost}:{pport}/v1")
-    windowP.provider_key_input.setText("sk-fake-good-key")
-    windowP.provider_test_button.click()
-    tested = wait_until(
-        lambda: "Connected" in windowP.provider_test_status.text(),
-        timeout=30, app=qt_app,
-    )
-    check("UI test connection succeeds", tested,
-          windowP.provider_test_status.text())
-    windowP.provider_model_id_input.setText("fake-gpt-smart")
-    windowP.provider_model_name_input.setText("Smart")
-    windowP.provider_price_in_input.setText("0.15")
-    windowP.provider_price_out_input.setText("0.60")
-    windowP.provider_add_model_button.click()
+    check("providers tab starts on the empty state",
+          windowP.provider_stack.currentIndex() == 0,
+          str(windowP.provider_stack.currentIndex()))
+    check("empty state names the Models tab",
+          "No cloud providers" in windowP.provider_empty_label.text()
+          and "Models tab" in windowP.provider_empty_label.text(),
+          windowP.provider_empty_label.text())
+    check("empty state has one add button",
+          windowP.provider_add_empty_button.isVisible()
+          and windowP.provider_add_empty_button.text()
+          == "Add a cloud provider")
+    fake_provider = {
+        "name": "fake-provider",
+        "base_url": f"http://{phost}:{pport}/v1",
+        "api_key": "sk-fake-good-key",
+        "models": [
+            {"id": "fake-gpt-smart", "display_name": "Smart",
+             "price_input_per_1m": 0.15, "price_output_per_1m": 0.60,
+             "capabilities": ["text"]},
+            {"id": "fake-gpt-partial", "display_name": "",
+             "price_input_per_1m": None, "price_output_per_1m": None,
+             "capabilities": ["text"]},
+            {"id": "fake-gpt-dumb", "display_name": "",
+             "price_input_per_1m": None, "price_output_per_1m": None,
+             "capabilities": ["text"]},
+        ],
+    }
+    app.AddProviderDialog = _stub_wizard_class(fake_provider)
+    windowP.provider_add_button.click()
     qt_app.processEvents()
+    app.AddProviderDialog = real_wizard
+    check("adding a provider shows the detail page",
+          windowP.provider_stack.currentIndex() == 1,
+          str(windowP.provider_stack.currentIndex()))
     check("UI add model with prices",
-          windowP.provider_models_list.count() == 1
+          windowP.provider_models_list.count() == 3
           and "fake-gpt-smart" in windowP.provider_models_list.item(0).text()
           and "$0.15" in windowP.provider_models_list.item(0).text(),
           windowP.provider_models_list.item(0).text()
           if windowP.provider_models_list.count() else "empty")
-    windowP.provider_model_id_input.setText("fake-gpt-partial")
-    windowP.provider_add_model_button.click()
-    windowP.provider_model_id_input.setText("fake-gpt-dumb")
-    windowP.provider_add_model_button.click()
-    qt_app.processEvents()
     check("UI adds 3 provider models",
           windowP.provider_models_list.count() == 3,
           str(windowP.provider_models_list.count()))
-    windowP.provider_model_id_input.setText("fake-gpt-smart")
-    windowP.provider_add_model_button.click()
-    qt_app.processEvents()
-    check("UI rejects a duplicate model id",
-          windowP.provider_models_list.count() == 3
-          and "already on this provider" in windowP.provider_status.text(),
-          windowP.provider_status.text())
-    windowP.provider_model_id_input.setText("fake-gpt-x")
-    windowP.provider_price_in_input.setText("abc")
-    windowP.provider_add_model_button.click()
-    qt_app.processEvents()
-    check("UI rejects a bad price",
-          windowP.provider_models_list.count() == 3
-          and "must be a number" in windowP.provider_status.text(),
-          windowP.provider_status.text())
-    windowP.provider_price_in_input.setText("")
-    windowP.provider_save_button.click()
     saved = wait_until(
         lambda: "Saved fake-provider." in windowP.provider_status.text(),
         timeout=10, app=qt_app,
@@ -2498,20 +2517,15 @@ def main():
         saved_data = json.load(handle)
     check("re-saving with an empty key field keeps the stored key",
           saved_data["providers"][0]["api_key"] == "sk-fake-good-key")
-    # Test connection with a wrong key typed in the form (not saved).
+    # Typing a key without saving must not touch the file (the
+    # bad-key test itself lives in the wizard now — v19 section).
     windowP.provider_key_input.setText("sk-wrong")
-    windowP.provider_test_button.click()
-    bad_key_test = wait_until(
-        lambda: "rejected the key" in windowP.provider_test_status.text(),
-        timeout=30, app=qt_app,
-    )
-    check("UI test connection with a bad key fails plainly", bad_key_test,
-          windowP.provider_test_status.text())
-    windowP.provider_key_input.setText("")
+    qt_app.processEvents()
     with open(PROVIDERS_FILE, encoding="utf-8") as handle:
         saved_data = json.load(handle)
-    check("testing a bad key does not overwrite the saved key",
+    check("an unsaved key never reaches the file",
           saved_data["providers"][0]["api_key"] == "sk-fake-good-key")
+    windowP.provider_key_input.setText("")
     # Switching tabs must not wipe an edit in progress (the tab only
     # reloads when providers.json actually changed on disk).
     windowP.provider_name_input.setText("renamed-in-form")
@@ -2797,24 +2811,58 @@ def main():
                   str(fake_entry["models"]))
 
     # ---------- v5: provider capability ticks + media run ----------
+    # v19: capabilities live under Advanced, collapsed; ticking a
+    # box stages the change at once, and the provider's one Save
+    # keeps it. The media provider arrives via the stub wizard.
     windowP.tabs.setCurrentIndex(6)
     qt_app.processEvents()
-    windowP.provider_new_button.click()
+    media_provider = {
+        "name": "media-provider",
+        "base_url": f"http://{phost}:{pport}/v1",
+        "api_key": "sk-fake-good-key",
+        "models": [
+            {"id": "fake-gpt-smart", "display_name": "",
+             "price_input_per_1m": None, "price_output_per_1m": None,
+             "capabilities": ["text"]},
+        ],
+    }
+    app.AddProviderDialog = _stub_wizard_class(media_provider)
+    windowP.provider_add_button.click()
     qt_app.processEvents()
+    app.AddProviderDialog = real_wizard
+    media_item_p = None
+    for row in range(windowP.provider_list.count()):
+        if windowP.provider_list.item(row).text() == "media-provider":
+            media_item_p = windowP.provider_list.item(row)
+    check("media provider is in the list", media_item_p is not None)
+    if media_item_p is not None:
+        windowP.provider_list.itemClicked.emit(media_item_p)
+        qt_app.processEvents()
+    check("Advanced starts collapsed",
+          not windowP.provider_advanced_box.isVisible())
     check("capability checkboxes start with Text only",
-          windowP.provider_cap_boxes["text"].isChecked()
-          and not windowP.provider_cap_boxes["vision"].isChecked()
-          and not windowP.provider_cap_boxes["image_generation"].isChecked()
-          and not windowP.provider_cap_boxes["audio"].isChecked()
-          and not windowP.provider_cap_boxes["tools"].isChecked()
-          and not windowP.provider_cap_boxes["long_context"].isChecked())
-    windowP.provider_name_input.setText("media-provider")
-    windowP.provider_url_input.setText(f"http://{phost}:{pport}/v1")
-    windowP.provider_key_input.setText("sk-fake-good-key")
-    windowP.provider_model_id_input.setText("fake-gpt-smart")
-    windowP.provider_cap_boxes["image_generation"].setChecked(True)
-    windowP.provider_cap_boxes["audio"].setChecked(True)
-    windowP.provider_add_model_button.click()
+          windowP.advanced_cap_boxes["text"].isChecked()
+          and not windowP.advanced_cap_boxes["vision"].isChecked()
+          and not windowP.advanced_cap_boxes["image_generation"].isChecked()
+          and not windowP.advanced_cap_boxes["audio"].isChecked()
+          and not windowP.advanced_cap_boxes["tools"].isChecked()
+          and not windowP.advanced_cap_boxes["long_context"].isChecked())
+    check("Advanced says no model is picked",
+          "Pick a model" in windowP.advanced_hint.text(),
+          windowP.advanced_hint.text())
+    media_item = windowP.provider_models_list.item(0)
+    windowP.provider_models_list.itemClicked.emit(media_item)
+    qt_app.processEvents()
+    check("clicking a model loads it into Advanced",
+          windowP.advanced_hint.text()
+          == "Price and capabilities for fake-gpt-smart.",
+          windowP.advanced_hint.text())
+    windowP.provider_advanced_toggle.setChecked(True)
+    qt_app.processEvents()
+    check("Advanced opens on its toggle",
+          windowP.provider_advanced_box.isVisible())
+    windowP.advanced_cap_boxes["image_generation"].setChecked(True)
+    windowP.advanced_cap_boxes["audio"].setChecked(True)
     qt_app.processEvents()
     check("provider models list shows the capability bracket",
           windowP.provider_models_list.count() == 1
@@ -2824,28 +2872,16 @@ def main():
           if windowP.provider_models_list.count() else "empty")
     windowP.grab().save(
         os.path.join(VERIFY_DIR, "screenshot-providers-caps.png"))
-    # Update model: click it, change its capabilities, write back.
-    media_item = windowP.provider_models_list.item(0)
-    windowP.provider_models_list.itemClicked.emit(media_item)
+    # Advanced edits stage at once — no second save per model.
+    windowP.advanced_cap_boxes["audio"].setChecked(False)
     qt_app.processEvents()
-    check("clicking a model loads its capabilities into the form",
-          windowP.provider_cap_boxes["image_generation"].isChecked()
-          and windowP.provider_cap_boxes["audio"].isChecked()
-          and windowP.provider_model_id_input.text() == "fake-gpt-smart")
-    windowP.provider_cap_boxes["audio"].setChecked(False)
-    windowP.provider_update_model_button.click()
-    qt_app.processEvents()
-    check("Update model writes the changed capabilities",
+    check("unticking a capability updates the list at once",
           windowP.provider_models_list.item(0).text()
           == "fake-gpt-smart [image_generation]",
           windowP.provider_models_list.item(0).text())
-    windowP.provider_models_list.itemClicked.emit(
-        windowP.provider_models_list.item(0))
+    windowP.advanced_cap_boxes["audio"].setChecked(True)
     qt_app.processEvents()
-    windowP.provider_cap_boxes["audio"].setChecked(True)
-    windowP.provider_update_model_button.click()
-    qt_app.processEvents()
-    check("Update model restores the audio capability",
+    check("re-ticking restores the audio capability",
           windowP.provider_models_list.item(0).text()
           == "fake-gpt-smart [image_generation, audio]",
           windowP.provider_models_list.item(0).text())
@@ -3496,7 +3532,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 18", app.__version__ == "18",
+    check("__version__ is 19", app.__version__ == "19",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3510,8 +3546,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v18",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v18",
+    check("title bar shows OLLAMA SYSTEM TEST v19",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v19",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4930,10 +4966,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v18",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v18",
+        check("title bar shows v19",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v19",
               window9.windowTitle())
-        check("__version__ is 18", app.__version__ == "18", app.__version__)
+        check("__version__ is 19", app.__version__ == "19", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -6155,7 +6191,6 @@ def main():
           == "Speed fell from 20.0 to 10.0 tok/s.",
           line14.takeaway_title())
     # The charts paint without error, with data and without.
-    from PySide6.QtWidgets import QGroupBox as QGroupBox14
     bars14.set_data([("Math", 80.0), ("Coding", 40.0)])
     bars14.show()
     line14.set_data([("Nov 13", 10.0), ("Nov 14", 20.0)])
@@ -6386,74 +6421,55 @@ def main():
                 check("compare glance hides for the same model twice",
                       not window14.compare_tiles.isVisible()
                       and window14.compare_chart.rows == [])
-                # R17: the rebuilt Providers tab. The group boxes are
-                # searched on the Providers tab page only — the
-                # window holds a third group box now (the Models
-                # tab's try-it box, v15).
+                # R17 (v19): the simplified Providers tab — an empty
+                # state with one button, a detail page once a
+                # provider exists, Advanced collapsed. The provider
+                # arrives via the stub wizard; the real wizard is
+                # driven in the v19 section.
                 window14.tabs.setCurrentIndex(window14.TAB_PROVIDERS)
                 qt_app.processEvents()
-                providers_page14 = window14.tabs.widget(
-                    window14.TAB_PROVIDERS)
-                group_titles14 = sorted(
-                    g.title() for g in
-                    providers_page14.findChildren(QGroupBox14))
-                check("providers tab has Connection and Models sections",
-                      group_titles14 == ["Connection",
-                                        "Models on this provider"],
-                      str(group_titles14))
-                label_texts14 = [
-                    label.text() for label in
-                    window14.findChildren(QLabel)]
-                check("every provider field explains itself",
-                      any("A short name for this provider" in t
-                          for t in label_texts14)
-                      and any("The provider's API address" in t
-                              for t in label_texts14)
-                      and any("Saved in providers.json" in t
-                              for t in label_texts14)
-                      and any("exactly as the provider lists it" in t
-                              for t in label_texts14)
-                      and any("Dollars per million tokens" in t
-                              for t in label_texts14),
-                      str([t for t in label_texts14 if t][:8]))
-                check("fetched combo starts with its prompt",
-                      window14.fetched_models_combo.count() == 1
-                      and window14.fetched_models_combo.itemText(0)
-                      == "Test the connection to list models",
-                      window14.fetched_models_combo.itemText(0))
-                window14.provider_name_input.setText("fake")
-                window14.provider_url_input.setText(
-                    f"http://{phost14}:{pport14}/v1")
-                window14.provider_key_input.setText(
-                    fake_ollama.PROVIDER_API_KEY)
-                window14.provider_test_button.click()
-                tested14 = wait_until(
-                    lambda: "Connected" in
-                    window14.provider_test_status.text(),
-                    timeout=30, app=qt_app)
-                check("test connection reports Connected", tested14,
-                      window14.provider_test_status.text())
-                check("fetched combo lists the provider models",
-                      [window14.fetched_models_combo.itemText(i)
-                       for i in range(
-                           window14.fetched_models_combo.count())]
-                      == ["Pick a model to use its id", "fake-gpt-dumb",
-                          "fake-gpt-partial", "fake-gpt-smart"],
-                      str([window14.fetched_models_combo.itemText(i)
-                           for i in range(
-                               window14.fetched_models_combo.count())]))
-                window14.fetched_models_combo.setCurrentIndex(2)
+                check("providers tab starts on the empty state",
+                      window14.provider_stack.currentIndex() == 0,
+                      str(window14.provider_stack.currentIndex()))
+                check("empty state names the Models tab",
+                      "No cloud providers" in
+                      window14.provider_empty_label.text()
+                      and "Models tab" in
+                      window14.provider_empty_label.text(),
+                      window14.provider_empty_label.text())
+                check("empty state has one add button",
+                      window14.provider_add_empty_button.isVisible()
+                      and window14.provider_add_empty_button.text()
+                      == "Add a cloud provider")
+                provider14b = {
+                    "name": "fake",
+                    "base_url": f"http://{phost14}:{pport14}/v1",
+                    "api_key": fake_ollama.PROVIDER_API_KEY,
+                    "models": [
+                        {"id": "fake-gpt-smart", "display_name": "",
+                         "price_input_per_1m": None,
+                         "price_output_per_1m": None,
+                         "capabilities": ["text"]},
+                    ],
+                }
+                app.AddProviderDialog = _stub_wizard_class(provider14b)
+                window14.provider_add_button.click()
                 qt_app.processEvents()
-                check("picking a fetched model fills the Model id",
-                      window14.provider_model_id_input.text()
-                      == "fake-gpt-partial",
-                      window14.provider_model_id_input.text())
-                window14.provider_new_button.click()
-                qt_app.processEvents()
-                check("a new provider starts with no fetched list",
-                      window14.fetched_models_combo.count() == 1
-                      and window14.fetched_models_combo.itemText(0)
-                      == "Test the connection to list models")
+                app.AddProviderDialog = real_wizard
+                check("adding a provider shows the detail page",
+                      window14.provider_stack.currentIndex() == 1,
+                      str(window14.provider_stack.currentIndex()))
+                check("detail page shows the provider name and address",
+                      window14.provider_name_input.text() == "fake"
+                      and window14.provider_url_input.text()
+                      == f"http://{phost14}:{pport14}/v1",
+                      f"{window14.provider_name_input.text()} "
+                      f"{window14.provider_url_input.text()}")
+                check("detail page labels the address in plain words",
+                      any("Where it answers" in label.text()
+                          for label in window14.findChildren(QLabel)))
+                check("Advanced starts collapsed on the detail page",
+                      not window14.provider_advanced_box.isVisible())
                 # R18: the Settings window (driven without exec — a
                 # real modal dialog would hang the suite).
                 from PySide6.QtGui import QAction as QAction14
@@ -8523,13 +8539,24 @@ def main():
         dialog18.reject()
         qt_app.processEvents()
         # RV3: Settings saves a bare address with its scheme.
+        # v19: the address field only saves when its override is
+        # ticked — unticked means the detected address.
         dialog18c = app.SettingsDialog(app.load_app_settings(), window18)
+        dialog18c.ollama_host_override.setChecked(True)
         dialog18c.ollama_host_input.setText("127.0.0.1:11436")
         dialog18c.accept()
         check("Settings saves a bare address with its scheme",
               dialog18c.result_values["ollama_host"]
               == "http://127.0.0.1:11436",
               str(dialog18c.result_values["ollama_host"]))
+        dialog18d = app.SettingsDialog(app.load_app_settings(), window18)
+        check("Settings address override starts unticked",
+              not dialog18d.ollama_host_override.isChecked())
+        dialog18d.accept()
+        check("an unticked address override saves empty (detected)",
+              dialog18d.result_values["ollama_host"] == "",
+              repr(dialog18d.result_values["ollama_host"]))
+        dialog18d.close()
         # RV3 end to end: a bare OLLAMA_HOST still lists models.
         os.environ["OLLAMA_HOST"] = f"{host18}:{port18}"
         window18.refresh_models()
@@ -8876,6 +8903,454 @@ def main():
             os.environ.pop("OST_CAPABILITIES_FILE", None)
         else:
             os.environ["OST_CAPABILITIES_FILE"] = prior_caps18b
+
+    # ---------- v19: wizard, ONE Save, detected Settings ---------------
+    from PySide6.QtTest import QTest as QTest19
+    from PySide6.QtWidgets import QDialog as QDialog19
+
+    # Detection helpers (unit-level, no window needed).
+    prior_env_host19 = app._ENV_OLLAMA_HOST
+    prior_env_models19 = app._ENV_OLLAMA_MODELS
+    try:
+        app._ENV_OLLAMA_HOST = None
+        app._ENV_OLLAMA_MODELS = None
+        check("detect_ollama_address defaults to localhost",
+              app.detect_ollama_address() == "http://localhost:11434",
+              app.detect_ollama_address())
+        check("detect_models_folder defaults to ~/.ollama/models",
+              app.detect_models_folder() == os.path.join(
+                  os.path.expanduser("~"), ".ollama", "models"),
+              app.detect_models_folder())
+        app._ENV_OLLAMA_HOST = "127.0.0.1:11436"
+        app._ENV_OLLAMA_MODELS = "/env/models"
+        check("detect_ollama_address honors the env, with a scheme",
+              app.detect_ollama_address() == "http://127.0.0.1:11436",
+              app.detect_ollama_address())
+        check("detect_models_folder honors the env",
+              app.detect_models_folder() == "/env/models",
+              app.detect_models_folder())
+        check("known providers are the eight services",
+              [p[0] for p in app.KNOWN_PROVIDERS] == [
+                  "openai", "openrouter", "groq", "together",
+                  "deepseek", "xai", "mistral", "lmstudio"],
+              str([p[0] for p in app.KNOWN_PROVIDERS]))
+        check("only LM Studio needs no key",
+              [p[0] for p in app.KNOWN_PROVIDERS if not p[3]]
+              == ["lmstudio"])
+    finally:
+        app._ENV_OLLAMA_HOST = prior_env_host19
+        app._ENV_OLLAMA_MODELS = prior_env_models19
+
+    # The wizard, driven directly (it is modal in the app, so the
+    # window tests use the stub; here the real dialog is shown and
+    # clicked through, step by step).
+    pserver19, _pt19 = fake_ollama.start_provider_server()
+    phost19, pport19 = pserver19.server_address
+    providers19 = os.path.join(SCRATCH, "providers19.json")
+    prior_providers19 = os.environ.get("OST_PROVIDERS_FILE")
+    os.environ["OST_PROVIDERS_FILE"] = providers19
+    if os.path.exists(providers19):
+        os.remove(providers19)
+
+    def _click_wizard_row19(wizard, row):
+        # A real click: a programmatic setCurrentRow is not a pick
+        # (Qt's focus auto-select must not count either).
+        item = wizard.provider_list.item(row)
+        wizard.provider_list.scrollToItem(item)
+        rect = wizard.provider_list.visualItemRect(item)
+        QTest19.mouseClick(wizard.provider_list.viewport(),
+                           Qt.LeftButton, pos=rect.center())
+        qt_app.processEvents()
+
+    window19 = None
+    oserver19 = None
+    prior_host19 = os.environ.get("OLLAMA_HOST")
+    prior_results19 = os.environ.get("OST_RESULTS_DIR")
+    prior_caps19 = os.environ.get("OST_CAPABILITIES_FILE")
+    try:
+        wizard19 = app.AddProviderDialog()
+        wizard19.show()
+        qt_app.processEvents()
+        check("wizard starts on step 1 with nothing picked",
+              wizard19.stack.currentIndex() == 0
+              and wizard19.provider_list.currentRow() == -1
+              and not wizard19.next_button.isEnabled()
+              and "Step 1 of 4" in wizard19.step_label.text(),
+              f"row {wizard19.provider_list.currentRow()} "
+              f"next {wizard19.next_button.isEnabled()} "
+              f"{wizard19.step_label.text()}")
+        check("the address field starts hidden",
+              not wizard19.address_row.isVisible())
+        # Focus alone must not pick a row: Qt makes row 0 current
+        # when the list takes focus, which is not a choice.
+        wizard19.provider_list.setFocus()
+        qt_app.processEvents()
+        check("focus alone picks nothing",
+              wizard19._picked is None
+              and not wizard19.next_button.isEnabled(),
+              str(wizard19._picked))
+        _click_wizard_row19(wizard19, 0)
+        check("picking OpenAI fills the name and the address",
+              wizard19.name_input.text() == "openai"
+              and "https://api.openai.com/v1" in wizard19.pick_info.text()
+              and not wizard19.address_row.isVisible()
+              and wizard19.next_button.isEnabled(),
+              f"{wizard19.name_input.text()} "
+              f"{wizard19.pick_info.text()}")
+        wizard19.next_button.click()
+        qt_app.processEvents()
+        check("wizard advances to the key step",
+              wizard19.stack.currentIndex() == 1
+              and "Step 2 of 4" in wizard19.step_label.text(),
+              wizard19.step_label.text())
+        check("key step names the service and shows the field",
+              "OpenAI" in wizard19.key_intro.text()
+              and wizard19.key_input.isVisible(),
+              wizard19.key_intro.text())
+        wizard19.back_button.click()
+        qt_app.processEvents()
+        check("Back returns to the pick step with the pick kept",
+              wizard19.stack.currentIndex() == 0
+              and wizard19.name_input.text() == "openai",
+              wizard19.name_input.text())
+        _click_wizard_row19(wizard19, 8)
+        check("Other reveals the address field and clears the name",
+              wizard19.address_row.isVisible()
+              and wizard19.name_input.text() == ""
+              and not wizard19.next_button.isEnabled())
+        wizard19.name_input.setText("fake")
+        qt_app.processEvents()
+        check("Next still waits for the address",
+              not wizard19.next_button.isEnabled())
+        wizard19.url_input.setText(f"http://{phost19}:{pport19}/v1")
+        qt_app.processEvents()
+        check("name plus address enables Next",
+              wizard19.next_button.isEnabled())
+        wizard19.next_button.click()
+        qt_app.processEvents()
+        wizard19.key_input.setText(fake_ollama.PROVIDER_API_KEY)
+        wizard19.next_button.click()
+        qt_app.processEvents()
+        check("wizard advances to the test step",
+              wizard19.stack.currentIndex() == 2
+              and "Step 3 of 4" in wizard19.step_label.text(),
+              wizard19.step_label.text())
+        check("wizard Next waits for a passing test",
+              not wizard19.next_button.isEnabled())
+        wizard19.test_button.click()
+        tested19 = wait_until(
+            lambda: "Connected" in wizard19.test_status.text(),
+            timeout=30, app=qt_app,
+        )
+        check("wizard test reports Connected", tested19,
+              wizard19.test_status.text())
+        check("a passing test enables Next",
+              wizard19.next_button.isEnabled())
+        wizard19.next_button.click()
+        qt_app.processEvents()
+        check("wizard advances to the tick step",
+              wizard19.stack.currentIndex() == 3
+              and "Step 4 of 4" in wizard19.step_label.text(),
+              wizard19.step_label.text())
+        check("tick step lists the provider models",
+              [wizard19.models_list.item(i).text()
+               for i in range(wizard19.models_list.count())]
+              == ["fake-gpt-dumb", "fake-gpt-partial", "fake-gpt-smart"],
+              str([wizard19.models_list.item(i).text()
+                   for i in range(wizard19.models_list.count())]))
+        check("tick step warns tests cost real money",
+              any("cost real money" in w.text()
+                  for w in wizard19.findChildren(QLabel)))
+        check("no model is ticked by default",
+              all(wizard19.models_list.item(i).checkState()
+                  == Qt.Unchecked
+                  for i in range(wizard19.models_list.count())))
+        wizard19.models_list.item(0).setCheckState(Qt.Checked)
+        wizard19.models_list.item(2).setCheckState(Qt.Checked)
+        wizard19.finish_button.click()
+        qt_app.processEvents()
+        check("finishing accepts the wizard",
+              wizard19.result() == QDialog19.Accepted)
+        check("finished provider carries the ticked models",
+              wizard19.result_provider is not None
+              and wizard19.result_provider["name"] == "fake"
+              and wizard19.result_provider["base_url"]
+              == f"http://{phost19}:{pport19}/v1"
+              and wizard19.result_provider["api_key"]
+              == fake_ollama.PROVIDER_API_KEY
+              and [m["id"] for m in wizard19.result_provider["models"]]
+              == ["fake-gpt-dumb", "fake-gpt-smart"],
+              str(wizard19.result_provider))
+        check("ticked models default to text with no prices",
+              wizard19.result_provider["models"][0]
+              == {"id": "fake-gpt-dumb", "display_name": "",
+                  "price_input_per_1m": None,
+                  "price_output_per_1m": None,
+                  "capabilities": ["text"]},
+              str(wizard19.result_provider["models"][0]))
+        wizard19.close()
+        qt_app.processEvents()
+        # The finished provider is saved, so the duplicate check
+        # has something to catch.
+        app.save_providers([wizard19.result_provider], providers19)
+        wizard19b = app.AddProviderDialog()
+        wizard19b.show()
+        qt_app.processEvents()
+        _click_wizard_row19(wizard19b, 8)
+        wizard19b.name_input.setText("fake")
+        wizard19b.url_input.setText(f"http://{phost19}:{pport19}/v1")
+        qt_app.processEvents()
+        wizard19b.next_button.click()
+        qt_app.processEvents()
+        check("a duplicate name is caught on step 1",
+              wizard19b.stack.currentIndex() == 0
+              and "already exists" in wizard19b.page_status.text(),
+              wizard19b.page_status.text())
+        wizard19b.close()
+        qt_app.processEvents()
+        # A bad key fails the test plainly and Next stays off.
+        wizard19c = app.AddProviderDialog()
+        wizard19c.show()
+        qt_app.processEvents()
+        _click_wizard_row19(wizard19c, 8)
+        wizard19c.name_input.setText("badkey")
+        wizard19c.url_input.setText(f"http://{phost19}:{pport19}/v1")
+        wizard19c.next_button.click()
+        qt_app.processEvents()
+        wizard19c.key_input.setText("sk-wrong")
+        wizard19c.next_button.click()
+        qt_app.processEvents()
+        wizard19c.test_button.click()
+        bad19 = wait_until(
+            lambda: "rejected the key" in wizard19c.test_status.text(),
+            timeout=30, app=qt_app,
+        )
+        check("wizard test with a bad key fails plainly", bad19,
+              wizard19c.test_status.text())
+        check("a failed test leaves Next off",
+              not wizard19c.next_button.isEnabled())
+        wizard19c.close()
+        qt_app.processEvents()
+        # LM Studio needs no key: the key field hides.
+        wizard19d = app.AddProviderDialog()
+        wizard19d.show()
+        qt_app.processEvents()
+        _click_wizard_row19(wizard19d, 7)
+        check("LM Studio says no key is needed",
+              "no key needed" in wizard19d.pick_info.text(),
+              wizard19d.pick_info.text())
+        wizard19d.next_button.click()
+        qt_app.processEvents()
+        check("the key field hides for a local server",
+              not wizard19d.key_input.isVisible()
+              and "needs no key" in wizard19d.key_intro.text(),
+              wizard19d.key_intro.text())
+        wizard19d.close()
+        qt_app.processEvents()
+        # Add-models mode: starts at the test step, Back is off,
+        # and Finish returns only the ticked ids.
+        wizard19e = app.AddProviderDialog(
+            existing=wizard19.result_provider)
+        wizard19e.show()
+        qt_app.processEvents()
+        check("add-models mode starts at the test step",
+              wizard19e.stack.currentIndex() == 2
+              and not wizard19e.back_button.isEnabled(),
+              f"{wizard19e.stack.currentIndex()} "
+              f"{wizard19e.back_button.isEnabled()}")
+        wizard19e.test_button.click()
+        tested19e = wait_until(
+            lambda: "Connected" in wizard19e.test_status.text(),
+            timeout=30, app=qt_app,
+        )
+        check("add-models test reports Connected", tested19e,
+              wizard19e.test_status.text())
+        wizard19e.next_button.click()
+        qt_app.processEvents()
+        for i in range(wizard19e.models_list.count()):
+            wizard19e.models_list.item(i).setCheckState(Qt.Checked)
+        wizard19e.finish_button.click()
+        qt_app.processEvents()
+        check("add-models mode returns the ticked ids",
+              wizard19e.result_model_ids
+              == ["fake-gpt-dumb", "fake-gpt-partial", "fake-gpt-smart"],
+              str(wizard19e.result_model_ids))
+        wizard19e.close()
+        qt_app.processEvents()
+        # The window side: Add models stages only new ids, ONE Save
+        # keeps them, and a bad Advanced price is refused plainly.
+        oserver19, _t19 = fake_ollama.start_server()
+        ohost19, oport19 = oserver19.server_address
+        os.environ["OLLAMA_HOST"] = f"http://{ohost19}:{oport19}"
+        results19 = os.path.join(SCRATCH, "results19")
+        os.environ["OST_RESULTS_DIR"] = results19
+        caps19 = os.path.join(SCRATCH, "capabilities19.json")
+        os.environ["OST_CAPABILITIES_FILE"] = caps19
+        window19 = app.MainWindow()
+        window19.show()
+        wait_until(lambda: window19.model_list.count() == 6,
+                   timeout=10, app=qt_app)
+        check("window lists locals plus the wizard provider models",
+              window19.model_list.count() == 6,
+              str(window19.model_list.count()))
+        window19.tabs.setCurrentIndex(window19.TAB_PROVIDERS)
+        qt_app.processEvents()
+        check("window opens on the detail page with a provider saved",
+              window19.provider_stack.currentIndex() == 1)
+        app.AddProviderDialog = _stub_wizard_class(
+            None, ["fake-gpt-smart", "fake-gpt-partial"])
+        window19.provider_add_models_button.click()
+        qt_app.processEvents()
+        app.AddProviderDialog = real_wizard
+        check("Add models stages only the new id",
+              window19.provider_models_list.count() == 3
+              and "Added 1 model" in window19.provider_status.text(),
+              f"{window19.provider_models_list.count()} "
+              f"{window19.provider_status.text()}")
+        with open(providers19, encoding="utf-8") as handle:
+            before_save19 = json.load(handle)
+        check("staging alone does not touch the file",
+              len(before_save19["providers"][0]["models"]) == 2,
+              str(before_save19))
+        window19.provider_save_button.click()
+        saved19 = wait_until(
+            lambda: "Saved fake." in window19.provider_status.text(),
+            timeout=10, app=qt_app,
+        )
+        check("ONE Save keeps the staged model", saved19,
+              window19.provider_status.text())
+        with open(providers19, encoding="utf-8") as handle:
+            after_save19 = json.load(handle)
+        check("the file gains the staged model after Save",
+              [m["id"] for m in after_save19["providers"][0]["models"]]
+              == ["fake-gpt-dumb", "fake-gpt-smart", "fake-gpt-partial"],
+              str(after_save19))
+        # Advanced: a bad price is refused, a good one stages.
+        partial_item19 = None
+        for row in range(window19.provider_models_list.count()):
+            if window19.provider_models_list.item(row).text().startswith(
+                    "fake-gpt-partial"):
+                partial_item19 = window19.provider_models_list.item(row)
+        check("the staged model is in the list",
+              partial_item19 is not None)
+        if partial_item19 is not None:
+            window19.provider_models_list.itemClicked.emit(partial_item19)
+            qt_app.processEvents()
+            window19.provider_advanced_toggle.setChecked(True)
+            qt_app.processEvents()
+            window19.advanced_price_in_input.setText("abc")
+            window19.advanced_price_in_input.editingFinished.emit()
+            qt_app.processEvents()
+            check("Advanced refuses a bad price",
+                  "must be a number" in window19.provider_status.text(),
+                  window19.provider_status.text())
+            window19.advanced_price_in_input.setText("0.25")
+            window19.advanced_price_in_input.editingFinished.emit()
+            qt_app.processEvents()
+            partial_text19 = ""
+            for row in range(window19.provider_models_list.count()):
+                if window19.provider_models_list.item(row).text().startswith(
+                        "fake-gpt-partial"):
+                    partial_text19 = (
+                        window19.provider_models_list.item(row).text())
+            check("a good price stages into the list",
+                  "$0.25" in partial_text19, partial_text19)
+        # Settings detected UI: empty saved values show the found
+        # values with the fields hidden; saved values start ticked.
+        app._ENV_OLLAMA_HOST = None
+        app._ENV_OLLAMA_MODELS = None
+        dialog19 = app.SettingsDialog(
+            {"models_folder": "", "ollama_host": "",
+             "default_budget_minutes": 0, "template_sets": {}},
+            window19)
+        dialog19.show()
+        qt_app.processEvents()
+        check("Settings shows the detected address and folder",
+              any("Found automatically" in w.text()
+                  and "localhost:11434" in w.text()
+                  for w in dialog19.findChildren(QLabel))
+              and any("Found automatically" in w.text()
+                      and ".ollama" in w.text()
+                      for w in dialog19.findChildren(QLabel)))
+        check("detected Settings hides both fields",
+              not dialog19.models_folder_override.isChecked()
+              and not dialog19.ollama_host_override.isChecked()
+              and not dialog19._folder_row_widget.isVisible()
+              and not dialog19.ollama_host_input.isVisible())
+        dialog19.accept()
+        check("detected Settings saves empty for both",
+              dialog19.result_values["models_folder"] == ""
+              and dialog19.result_values["ollama_host"] == "",
+              str(dialog19.result_values))
+        dialog19b = app.SettingsDialog(
+            {"models_folder": "/tmp/ost-models",
+             "ollama_host": "http://127.0.0.1:11555",
+             "default_budget_minutes": 0, "template_sets": {}},
+            window19)
+        dialog19b.show()
+        qt_app.processEvents()
+        check("saved overrides start ticked with their values",
+              dialog19b.models_folder_override.isChecked()
+              and dialog19b.ollama_host_override.isChecked()
+              and dialog19b.models_folder_input.text() == "/tmp/ost-models"
+              and dialog19b.ollama_host_input.text()
+              == "http://127.0.0.1:11555"
+              and dialog19b._folder_row_widget.isVisible()
+              and dialog19b.ollama_host_input.isVisible())
+        dialog19b.models_folder_override.setChecked(False)
+        dialog19b.accept()
+        check("unticking an override clears it on save",
+              dialog19b.result_values["models_folder"] == ""
+              and dialog19b.result_values["ollama_host"]
+              == "http://127.0.0.1:11555",
+              str(dialog19b.result_values))
+        app._ENV_OLLAMA_HOST = "http://env-host:11434"
+        app._ENV_OLLAMA_MODELS = "/env/models"
+        dialog19c = app.SettingsDialog(
+            {"models_folder": "", "ollama_host": "",
+             "default_budget_minutes": 0, "template_sets": {}},
+            window19)
+        dialog19c.show()
+        qt_app.processEvents()
+        check("env-locked overrides are disabled",
+              not dialog19c.models_folder_override.isEnabled()
+              and not dialog19c.ollama_host_override.isEnabled())
+        check("env-locked labels say so",
+              any("Set outside the app" in w.text()
+                  and "env-host" in w.text()
+                  for w in dialog19c.findChildren(QLabel))
+              and any("Set outside the app" in w.text()
+                      and "/env/models" in w.text()
+                      for w in dialog19c.findChildren(QLabel)))
+        dialog19c.close()
+        app._ENV_OLLAMA_HOST = None
+        app._ENV_OLLAMA_MODELS = None
+    finally:
+        if window19 is not None:
+            window19.close()
+            window19.deleteLater()
+            qt_app.processEvents()
+        if oserver19 is not None:
+            oserver19.shutdown()
+            oserver19.server_close()
+        pserver19.shutdown()
+        pserver19.server_close()
+        if prior_providers19 is None:
+            os.environ.pop("OST_PROVIDERS_FILE", None)
+        else:
+            os.environ["OST_PROVIDERS_FILE"] = prior_providers19
+        if prior_host19 is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host19
+        if prior_results19 is None:
+            os.environ.pop("OST_RESULTS_DIR", None)
+        else:
+            os.environ["OST_RESULTS_DIR"] = prior_results19
+        if prior_caps19 is None:
+            os.environ.pop("OST_CAPABILITIES_FILE", None)
+        else:
+            os.environ["OST_CAPABILITIES_FILE"] = prior_caps19
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview

@@ -1,6 +1,6 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v18
+# TEST-REPORT — OLLAMA SYSTEM TEST v19
 
-Verified 2026-11-16 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
+Verified 2026-11-17 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
 LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-linux-gnu,
 venv ~/workspace/forge-v2-testenv/bin/python, default HOME (overriding
@@ -8,6 +8,22 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v19 is the Providers tab simplification + Settings auto-config
+release. No new templates; no new dependencies; providers.json
+format unchanged. The Providers tab was a wall of form shown
+before he had any provider at all — it now starts as a calm
+empty screen with one "Add a cloud provider" button, and adding
+a provider is four steps (pick the service, paste the key, test
+the connection, tick the models) with one save at the end.
+Prices and capabilities moved under Advanced, collapsed, with
+edits staging at once and the provider's single Save keeping
+them. Settings detect the Ollama address and the models folder
+and show what was found; the fields only appear under "Use a
+different address/folder". The wizard enforces nothing-selected-
+by-default twice: the name field takes focus on open (Qt would
+otherwise make the first list row current and pre-pick OpenAI),
+and a pick only counts after a real click or key.
 
 v18 is the slow-machine review release (tasks RV1–RV13 from a
 review of v17 run as a user on a slow machine). No new templates;
@@ -146,6 +162,32 @@ at the limit with a plain "time budget reached" status, default off;
 and the current results export to CSV and HTML, with a Compare tab
 putting two models' per-template scores side by side. No new
 templates, no template changes.
+
+v19 suite: 1538 passed, 0 failed (run 3, log
+~/workspace/ost-v19-verify/v19-run3.log). The v18 suite's 1481
+checks are carried over inside that count, with the provider-UI
+tests rewritten for the wizard and the detected Settings, plus
+the new v19 section (wizard flow, empty state, ONE Save,
+Advanced, detection helpers, detected Settings) and two extra
+RV3 Settings checks. The road: run 1 reached 1532 of 1537 with
+5 failures — 1 em-dash sweep (the wizard's strings used
+em-dashes; the suite only shows the first 3 hits, and the scan
+found 6 in total across the wizard, the budget copy, and the
+Advanced copy, all reworded) and 4 from one cascade with a REAL
+bug behind it: focusing the wizard's list makes row 0 current,
+so clicking row 0 changed no row and picked nothing — the click
+itself now picks (itemClicked/itemActivated), and the suite's
+focus-then-click sequence is the regression test. Run 2 went
+1537/0 green. Two executable fixes landed after run 2 — a None
+guard in on_provider_model_selected (a click on an empty model
+list used to crash the slot, found by the GUI drive) and the
+wizard's address row hidden until "Other" is picked (found by
+reviewing the drive screenshot) — plus one new suite check that
+the address field starts hidden, so run 3 re-ran the final tree
+and went 1538/0 green. Before run 1, the home quota blocked the
+run-tree copy (Errno 122); two stale v6 install-sim venvs
+(~276 MB) were removed and a 500 MB probe write confirmed the
+headroom.
 
 v18 suite: 1481 passed, 0 failed (run 3, log
 ~/workspace/ost-v18-verify/v18-run3.log). The v17 suite's 1436

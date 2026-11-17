@@ -1,5 +1,59 @@
 # Changelog
 
+## v19 (2026-11-17)
+
+Providers tab simplification + Settings auto-config. The providers
+tab was a wall of form: name, base URL, key, test button, model
+form, prices, capability checkboxes, all at once, before he had
+any provider at all. Settings made him type an Ollama address and
+a models folder the app can find on its own. No new templates; no
+new dependencies; providers.json format unchanged — existing
+providers keep working.
+
+- The Providers tab starts calm. With no providers it shows one
+  screen — "No cloud providers. Your local Ollama models are on
+  the Models tab." — and one button, "Add a cloud provider". The
+  form never shows until he asks for it.
+- Adding a provider is four steps, not one form. Step 1: pick the
+  service from the known list (OpenAI, OpenRouter, Groq, Together,
+  DeepSeek, xAI, Mistral, LM Studio) and the app fills in the
+  address; "Other" reveals the address field. Step 2: paste the
+  key — a local server needs none. Step 3: test the connection
+  and the app lists the models. Step 4: tick the models to add.
+  Done — one save at the end. A duplicate name is caught on step
+  1, not after the whole flow.
+- ONE Save. Adding models is editing: the wizard stages the
+  ticked models, Advanced edits stage at once, and the provider's
+  single Save button keeps everything.
+- Prices and capabilities live under Advanced, collapsed. A
+  model's price and capabilities are edited there, with the
+  model's name in the heading, and stage without a second save.
+  New models default to text; cost estimates still say "unknown
+  price" when no price is saved.
+- The cost warning stays in plain words: step 4 says tests on the
+  provider cost real money and each test spends a little of the
+  key's balance.
+- Settings detect instead of asking. The Ollama address and the
+  models folder show what the app found ("Found automatically:
+  ...") and the fields only appear under "Use a different
+  address/folder". A saved override starts ticked with its value
+  showing; unticking saves empty, which means detected. Values
+  set outside the app still show locked. The time budget keeps
+  its field with plainer copy: 0 means no limit, and that is the
+  right default for a slow machine — a limit cuts a slow model
+  off mid-test.
+- Nothing is selected by default in the wizard, enforced twice:
+  the name field takes focus when the dialog opens (Qt makes the
+  first list row current when the list takes focus, which would
+  have pre-picked OpenAI), and a pick only counts after a real
+  click or key — tabbing into the list no longer picks the first
+  row either. A click on the already-current row picks it too
+  (found by the suite: focusing the list makes row 0 current, so
+  clicking it changed no row and picked nothing). The address
+  field starts hidden and only appears for "Other".
+- The How to Use page describes the new flow; the old "New
+  provider / Test connection / Save provider" wording is gone.
+
 ## v18 (2026-11-16)
 
 Fixes from a review of v17 run as a user on a slow machine (tasks

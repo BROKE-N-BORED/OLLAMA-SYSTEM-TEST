@@ -107,8 +107,8 @@ from datetime import datetime, timedelta
 
 try:
     from PySide6.QtCore import (
-        QCoreApplication, QPropertyAnimation, QRect, QSettings, QSize, Qt,
-        QThread, QTimer, Signal,
+        QCoreApplication, QEvent, QPropertyAnimation, QRect, QSettings,
+        QSize, Qt, QThread, QTimer, Signal,
     )
     from PySide6.QtGui import (
         QAction, QFont, QIcon, QKeySequence, QPainter, QPalette, QPen,
@@ -139,6 +139,7 @@ try:
         QScrollArea,
         QSlider,
         QSpinBox,
+        QStackedWidget,
         QTabWidget,
         QTableWidget,
         QTableWidgetItem,
@@ -159,7 +160,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "18"
+__version__ = "19"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -290,15 +291,16 @@ Ollama has installed.
 ## Providers (cloud models)
 
 The Providers tab adds cloud providers (OpenAI-compatible APIs).
-Press New provider, fill in the name, the base URL, and the API key,
-then press Save provider. Keys live in `providers.json` next to the
-app. That file holds your keys: never share it or upload it anywhere.
+Press Add a cloud provider and follow the steps: pick the service
+(the app fills in the address), paste the key, test the connection,
+and tick the models to add. Keys live in `providers.json` next to
+the app. That file holds your keys: never share it or upload it
+anywhere.
 
-Press Test connection to check a provider answers. Add the provider's
-models with their prices (per million tokens) to get cost estimates
-before a run. A run with provider models shows its estimated cost
-first and asks to confirm when it is over $1.00, or when no prices
-are saved and the cost is unknown.
+Prices (per million tokens) live under Advanced on the provider's
+page; with prices saved, a run shows its estimated cost first and
+asks to confirm when it is over $1.00, or when no prices are saved
+and the cost is unknown.
 
 Removing a provider asks to confirm first. Its key and saved models
 go with it.
@@ -316,12 +318,14 @@ results as a spreadsheet file or a web page, wherever you choose.
 - "could not reach Ollama. Try again and the app will start it.":
   Ollama stopped answering. Press Run again and the app starts it.
 - "provider X did not answer": the provider could not be reached.
-  Check the base URL on the Providers tab, or try Test connection.
+  Check the address on the Providers tab, or add the models again
+  to test the connection.
 - "provider X rejected the key": the API key is wrong or revoked.
-  Paste a fresh key on the Providers tab and press Save provider.
+  Paste a fresh key on the Providers tab and press Save.
 - A model row says "failed": that model could not run. The test
   carries on with the rest. Try that model on its own with
-  `ollama run <name>` (local) or Test connection (provider).
+  `ollama run <name>` (local) or by adding its models again
+  (provider).
 - A task says "not run": the test image or audio clip that task needs
   is missing from the `images` or `audio` folder. Put the file back
   (or re-download the Release zip, which carries them) and run again.
@@ -355,8 +359,8 @@ START_OLLAMA_TIMEOUT = 30.0  # seconds to wait for `ollama serve` to answer
 START_OLLAMA_POLL = 1.0      # seconds between checks while waiting
 PROVIDER_READ_TIMEOUT = 120.0   # seconds between provider chunks (providers are slow)
 PROVIDER_STALL_TIMEOUT = 300.0  # seconds with no provider chunk at all before giving up
-PROVIDER_TEST_TIMEOUT = 15.0    # seconds for the Test connection call
-MAX_FETCHED_MODELS = 200       # most model ids the Test connection pick-list holds
+PROVIDER_TEST_TIMEOUT = 15.0    # seconds for the provider test call
+MAX_FETCHED_MODELS = 200       # most model ids the wizard's tick-list holds
 PROVIDER_LABEL_SEP = " / "      # "provider / model-id", used everywhere
 SHOW_TIMEOUT = 2.0              # seconds for one /api/show screening call
 LONG_CONTEXT_MIN_TOKENS = 32768  # a context this long counts as long-context
@@ -472,6 +476,26 @@ def ollama_base():
 # lock the field it came from.
 _ENV_OLLAMA_HOST = os.environ.get("OLLAMA_HOST")
 _ENV_OLLAMA_MODELS = os.environ.get("OLLAMA_MODELS")
+
+
+def detect_ollama_address():
+    """The Ollama address the app found on its own (v19): the
+    environment's address when one is set, else the default local
+    address. Settings shows this instead of asking him to type it.
+    """
+    return normalize_ollama_address(
+        _ENV_OLLAMA_HOST or "http://localhost:11434")
+
+
+def detect_models_folder():
+    """Where Ollama keeps its models, found on its own (v19): the
+    environment's folder when one is set, else Ollama's default
+    folder under the home directory. Settings shows this instead
+    of asking him to type it.
+    """
+    if _ENV_OLLAMA_MODELS:
+        return _ENV_OLLAMA_MODELS
+    return os.path.join(os.path.expanduser("~"), ".ollama", "models")
 
 
 def load_app_settings():
@@ -2018,6 +2042,22 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
 # Provider accounts live in providers.json next to the app. That file
 # holds API keys: it is never written anywhere else, and no key is ever
 # written to a run file, a report, a profile, or the status line.
+
+# v19: the providers the add wizard knows by name, so picking one fills
+# in its address — nothing to type, nothing to mistype. (name, display
+# name, base URL, needs a key). LM Studio runs on this PC and needs no
+# key. Anything else goes through "Other", which asks for the address.
+KNOWN_PROVIDERS = [
+    ("openai", "OpenAI", "https://api.openai.com/v1", True),
+    ("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", True),
+    ("groq", "Groq", "https://api.groq.com/openai/v1", True),
+    ("together", "Together", "https://api.together.xyz/v1", True),
+    ("deepseek", "DeepSeek", "https://api.deepseek.com/v1", True),
+    ("xai", "xAI", "https://api.x.ai/v1", True),
+    ("mistral", "Mistral", "https://api.mistral.ai/v1", True),
+    ("lmstudio", "LM Studio (on this PC)",
+     "http://localhost:1234/v1", False),
+]
 
 def load_providers(path=None):
     """Load providers.json. Returns (providers, warnings).
@@ -6236,6 +6276,428 @@ class RunPreviewDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class AddProviderDialog(QDialog):
+    """v19: add a cloud provider, step by step — not one form.
+
+    Step 1 pick a provider from the known list (the app fills in
+    the address; "Other" asks for it). Step 2 paste the key (a
+    local server needs none). Step 3 test the connection — the
+    app lists the models. Step 4 tick the models to add. Done.
+    One save at the end: the finished provider dict lands in
+    result_provider (or result_model_ids in add-models mode).
+
+    Add-models mode (existing=provider dict): starts at step 3
+    with the saved address and key, and returns only the ticked
+    model ids — the window stages them into the provider being
+    edited, and its one Save keeps them.
+    """
+
+    def __init__(self, parent=None, existing=None):
+        super().__init__(parent)
+        self.existing = dict(existing) if existing else None
+        self.result_provider = None
+        self.result_model_ids = None
+        self._fetched_ids = []
+        self._test_worker = None
+        self._picked = None  # (name, display, base_url, needs_key)
+        # A pick needs a real press or key — Qt makes row 0 current
+        # when the list takes focus, which is not a choice.
+        self._pick_armed = False
+        self.setWindowTitle(
+            "Add models" if self.existing else "Add a cloud provider")
+        self.resize(520, 460)
+        layout = QVBoxLayout(self)
+        self.step_label = QLabel("")
+        layout.addWidget(self.step_label)
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack)
+        self._build_pick_page()
+        self._build_key_page()
+        self._build_test_page()
+        self._build_models_page()
+        self.page_status = QLabel("")
+        self.page_status.setWordWrap(True)
+        layout.addWidget(self.page_status)
+        nav = QHBoxLayout()
+        self.back_button = QPushButton("Back")
+        self.back_button.clicked.connect(self._go_back)
+        self.next_button = QPushButton("Next")
+        self.next_button.clicked.connect(self._go_next)
+        self.finish_button = QPushButton(
+            "Add models" if self.existing else "Add provider")
+        self.finish_button.clicked.connect(self._finish)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        nav.addWidget(self.back_button)
+        nav.addStretch()
+        nav.addWidget(self.cancel_button)
+        nav.addWidget(self.next_button)
+        nav.addWidget(self.finish_button)
+        layout.addLayout(nav)
+        if self.existing is not None:
+            self._picked = (
+                self.existing.get("name", ""),
+                self.existing.get("name", ""),
+                self.existing.get("base_url", ""),
+                bool(self.existing.get("api_key")),
+            )
+            self.stack.setCurrentIndex(2)
+        else:
+            self.stack.setCurrentIndex(0)
+        self._refresh_nav()
+        self._shown_once = False
+
+    def showEvent(self, event):
+        """Qt makes the first list row current when the list takes
+        focus on open; nothing is selected by default, so the name
+        field takes focus instead."""
+        super().showEvent(event)
+        if not self._shown_once:
+            self._shown_once = True
+            if self.existing is None:
+                self.name_input.setFocus()
+
+    def eventFilter(self, watched, event):
+        if watched in (self.provider_list,
+                       self.provider_list.viewport()) \
+                and event.type() in (
+                    QEvent.MouseButtonPress, QEvent.KeyPress):
+            self._pick_armed = True
+        return super().eventFilter(watched, event)
+
+    # -- pages -----------------------------------------------------------
+
+    def _build_pick_page(self):
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        intro = QLabel(
+            "Which service sends the tests? Pick one. The app "
+            "fills in the address."
+        )
+        intro.setWordWrap(True)
+        page_layout.addWidget(intro)
+        self.provider_list = QListWidget()
+        for _name, display, _url, _needs_key in KNOWN_PROVIDERS:
+            self.provider_list.addItem(display)
+        self.provider_list.addItem("Other (type the address)")
+        self.provider_list.currentRowChanged.connect(self._on_pick_changed)
+        # A click (or Enter) on the already-current row changes no
+        # row, so it picks nothing through currentRowChanged — the
+        # click itself is the pick.
+        self.provider_list.itemClicked.connect(self._on_pick_activated)
+        self.provider_list.itemActivated.connect(self._on_pick_activated)
+        # Clicks land on the viewport, keys on the list — watch both.
+        self.provider_list.installEventFilter(self)
+        self.provider_list.viewport().installEventFilter(self)
+        page_layout.addWidget(self.provider_list)
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g. openai")
+        self.name_input.textChanged.connect(self._refresh_nav)
+        name_row.addWidget(self.name_input)
+        page_layout.addLayout(name_row)
+        self.address_row = QWidget()
+        # Hidden until "Other" is picked — the known providers fill
+        # in the address, so the field only appears when it is needed.
+        self.address_row.setVisible(False)
+        address_layout = QHBoxLayout(self.address_row)
+        address_layout.setContentsMargins(0, 0, 0, 0)
+        address_layout.addWidget(QLabel("Where it answers:"))
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("e.g. https://api.example.com/v1")
+        self.url_input.textChanged.connect(self._refresh_nav)
+        address_layout.addWidget(self.url_input)
+        page_layout.addWidget(self.address_row)
+        self.pick_info = QLabel("")
+        self.pick_info.setWordWrap(True)
+        self.pick_info.setEnabled(False)
+        page_layout.addWidget(self.pick_info)
+        page_layout.addStretch()
+        self.stack.addWidget(page)
+
+    def _build_key_page(self):
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        self.key_intro = QLabel("")
+        self.key_intro.setWordWrap(True)
+        page_layout.addWidget(self.key_intro)
+        self.key_input = QLineEdit()
+        self.key_input.setEchoMode(QLineEdit.Password)
+        self.key_input.setPlaceholderText("Paste the key here")
+        page_layout.addWidget(self.key_input)
+        self.key_note = QLabel(
+            "You can leave it empty and add it later, but tests "
+            "need a key to run."
+        )
+        self.key_note.setWordWrap(True)
+        self.key_note.setEnabled(False)
+        page_layout.addWidget(self.key_note)
+        page_layout.addStretch()
+        self.stack.addWidget(page)
+
+    def _build_test_page(self):
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        intro = QLabel(
+            "Check the connection and list the models. If the "
+            "test fails, go back and check the address and key."
+        )
+        intro.setWordWrap(True)
+        page_layout.addWidget(intro)
+        test_row = QHBoxLayout()
+        self.test_button = QPushButton("Test")
+        self.test_button.clicked.connect(self._run_test)
+        test_row.addWidget(self.test_button)
+        self.test_status = QLabel("")
+        self.test_status.setWordWrap(True)
+        test_row.addWidget(self.test_status)
+        test_row.addStretch()
+        page_layout.addLayout(test_row)
+        page_layout.addStretch()
+        self.stack.addWidget(page)
+
+    def _build_models_page(self):
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        intro = QLabel("Tick the models to add.")
+        intro.setWordWrap(True)
+        page_layout.addWidget(intro)
+        self.models_list = QListWidget()
+        page_layout.addWidget(self.models_list)
+        cost_note = QLabel(
+            "Tests on this provider cost real money. Each test "
+            "spends a little of your key's balance."
+        )
+        cost_note.setWordWrap(True)
+        cost_note.setEnabled(False)
+        page_layout.addWidget(cost_note)
+        page_layout.addStretch()
+        self.stack.addWidget(page)
+
+    # -- navigation ------------------------------------------------------
+
+    def _refresh_nav(self):
+        index = self.stack.currentIndex()
+        total = 4
+        step_names = [
+            "Pick a provider", "Paste the key",
+            "Test the connection", "Tick the models",
+        ]
+        self.step_label.setText(
+            f"Step {index + 1} of {total}: {step_names[index]}")
+        first = 2 if self.existing is not None else 0
+        self.back_button.setEnabled(index > first)
+        self.finish_button.setVisible(index == 3)
+        self.next_button.setVisible(index < 3)
+        if index == 0:
+            ok = self._picked is not None and bool(
+                self.name_input.text().strip())
+            if self._picked is not None and self._picked[0] == "__other__":
+                ok = ok and bool(self.url_input.text().strip())
+            self.next_button.setEnabled(ok)
+        elif index == 2:
+            self.next_button.setEnabled(bool(self._fetched_ids))
+        else:
+            self.next_button.setEnabled(True)
+
+    def _on_pick_activated(self, item):
+        """A click or Enter on a row picks it even when it was
+        already current (no row change, so currentRowChanged never
+        fires). Idempotent with the row-change path."""
+        self._pick_armed = True
+        self._on_pick_changed(self.provider_list.row(item))
+
+    def _on_pick_changed(self, row):
+        # Qt makes row 0 current when the list takes focus; that is
+        # not a pick. Only a real press or key arms the pick.
+        if not self._pick_armed:
+            return
+        if row < 0:
+            self._picked = None
+            self.pick_info.setText("")
+            self.address_row.setVisible(False)
+            self._refresh_nav()
+            return
+        if row < len(KNOWN_PROVIDERS):
+            picked = KNOWN_PROVIDERS[row]
+            self._picked = picked
+            self.name_input.setText(picked[0])
+            self.address_row.setVisible(False)
+            if picked[3]:
+                self.pick_info.setText(
+                    f"Sends tests to {picked[2]}")
+            else:
+                self.pick_info.setText(
+                    f"Sends tests to {picked[2]} (on this PC, "
+                    "no key needed.)")
+        else:
+            self._picked = ("__other__", "Other", "", True)
+            self.name_input.setText("")
+            self.address_row.setVisible(True)
+            self.pick_info.setText(
+                "Type the name and where it answers below.")
+        self._refresh_nav()
+
+    def _go_back(self):
+        index = self.stack.currentIndex()
+        if index > 0:
+            self.stack.setCurrentIndex(index - 1)
+            self.page_status.setText("")
+            self._refresh_nav()
+
+    def _go_next(self):
+        index = self.stack.currentIndex()
+        if index == 0:
+            name = self.name_input.text().strip()
+            if not name:
+                self.page_status.setText(
+                    "Give the provider a name first.")
+                return
+            if self.existing is None:
+                providers, _warnings = load_providers()
+                if any(p["name"] == name for p in providers):
+                    self.page_status.setText(
+                        f"A provider named {name} already exists.")
+                    return
+            if self._picked[0] == "__other__":
+                url = self.url_input.text().strip().rstrip("/")
+                if not url:
+                    self.page_status.setText(
+                        "Type where it answers first.")
+                    return
+                if not url.startswith(("http://", "https://")):
+                    self.page_status.setText(
+                        "The address must start with http:// or "
+                        "https://")
+                    return
+            self._update_key_page()
+            self.stack.setCurrentIndex(1)
+        elif index == 1:
+            self.stack.setCurrentIndex(2)
+        elif index == 2:
+            self._fill_models_page()
+            self.stack.setCurrentIndex(3)
+        self.page_status.setText("")
+        self._refresh_nav()
+
+    def _update_key_page(self):
+        if self._picked is None:
+            return
+        _name, display, _url, needs_key = self._picked
+        if needs_key:
+            self.key_intro.setText(
+                f"Your key for {display}. Saved on this PC, "
+                "never shown.")
+            self.key_input.setVisible(True)
+            self.key_note.setVisible(True)
+        else:
+            self.key_intro.setText(
+                f"{display} runs on this PC and needs no key.")
+            self.key_input.setVisible(False)
+            self.key_note.setVisible(False)
+
+    def _staged_provider(self):
+        """The provider dict from the wizard's steps so far."""
+        if self.existing is not None:
+            return {
+                "name": self.existing.get("name", ""),
+                "base_url": self.existing.get("base_url", ""),
+                "api_key": self.existing.get("api_key", ""),
+                "models": [],
+            }
+        if self._picked is None:
+            return None
+        if self._picked[0] == "__other__":
+            base_url = self.url_input.text().strip().rstrip("/")
+        else:
+            base_url = self._picked[2]
+        return {
+            "name": self.name_input.text().strip(),
+            "base_url": base_url,
+            "api_key": self.key_input.text(),
+            "models": [],
+        }
+
+    def _run_test(self):
+        if self._test_worker is not None:
+            return
+        provider = self._staged_provider()
+        if provider is None or not provider["base_url"]:
+            self.test_status.setText("Pick a provider first.")
+            return
+        # No closing mid-test: the worker belongs to this dialog,
+        # and dropping it while it runs aborts Qt.
+        self.test_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        self.test_status.setText("Testing...")
+        self._fetched_ids = []
+        self._refresh_nav()
+        self._test_worker = ProviderTestWorker(provider)
+        self._test_worker.tested.connect(self._on_tested)
+        self._test_worker.start()
+
+    def _on_tested(self, ok, message, model_ids):
+        worker = self._test_worker
+        self._test_worker = None
+        if worker is not None:
+            worker.wait()
+        self.test_button.setEnabled(True)
+        self.cancel_button.setEnabled(True)
+        self.test_status.setText(message)
+        self._fetched_ids = list(model_ids) if ok else []
+        self._refresh_nav()
+
+    def _fill_models_page(self):
+        self.models_list.clear()
+        for model_id in self._fetched_ids:
+            item = QListWidgetItem(model_id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            item.setData(Qt.UserRole, model_id)
+            self.models_list.addItem(item)
+
+    def _ticked_ids(self):
+        ticked = []
+        for row in range(self.models_list.count()):
+            item = self.models_list.item(row)
+            if item.checkState() == Qt.Checked:
+                ticked.append(item.data(Qt.UserRole))
+        return ticked
+
+    def _finish(self):
+        ticked = self._ticked_ids()
+        if self.existing is not None:
+            self.result_model_ids = ticked
+            self.accept()
+            return
+        provider = self._staged_provider()
+        provider["models"] = [
+            {"id": model_id, "display_name": "",
+             "price_input_per_1m": None, "price_output_per_1m": None,
+             "capabilities": ["text"]}
+            for model_id in ticked
+        ]
+        self.result_provider = provider
+        self.accept()
+
+    def reject(self):
+        # A test in flight owns this dialog until it reports back.
+        if self._test_worker is not None:
+            self.page_status.setText(
+                "Wait for the test to finish first.")
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._test_worker is not None:
+            self.page_status.setText(
+                "Wait for the test to finish first.")
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 def render_template_preview(template):
     """R24: a template's tasks as plain text, for the preview dialog
     — what the template asks, before the user runs it. Prompts are
@@ -6658,9 +7120,10 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         # v18 (RV11): tall enough that the fields fit at the default
         # size with no scrollbar (measured: the content needs 611 px
-        # at the default font; 620 leaves a margin and still fits a
-        # 768 px screen with its title bar); bigger text still scrolls.
-        self.resize(520, 620)
+        # at the default font); v19's detected rows add ~20 px, so
+        # 640 — still fits a 768 px screen with its title bar.
+        # Bigger text still scrolls.
+        self.resize(520, 640)
         self._current = dict(current)
         self._template_sets = dict(current.get("template_sets") or {})
         self.result_values = None
@@ -6683,53 +7146,75 @@ class SettingsDialog(QDialog):
             # v18 (RV11): plain words, no jargon about environments.
             "Settings for this app. They stay on this PC."
         ))
+        # v19: the folder and the address are DETECTED, not typed —
+        # the app shows what it found, and the field only appears
+        # when he ticks "Use a different...". A saved override
+        # starts ticked with its value showing.
         layout.addWidget(QLabel("Models folder:"))
-        folder_row = QHBoxLayout()
+        folder_found = detect_models_folder()
+        if _ENV_OLLAMA_MODELS is not None:
+            folder_detected = QLabel(
+                f"Set outside the app: {folder_found}")
+        else:
+            folder_detected = QLabel(
+                f"Found automatically: {folder_found}")
+        folder_detected.setWordWrap(True)
+        folder_detected.setEnabled(False)
+        layout.addWidget(folder_detected)
+        self.models_folder_override = QCheckBox("Use a different folder")
+        self.models_folder_override.stateChanged.connect(
+            self._refresh_settings_overrides)
+        layout.addWidget(self.models_folder_override)
+        folder_row_widget = QWidget()
+        folder_row = QHBoxLayout(folder_row_widget)
+        folder_row.setContentsMargins(0, 0, 0, 0)
         self.models_folder_input = QLineEdit()
         self.models_folder_input.setPlaceholderText(
-            "Leave empty for where Ollama keeps its models"
+            "Where Ollama keeps its models"
         )
         folder_row.addWidget(self.models_folder_input)
         self.browse_button = QPushButton("Browse")
         self.browse_button.clicked.connect(self._browse_folder)
         folder_row.addWidget(self.browse_button)
-        layout.addLayout(folder_row)
+        layout.addWidget(folder_row_widget)
+        self._folder_row_widget = folder_row_widget
+        saved_folder = current.get("models_folder", "")
         if _ENV_OLLAMA_MODELS is not None:
             self.models_folder_input.setText(_ENV_OLLAMA_MODELS)
             self.models_folder_input.setEnabled(False)
             self.browse_button.setEnabled(False)
-            layout.addWidget(_explain(
-                "OLLAMA_MODELS is set outside the app, so this "
-                "setting is ignored while that is set."
-            ))
+            self.models_folder_override.setEnabled(False)
         else:
-            self.models_folder_input.setText(
-                current.get("models_folder", "")
-            )
-            layout.addWidget(_explain(
-                "Where Ollama keeps its models. Takes effect when "
-                "this app starts Ollama; if Ollama is already "
-                "running, restart it for this to apply."
-            ))
+            self.models_folder_input.setText(saved_folder)
+            self.models_folder_override.setChecked(bool(saved_folder))
         layout.addWidget(QLabel("Ollama address:"))
+        address_found = detect_ollama_address()
+        if _ENV_OLLAMA_HOST is not None:
+            address_detected = QLabel(
+                f"Set outside the app: {address_found}")
+        else:
+            address_detected = QLabel(
+                f"Found automatically: {address_found}")
+        address_detected.setWordWrap(True)
+        address_detected.setEnabled(False)
+        layout.addWidget(address_detected)
+        self.ollama_host_override = QCheckBox("Use a different address")
+        self.ollama_host_override.stateChanged.connect(
+            self._refresh_settings_overrides)
+        layout.addWidget(self.ollama_host_override)
         self.ollama_host_input = QLineEdit()
         self.ollama_host_input.setPlaceholderText(
-            "e.g. http://localhost:11434 (empty means the default)"
-        )
+            "e.g. http://localhost:11434")
         layout.addWidget(self.ollama_host_input)
+        saved_host = current.get("ollama_host", "")
         if _ENV_OLLAMA_HOST is not None:
             self.ollama_host_input.setText(_ENV_OLLAMA_HOST)
             self.ollama_host_input.setEnabled(False)
-            layout.addWidget(_explain(
-                "OLLAMA_HOST is set outside the app, so this "
-                "setting is ignored while that is set."
-            ))
+            self.ollama_host_override.setEnabled(False)
         else:
-            self.ollama_host_input.setText(current.get("ollama_host", ""))
-            layout.addWidget(_explain(
-                "Where Ollama answers. Applies to new connections "
-                "right away."
-            ))
+            self.ollama_host_input.setText(saved_host)
+            self.ollama_host_override.setChecked(bool(saved_host))
+        self._refresh_settings_overrides()
         budget_row = QHBoxLayout()
         budget_row.addWidget(QLabel("Default time budget:"))
         self.budget_spin = QSpinBox()
@@ -6741,7 +7226,8 @@ class SettingsDialog(QDialog):
         layout.addLayout(budget_row)
         layout.addWidget(_explain(
             "Minutes after which a template stops (0 means no "
-            "limit). Applies to new runs."
+            "limit). Leave it at 0 unless a run hangs. A limit "
+            "cuts a slow model off mid-test. Applies to new runs."
         ))
         # R21: accessibility (library 015) — a bigger-text preset and
         # a reduce-motion switch, in Settings as well as at first
@@ -6822,6 +7308,21 @@ class SettingsDialog(QDialog):
         self._template_sets = {}
         self._refresh_template_sets_label()
 
+    def _refresh_settings_overrides(self):
+        """v19: the folder and address fields show only while their
+        "Use a different..." box is ticked — the detected value is
+        what the app uses otherwise. Defensive about order: the
+        folder box is ticked during setup, before the address
+        widgets exist."""
+        folder_box = getattr(self, "models_folder_override", None)
+        folder_row = getattr(self, "_folder_row_widget", None)
+        if folder_box is not None and folder_row is not None:
+            folder_row.setVisible(folder_box.isChecked())
+        host_box = getattr(self, "ollama_host_override", None)
+        host_input = getattr(self, "ollama_host_input", None)
+        if host_box is not None and host_input is not None:
+            host_input.setVisible(host_box.isChecked())
+
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(
             self, "Pick the models folder",
@@ -6852,14 +7353,20 @@ class SettingsDialog(QDialog):
     def accept(self):
         values = dict(self._current)
         if self.models_folder_input.isEnabled():
+            # v19: unticked means the detected folder — saved empty,
+            # which is what "detected" has always meant in storage.
             values["models_folder"] = (
                 self.models_folder_input.text().strip()
+                if self.models_folder_override.isChecked()
+                else ""
             )
         if self.ollama_host_input.isEnabled():
             # v18 (RV3): a bare address is saved with its scheme,
             # so the field shows the working form back.
-            values["ollama_host"] = normalize_ollama_address(
-                self.ollama_host_input.text()
+            values["ollama_host"] = (
+                normalize_ollama_address(self.ollama_host_input.text())
+                if self.ollama_host_override.isChecked()
+                else ""
             )
         values["default_budget_minutes"] = self.budget_spin.value()
         values["font_point_size"] = self.font_spin.value()
@@ -6916,7 +7423,6 @@ class MainWindow(QMainWindow):
         # is the model name.
         self._pending_run = None
         self._pending_pull = None
-        self.provider_test_worker = None
         # R19: pulls waiting behind the one running, and pulls that
         # stopped part-way (name -> (completed, total) bytes) so a
         # re-pull can say it is resuming instead of starting over.
@@ -7232,156 +7738,154 @@ class MainWindow(QMainWindow):
         self.provider_list.itemClicked.connect(self.on_provider_selected)
         provider_left.addWidget(self.provider_list)
         provider_list_buttons = QHBoxLayout()
-        self.provider_new_button = QPushButton("New provider")
-        self.provider_new_button.clicked.connect(self.new_provider)
+        self.provider_add_button = QPushButton("Add a cloud provider")
+        self.provider_add_button.clicked.connect(self.add_provider)
         self.provider_remove_button = QPushButton("Remove provider")
         self.provider_remove_button.clicked.connect(self.remove_provider)
-        provider_list_buttons.addWidget(self.provider_new_button)
+        provider_list_buttons.addWidget(self.provider_add_button)
         provider_list_buttons.addWidget(self.provider_remove_button)
         provider_list_buttons.addStretch()
         provider_left.addLayout(provider_list_buttons)
         provider_columns.addLayout(provider_left)
 
-        # R17: the Providers tab rebuilt (library 012, 004; U20) —
-        # two sections, each field explained in plain words directly
-        # underneath it, and the model list comes from the provider.
-        provider_right = QVBoxLayout()
-        connection_box = QGroupBox("Connection")
-        connection_layout = QVBoxLayout(connection_box)
-        name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("Name:"))
+        # v19: the Providers tab simplified — an empty state with one
+        # button, and a compact detail page for the picked provider.
+        # Adding goes through the step-by-step wizard; the form never
+        # shows until he asks for it. Prices and capabilities live
+        # under Advanced, collapsed. The tab still scrolls (RV8).
+        self.provider_stack = QStackedWidget()
+        empty_page = QWidget()
+        empty_layout = QVBoxLayout(empty_page)
+        empty_label = QLabel(
+            "No cloud providers. Your local Ollama models are on "
+            "the Models tab."
+        )
+        empty_label.setWordWrap(True)
+        self.provider_empty_label = empty_label
+        empty_layout.addWidget(empty_label)
+        empty_layout.addWidget(_explain(
+            "A cloud provider runs models on someone else's "
+            "computers and charges real money per test. Add one "
+            "only if you have a key for it."
+        ))
+        self.provider_add_empty_button = QPushButton(
+            "Add a cloud provider")
+        self.provider_add_empty_button.clicked.connect(self.add_provider)
+        empty_layout.addWidget(self.provider_add_empty_button)
+        empty_layout.addStretch()
+        self.provider_stack.addWidget(empty_page)
+        detail_page = QWidget()
+        detail_layout = QVBoxLayout(detail_page)
+        detail_name_row = QHBoxLayout()
+        detail_name_row.addWidget(QLabel("Name:"))
         self.provider_name_input = QLineEdit()
         self.provider_name_input.setPlaceholderText("e.g. openai")
-        name_row.addWidget(self.provider_name_input)
-        connection_layout.addLayout(name_row)
-        connection_layout.addWidget(_explain(
-            "A short name for this provider, e.g. openai. "
-            "Shown in the model list."
-        ))
-        url_row = QHBoxLayout()
-        url_row.addWidget(QLabel("Base URL:"))
+        detail_name_row.addWidget(self.provider_name_input)
+        detail_layout.addLayout(detail_name_row)
+        detail_url_row = QHBoxLayout()
+        detail_url_row.addWidget(QLabel("Where it answers:"))
         self.provider_url_input = QLineEdit()
-        self.provider_url_input.setPlaceholderText("e.g. https://api.openai.com/v1")
-        url_row.addWidget(self.provider_url_input)
-        connection_layout.addLayout(url_row)
-        connection_layout.addWidget(_explain(
-            "The provider's API address. It must start with "
-            "http:// or https://"
+        self.provider_url_input.setPlaceholderText(
+            "e.g. https://api.openai.com/v1")
+        detail_url_row.addWidget(self.provider_url_input)
+        detail_layout.addLayout(detail_url_row)
+        detail_layout.addWidget(_explain(
+            "A short name, shown in the model list. The address is "
+            "where it answers; it must start with http:// or https://"
         ))
         key_row = QHBoxLayout()
-        key_row.addWidget(QLabel("API key:"))
+        key_row.addWidget(QLabel("Key:"))
         self.provider_key_input = QLineEdit()
         self.provider_key_input.setEchoMode(QLineEdit.Password)
         self.provider_key_input.setPlaceholderText("API key")
         key_row.addWidget(self.provider_key_input)
         self.provider_key_status = QLabel("No key saved")
         key_row.addWidget(self.provider_key_status)
-        connection_layout.addLayout(key_row)
-        connection_layout.addWidget(_explain(
-            "Your key for this provider. Saved in providers.json, "
-            "never shown on screen."
+        detail_layout.addLayout(key_row)
+        detail_layout.addWidget(_explain(
+            "Your key for this provider. Saved on this PC, never "
+            "shown on screen. Leave empty to keep the saved key."
         ))
-        provider_test_row = QHBoxLayout()
-        self.provider_test_button = QPushButton("Test connection")
-        self.provider_test_button.clicked.connect(self.test_provider_connection)
-        self.provider_test_status = QLabel("")
-        self.provider_test_status.setWordWrap(True)
-        provider_test_row.addWidget(self.provider_test_button)
-        provider_test_row.addWidget(self.provider_test_status)
-        provider_test_row.addStretch()
-        connection_layout.addLayout(provider_test_row)
-        fetched_row = QHBoxLayout()
-        fetched_row.addWidget(QLabel("Models this provider lists:"))
-        self.fetched_models_combo = QComboBox()
-        self.fetched_models_combo.setSizeAdjustPolicy(
-            QComboBox.AdjustToContents
-        )
-        self.fetched_models_combo.addItem(
-            "Test the connection to list models", None
-        )
-        self.fetched_models_combo.currentIndexChanged.connect(
-            self.on_fetched_model_picked
-        )
-        fetched_row.addWidget(self.fetched_models_combo)
-        fetched_row.addStretch()
-        connection_layout.addLayout(fetched_row)
-        connection_layout.addWidget(_explain(
-            "Pick one to fill the Model id below. The list comes from "
-            "the provider, so the id cannot be mistyped."
-        ))
-        provider_right.addWidget(connection_box)
-        models_box = QGroupBox("Models on this provider")
-        models_layout = QVBoxLayout(models_box)
+        detail_layout.addWidget(QLabel("Models on this provider:"))
         self.provider_models_list = QListWidget()
-        self.provider_models_list.itemClicked.connect(self.on_provider_model_selected)
-        models_layout.addWidget(self.provider_models_list)
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Model id:"))
-        self.provider_model_id_input = QLineEdit()
-        self.provider_model_id_input.setPlaceholderText("e.g. gpt-4o-mini")
-        model_row.addWidget(self.provider_model_id_input)
-        model_row.addWidget(QLabel("Display name:"))
-        self.provider_model_name_input = QLineEdit()
-        self.provider_model_name_input.setPlaceholderText("optional")
-        model_row.addWidget(self.provider_model_name_input)
-        models_layout.addLayout(model_row)
-        models_layout.addWidget(_explain(
-            "The model id exactly as the provider lists it. "
-            "Display name is optional: a shorter name to show in the "
-            "model list."
-        ))
+        self.provider_models_list.itemClicked.connect(
+            self.on_provider_model_selected)
+        detail_layout.addWidget(self.provider_models_list)
+        model_buttons = QHBoxLayout()
+        self.provider_add_models_button = QPushButton("Add models")
+        self.provider_add_models_button.clicked.connect(
+            self.add_provider_models)
+        self.provider_remove_model_button = QPushButton("Remove model")
+        self.provider_remove_model_button.clicked.connect(
+            self.remove_provider_model)
+        model_buttons.addWidget(self.provider_add_models_button)
+        model_buttons.addWidget(self.provider_remove_model_button)
+        model_buttons.addStretch()
+        detail_layout.addLayout(model_buttons)
+        self.provider_advanced_toggle = QPushButton("Advanced")
+        self.provider_advanced_toggle.setCheckable(True)
+        self.provider_advanced_toggle.setChecked(False)
+        # toggled, not clicked: the box follows the button's state
+        # however it changes.
+        self.provider_advanced_toggle.toggled.connect(
+            self._toggle_advanced)
+        detail_layout.addWidget(self.provider_advanced_toggle)
+        self.provider_advanced_box = QWidget()
+        self.provider_advanced_box.setVisible(False)
+        advanced_layout = QVBoxLayout(self.provider_advanced_box)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        self.advanced_hint = QLabel(
+            "Pick a model above to set its price and what it can do.")
+        self.advanced_hint.setWordWrap(True)
+        advanced_layout.addWidget(self.advanced_hint)
         price_row = QHBoxLayout()
         price_row.addWidget(QLabel("Price in per 1M:"))
-        self.provider_price_in_input = QLineEdit()
-        self.provider_price_in_input.setPlaceholderText("$ optional")
-        price_row.addWidget(self.provider_price_in_input)
+        self.advanced_price_in_input = QLineEdit()
+        self.advanced_price_in_input.setPlaceholderText("$ optional")
+        self.advanced_price_in_input.editingFinished.connect(
+            self._apply_advanced_to_model)
+        price_row.addWidget(self.advanced_price_in_input)
         price_row.addWidget(QLabel("Price out per 1M:"))
-        self.provider_price_out_input = QLineEdit()
-        self.provider_price_out_input.setPlaceholderText("$ optional")
-        price_row.addWidget(self.provider_price_out_input)
-        models_layout.addLayout(price_row)
-        models_layout.addWidget(_explain(
-            "Optional. Dollars per million tokens, used for cost "
-            "estimates. Leave empty when you do not know it."
+        self.advanced_price_out_input = QLineEdit()
+        self.advanced_price_out_input.setPlaceholderText("$ optional")
+        self.advanced_price_out_input.editingFinished.connect(
+            self._apply_advanced_to_model)
+        price_row.addWidget(self.advanced_price_out_input)
+        advanced_layout.addLayout(price_row)
+        advanced_layout.addWidget(_explain(
+            "Dollars per million tokens, used for cost estimates. "
+            "Leave empty when you do not know it. The cost then "
+            "says unknown price."
         ))
         caps_label = QLabel(
-            "What this model can do (decides which templates it can run):"
+            "What this model can do (decides which tests it can run):"
         )
         caps_label.setWordWrap(True)
-        models_layout.addWidget(caps_label)
+        advanced_layout.addWidget(caps_label)
         caps_row = QHBoxLayout()
-        self.provider_cap_boxes = {}
+        self.advanced_cap_boxes = {}
         for capability in CAPABILITIES:
             box = QCheckBox(CAPABILITY_LABELS[capability])
             if capability == "text":
                 box.setChecked(True)
-            self.provider_cap_boxes[capability] = box
+            box.stateChanged.connect(self._apply_advanced_to_model)
+            self.advanced_cap_boxes[capability] = box
             caps_row.addWidget(box)
         caps_row.addStretch()
-        models_layout.addLayout(caps_row)
-        model_buttons = QHBoxLayout()
-        self.provider_add_model_button = QPushButton("Add model")
-        self.provider_add_model_button.clicked.connect(self.add_provider_model)
-        self.provider_update_model_button = QPushButton("Update model")
-        self.provider_update_model_button.clicked.connect(self.update_provider_model)
-        self.provider_remove_model_button = QPushButton("Remove model")
-        self.provider_remove_model_button.clicked.connect(self.remove_provider_model)
-        model_buttons.addWidget(self.provider_add_model_button)
-        model_buttons.addWidget(self.provider_update_model_button)
-        model_buttons.addWidget(self.provider_remove_model_button)
-        model_buttons.addStretch()
-        models_layout.addLayout(model_buttons)
-        provider_right.addWidget(models_box)
+        advanced_layout.addLayout(caps_row)
+        detail_layout.addWidget(self.provider_advanced_box)
         provider_save_row = QHBoxLayout()
-        self.provider_save_button = QPushButton("Save provider")
+        self.provider_save_button = QPushButton("Save")
         self.provider_save_button.clicked.connect(self.save_provider)
         self.provider_status = QLabel("")
         self.provider_status.setWordWrap(True)
         provider_save_row.addWidget(self.provider_save_button)
         provider_save_row.addWidget(self.provider_status)
         provider_save_row.addStretch()
-        provider_right.addLayout(provider_save_row)
-        provider_columns.addLayout(provider_right)
+        detail_layout.addLayout(provider_save_row)
+        detail_layout.addStretch()
+        self.provider_stack.addWidget(detail_page)
+        provider_columns.addWidget(self.provider_stack, 1)
         providers_layout.addLayout(provider_columns)
         tabs.currentChanged.connect(self.on_tab_changed)
 
@@ -9427,18 +9931,19 @@ class MainWindow(QMainWindow):
              self.profile_view],
             [self.compare_model_a, self.compare_model_b,
              self.compare_table],
-            [self.provider_list, self.provider_new_button,
-             self.provider_remove_button, self.provider_name_input,
+            [self.provider_list, self.provider_add_button,
+             self.provider_remove_button,
+             self.provider_add_empty_button,
+             self.provider_name_input,
              self.provider_url_input, self.provider_key_input,
-             self.provider_test_button, self.fetched_models_combo,
-             self.provider_models_list, self.provider_model_id_input,
-             self.provider_model_name_input, self.provider_price_in_input,
-             self.provider_price_out_input]
-            + [self.provider_cap_boxes[c] for c in CAPABILITIES]
-            + [self.provider_add_model_button,
-               self.provider_update_model_button,
-               self.provider_remove_model_button,
-               self.provider_save_button],
+             self.provider_models_list,
+             self.provider_add_models_button,
+             self.provider_remove_model_button,
+             self.provider_advanced_toggle,
+             self.advanced_price_in_input,
+             self.advanced_price_out_input]
+            + [self.advanced_cap_boxes[c] for c in CAPABILITIES]
+            + [self.provider_save_button],
         ]
         for chain in chains:
             for first, second in zip(chain, chain[1:]):
@@ -9907,8 +10412,8 @@ class MainWindow(QMainWindow):
         """Reload providers.json and rebuild the Providers tab list.
 
         Keeps the provider currently being edited selected when it
-        still exists; otherwise shows the first provider, or a blank
-        form when there are no providers yet.
+        still exists; otherwise shows the first provider, or the
+        empty state when there are no providers yet.
         """
         providers, _warnings = load_providers()
         self.providers = providers
@@ -9940,13 +10445,15 @@ class MainWindow(QMainWindow):
             self._load_provider_into_form(providers[0], is_new=False)
             self.provider_list.setCurrentRow(0)
         else:
-            self._load_provider_into_form(
-                {"name": "", "base_url": "", "api_key": "", "models": []},
-                is_new=True,
-            )
+            self.editing_provider = None
+            self.editing_is_new = False
+            self.editing_original_name = ""
+            self.editing_kept_key = ""
+            self.editing_model_index = None
+            self.provider_stack.setCurrentIndex(0)
 
     def _load_provider_into_form(self, provider, is_new):
-        """Fill the edit form from a provider dict.
+        """Fill the detail page from a provider dict.
 
         The key field is always left EMPTY: the stored key is kept in
         editing_kept_key and reused on save unless he types a new one.
@@ -9974,36 +10481,62 @@ class MainWindow(QMainWindow):
             self.provider_key_input.setPlaceholderText(
                 "API key (leave empty if the server needs none)"
             )
-        self.provider_model_id_input.setText("")
-        self.provider_model_name_input.setText("")
-        self.provider_price_in_input.setText("")
-        self.provider_price_out_input.setText("")
         self.editing_model_index = None
         self._set_caps_form(["text"])
+        self.advanced_price_in_input.setText("")
+        self.advanced_price_out_input.setText("")
+        self.advanced_hint.setText(
+            "Pick a model above to set its price and what it can do.")
         self._refresh_provider_models_list()
-        # The fetched list belongs to the previous provider: a new
-        # form starts with no list until this provider is tested.
-        self.fetched_models_combo.blockSignals(True)
-        self.fetched_models_combo.clear()
-        self.fetched_models_combo.addItem(
-            "Test the connection to list models", None
-        )
-        self.fetched_models_combo.blockSignals(False)
+        self.provider_stack.setCurrentIndex(1)
 
     def _caps_from_form(self):
-        """Capabilities from the checkboxes (Text on its own when
-        nothing is ticked — a model with no capability at all would
-        run nothing)."""
+        """Capabilities from the Advanced checkboxes (Text on its own
+        when nothing is ticked — a model with no capability at all
+        would run nothing)."""
         caps = [
             capability for capability in CAPABILITIES
-            if self.provider_cap_boxes[capability].isChecked()
+            if self.advanced_cap_boxes[capability].isChecked()
         ]
         return caps or ["text"]
 
     def _set_caps_form(self, capabilities):
         wanted = set(capabilities or ["text"])
-        for capability, box in self.provider_cap_boxes.items():
+        for capability, box in self.advanced_cap_boxes.items():
             box.setChecked(capability in wanted)
+
+    def _toggle_advanced(self):
+        """Advanced (v19) starts collapsed; the button opens it."""
+        self.provider_advanced_box.setVisible(
+            self.provider_advanced_toggle.isChecked())
+
+    def _apply_advanced_to_model(self):
+        """Write the Advanced fields back onto the picked model, in
+        the staged copy — no second save button; the one Save keeps
+        everything. Silent when no model is picked."""
+        if self.editing_provider is None:
+            return
+        index = self.editing_model_index
+        models = self.editing_provider["models"]
+        if index is None or not (0 <= index < len(models)):
+            return
+        price_in = self._parse_price(
+            self.advanced_price_in_input.text())
+        price_out = self._parse_price(
+            self.advanced_price_out_input.text())
+        if price_in is False or price_out is False:
+            self.provider_status.setText(
+                "Price must be a number, e.g. 0.15")
+            return
+        models[index]["price_input_per_1m"] = price_in
+        models[index]["price_output_per_1m"] = price_out
+        models[index]["capabilities"] = self._caps_from_form()
+        self._refresh_provider_models_list()
+        for row in range(self.provider_models_list.count()):
+            item = self.provider_models_list.item(row)
+            if item.data(Qt.UserRole) == index:
+                self.provider_models_list.setCurrentRow(row)
+                break
 
     def _refresh_provider_models_list(self):
         self.provider_models_list.clear()
@@ -10025,9 +10558,10 @@ class MainWindow(QMainWindow):
             self.provider_models_list.addItem(item)
 
     def on_provider_model_selected(self, item):
-        """Clicking a model loads it into the form for editing (its
-        capabilities included); Update model writes the form back."""
-        if self.editing_provider is None:
+        """Clicking a model loads it into Advanced for editing (its
+        price and capabilities); changes stage at once and Save
+        keeps them."""
+        if item is None or self.editing_provider is None:
             return
         index = item.data(Qt.UserRole)
         models = self.editing_provider["models"]
@@ -10035,20 +10569,19 @@ class MainWindow(QMainWindow):
             return
         model = models[index]
         self.editing_model_index = index
-        self.provider_model_id_input.setText(model.get("id", ""))
-        self.provider_model_name_input.setText(model.get("display_name", ""))
         price_in = model.get("price_input_per_1m")
         price_out = model.get("price_output_per_1m")
-        self.provider_price_in_input.setText(
+        self.advanced_price_in_input.setText(
             "" if price_in is None else str(price_in)
         )
-        self.provider_price_out_input.setText(
+        self.advanced_price_out_input.setText(
             "" if price_out is None else str(price_out)
         )
         self._set_caps_form(model.get("capabilities") or ["text"])
+        self.advanced_hint.setText(
+            f"Price and capabilities for {model['id']}.")
         self.provider_status.setText(
-            f"Editing {model['id']}. Press Update model, then Save provider."
-        )
+            f"Editing {model['id']}. Press Save to keep changes.")
 
     def _provider_from_form(self):
         """Provider dict from the form fields, keeping the stored key
@@ -10073,13 +10606,59 @@ class MainWindow(QMainWindow):
                 self._load_provider_into_form(provider, is_new=False)
                 return
 
-    def new_provider(self):
-        self.provider_list.clearSelection()
-        self._load_provider_into_form(
-            {"name": "", "base_url": "", "api_key": "", "models": []},
-            is_new=True,
-        )
-        self.provider_status.setText("New provider. Fill in the details and press Save provider.")
+    def add_provider(self):
+        """Add a cloud provider through the step-by-step wizard
+        (v19). The wizard saves nothing itself — the finished
+        provider is checked for a unique name here, then saved at
+        once: the wizard's finish IS the one save."""
+        wizard = AddProviderDialog(self)
+        if wizard.exec() != QDialog.Accepted:
+            return
+        provider = wizard.result_provider
+        if provider is None:
+            return
+        providers, _warnings = load_providers()
+        if any(p["name"] == provider["name"] for p in providers):
+            self.provider_status.setText(
+                f"A provider named {provider['name']} already exists.")
+            return
+        providers.append(provider)
+        providers.sort(key=lambda p: p["name"])
+        save_providers(providers)
+        self.provider_status.setText(f"Saved {provider['name']}.")
+        self.refresh_providers()
+        self.refresh_models()
+
+    def add_provider_models(self):
+        """Add models to the provider being edited, through the
+        wizard's test-and-tick steps. The ticked models stage into
+        the edit; Save keeps them."""
+        if self.editing_provider is None:
+            self.provider_status.setText("Pick a provider first.")
+            return
+        wizard = AddProviderDialog(self, existing=self.editing_provider)
+        if wizard.exec() != QDialog.Accepted:
+            return
+        added = 0
+        have = {m["id"] for m in self.editing_provider["models"]}
+        for model_id in wizard.result_model_ids or []:
+            if model_id in have:
+                continue
+            self.editing_provider["models"].append({
+                "id": model_id, "display_name": "",
+                "price_input_per_1m": None, "price_output_per_1m": None,
+                "capabilities": ["text"],
+            })
+            have.add(model_id)
+            added += 1
+        self._refresh_provider_models_list()
+        if added:
+            self.provider_status.setText(
+                f"Added {added} model{'s' if added != 1 else ''}. "
+                "Press Save to keep them.")
+        else:
+            self.provider_status.setText(
+                "Those models are already on this provider.")
 
     def remove_provider(self):
         item = self.provider_list.currentItem()
@@ -10110,10 +10689,12 @@ class MainWindow(QMainWindow):
             self.provider_status.setText("Give the provider a name first.")
             return
         if not provider["base_url"]:
-            self.provider_status.setText("Give the provider a base URL first.")
+            self.provider_status.setText(
+                "Give the provider an address first.")
             return
         if not provider["base_url"].startswith(("http://", "https://")):
-            self.provider_status.setText("The base URL must start with http:// or https://")
+            self.provider_status.setText(
+                "The address must start with http:// or https://")
             return
         providers, _warnings = load_providers()
         if self.editing_is_new:
@@ -10138,130 +10719,6 @@ class MainWindow(QMainWindow):
         self.provider_status.setText(f"Saved {provider['name']}.")
         self.refresh_providers()
         self.refresh_models()
-
-    def test_provider_connection(self):
-        if self.provider_test_worker is not None:
-            return
-        provider = self._provider_from_form()
-        if not provider["base_url"]:
-            self.provider_test_status.setText("Type a base URL first.")
-            return
-        if not provider["name"]:
-            provider["name"] = "provider"
-        self.provider_test_button.setEnabled(False)
-        self.provider_test_status.setText("Testing...")
-        self.provider_test_worker = ProviderTestWorker(provider)
-        self.provider_test_worker.tested.connect(self.on_provider_tested)
-        self.provider_test_worker.start()
-
-    def on_provider_tested(self, ok, message, model_ids):
-        worker = self.provider_test_worker
-        self.provider_test_worker = None
-        if worker is not None:
-            worker.wait()
-        self.provider_test_button.setEnabled(True)
-        self.provider_test_status.setText(message)
-        # R17: the fetched model list becomes a pick-list — the model
-        # list comes from the provider, not from typing. Nothing is
-        # picked by default: the first item is a prompt, not a model.
-        self.fetched_models_combo.blockSignals(True)
-        self.fetched_models_combo.clear()
-        if ok and model_ids:
-            self.fetched_models_combo.addItem(
-                "Pick a model to use its id", None
-            )
-            for model_id in model_ids:
-                self.fetched_models_combo.addItem(model_id, model_id)
-        else:
-            self.fetched_models_combo.addItem(
-                "Test the connection to list models", None
-            )
-        self.fetched_models_combo.blockSignals(False)
-
-    def on_fetched_model_picked(self, index):
-        """Picking a fetched model fills the Model id field with it —
-        the id comes from the provider, so it cannot be mistyped."""
-        model_id = self.fetched_models_combo.itemData(index)
-        if model_id:
-            self.provider_model_id_input.setText(model_id)
-
-    def add_provider_model(self):
-        if self.editing_provider is None:
-            self.provider_status.setText("Pick a provider first.")
-            return
-        model_id = self.provider_model_id_input.text().strip()
-        if not model_id:
-            self.provider_status.setText("Type a model id first.")
-            return
-        if any(m["id"] == model_id for m in self.editing_provider["models"]):
-            self.provider_status.setText("That model is already on this provider.")
-            return
-        price_in = self._parse_price(self.provider_price_in_input.text())
-        price_out = self._parse_price(self.provider_price_out_input.text())
-        if price_in is False or price_out is False:
-            self.provider_status.setText("Price must be a number, e.g. 0.15")
-            return
-        self.editing_provider["models"].append({
-            "id": model_id,
-            "display_name": self.provider_model_name_input.text().strip(),
-            "price_input_per_1m": price_in,
-            "price_output_per_1m": price_out,
-            "capabilities": self._caps_from_form(),
-        })
-        self.provider_model_id_input.setText("")
-        self.provider_model_name_input.setText("")
-        self.provider_price_in_input.setText("")
-        self.provider_price_out_input.setText("")
-        self.editing_model_index = None
-        self._set_caps_form(["text"])
-        self._refresh_provider_models_list()
-        self.provider_status.setText(
-            f"Added {model_id}. Press Save provider to keep it."
-        )
-
-    def update_provider_model(self):
-        """Write the model form back onto the model picked in the list
-        (click a model first). The id may change, but not onto another
-        model already on this provider."""
-        if self.editing_provider is None:
-            self.provider_status.setText("Pick a provider first.")
-            return
-        index = self.editing_model_index
-        models = self.editing_provider["models"]
-        if index is None or not (0 <= index < len(models)):
-            self.provider_status.setText("Click a model in the list first.")
-            return
-        model_id = self.provider_model_id_input.text().strip()
-        if not model_id:
-            self.provider_status.setText("Type a model id first.")
-            return
-        if any(
-            m["id"] == model_id for i, m in enumerate(models) if i != index
-        ):
-            self.provider_status.setText("That model is already on this provider.")
-            return
-        price_in = self._parse_price(self.provider_price_in_input.text())
-        price_out = self._parse_price(self.provider_price_out_input.text())
-        if price_in is False or price_out is False:
-            self.provider_status.setText("Price must be a number, e.g. 0.15")
-            return
-        models[index] = {
-            "id": model_id,
-            "display_name": self.provider_model_name_input.text().strip(),
-            "price_input_per_1m": price_in,
-            "price_output_per_1m": price_out,
-            "capabilities": self._caps_from_form(),
-        }
-        self.provider_model_id_input.setText("")
-        self.provider_model_name_input.setText("")
-        self.provider_price_in_input.setText("")
-        self.provider_price_out_input.setText("")
-        self.editing_model_index = None
-        self._set_caps_form(["text"])
-        self._refresh_provider_models_list()
-        self.provider_status.setText(
-            f"Updated {model_id}. Press Save provider to keep it."
-        )
 
     def _parse_price(self, text):
         """Price text to float, None when empty, False when not a number."""
@@ -10290,7 +10747,7 @@ class MainWindow(QMainWindow):
             self.editing_model_index = None
             self._refresh_provider_models_list()
             self.provider_status.setText(
-                f"Removed {removed['id']}. Press Save provider to keep it."
+                f"Removed {removed['id']}. Press Save to keep it."
             )
 
     # -- report ----------------------------------------------------------
