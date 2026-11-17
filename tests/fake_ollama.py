@@ -477,6 +477,7 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
         answer = answer_for(spec["brain"], payload.get("prompt", ""))
         chunk_delay = 1.0 if self.server.slow else 0.05
         chunk_count = 12 if self.server.slow else 3
+        time.sleep(self.server.headers_delay)
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.end_headers()
@@ -599,6 +600,7 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
         )
         chunk_delay = 1.0 if self.server.slow else 0.05
         chunk_count = 12 if self.server.slow else 3
+        time.sleep(self.server.headers_delay)
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.end_headers()
@@ -740,6 +742,10 @@ class FakeOllamaServer(ThreadingHTTPServer):
         self.chat_history = []
         self.chat_images_seen = 0
         self.chat_tools_seen = 0
+        # v18: seconds to wait before answering a generate/chat call
+        # at all (headers included) — a slow first token, like a
+        # cold model load on a slow box.
+        self.headers_delay = 0
 
 
 def start_server():

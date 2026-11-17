@@ -1,6 +1,6 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v17
+# TEST-REPORT — OLLAMA SYSTEM TEST v18
 
-Verified 2026-11-15 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
+Verified 2026-11-16 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
 LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-linux-gnu,
 venv ~/workspace/forge-v2-testenv/bin/python, default HOME (overriding
@@ -8,6 +8,26 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v18 is the slow-machine review release (tasks RV1–RV13 from a
+review of v17 run as a user on a slow machine). No new templates;
+no new dependencies. The headline fix: every generate call used
+to get 10 seconds for its first answer, and a cold model on a slow
+machine takes far longer — the run died in warmup blaming Ollama,
+though Ollama never stopped. The first reply now waits 5 minutes
+and a slow model fails its own tasks while the run carries on,
+with "slow" and "down" as different errors. Stopping a pull no
+longer wedges pulling until restart: the worker always reports
+back and the window clears a dead worker's slot. A bare Ollama
+address (no http://) now works, a failed screening is no longer
+cached as text-only, pull progress names the model, the Run tab's
+elapsed time climbs during a long call, the Providers tab scrolls,
+the try-it box starts blank, idle bars show no %, Settings has
+plain-words copy and fits its default size, and an empty model
+list says Ollama is starting instead of showing a blank box.
+The RV4 resume test expectation was corrected (1 call, not 2 —
+a model that cannot warm up fails its pairs without running a
+task, by design).
 
 v17 is the Ollama-starts-itself release, ordered in one morning
 after Ollama died on his PC mid-run three times: the app starts
@@ -126,6 +146,35 @@ at the limit with a plain "time budget reached" status, default off;
 and the current results export to CSV and HTML, with a Compare tab
 putting two models' per-template scores side by side. No new
 templates, no template changes.
+
+v18 suite: 1481 passed, 0 failed (run 3, log
+~/workspace/ost-v18-verify/v18-run3.log). The v17 suite's 1436
+checks are carried over inside that count, plus 45 new v18
+checks (RV1–RV13 coverage, the fake server's headers_delay knob,
+the RV4 expectation correction). This run supersedes the owed
+v17 green re-run — it includes every v17 check. The road: run 1
+reached 1466 of 1480 with 14 failures — 2 screening tests written
+for the old cache-on-failure contract (rewritten for RV5), 3
+server-dies tests (the killer left the socket open, so the new
+300 s first-reply window waited it out — the killer closes the
+socket now, like a real dead Ollama), 2 run-queue tests (load
+timing — the flow passes standalone in ~5 s and passed in run 2),
+4 version pins still saying 17, the Settings scrollbar (the
+content needs 611 px; the dialog is 620 now), the re-pull test
+(the old worker's thread finished before the click, so the
+re-pull resumed instead of queuing — the test accepts either,
+and a stub pins the queue branch), and the placeholder test
+(the Models tab is not the opening tab, so the label's
+isVisible stayed False until the test switched tabs). Run 1's
+re-pull race also caught a REAL bug: the pull completion slots
+took any worker's signal, so a re-pull that resumed at once was
+clobbered by the dead worker's queued stopped signal — the slots
+now ignore signals from a worker that already left the slot.
+Run 2 reached 1469 of 1476 with 7 failures, all install.sh, all
+one cause: pip hit Errno 122 Disk quota exceeded on the home
+subvolume (environmental, not the app — the pip cache was purged
+and a stale 282 MB v17 unzip removed before run 3, and a 300 MB
+probe write confirmed the headroom). Run 3 is the green run.
 
 The sandbox has no Ollama, no models, and no real provider accounts, so
 all runtime tests ran against the fake servers from v5/v6 (fake Ollama

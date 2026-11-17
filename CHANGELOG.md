@@ -1,5 +1,76 @@
 # Changelog
 
+## v18 (2026-11-16)
+
+Fixes from a review of v17 run as a user on a slow machine (tasks
+RV1–RV13). No new templates; no new dependencies.
+
+- A slow first token no longer kills the run (RV1). Every generate
+  call used to get 10 seconds for its first answer, and a cold
+  model on a slow machine takes far longer — the run died in
+  warmup blaming Ollama, though Ollama never stopped. The first
+  reply now waits 5 minutes; past that, the model is "slow" and
+  fails its own tasks while the run carries on with the next
+  model — slow and down are different errors with different
+  messages now. The per-read timeout returns to 10 seconds after
+  the first reply, so stall detection and Cancel stay responsive.
+- Stop pull no longer wedges pulling (RV2). Stopping a pull used
+  to kill the pull worker mid-read; the window kept pointing at
+  the dead worker and every later pull was refused until the app
+  restarted. The worker now always reports back — stopped or
+  failed — and the window clears a dead worker's slot. A re-pull
+  while the old pull is still dying queues instead of refusing.
+  The pull completion slots also ignore stale signals from a
+  worker that already left the slot (found by the suite: a re-pull
+  that resumes at once would otherwise be clobbered by the dead
+  worker's queued stopped signal, freezing the window while it
+  waited for the running pull).
+- A bare Ollama address works (RV3). Typing 127.0.0.1:11436 with
+  no http:// silently broke the app — the address was used verbatim,
+  so the app treated a running Ollama as unreachable. The app now
+  adds http:// where an address is used and when Settings saves one.
+- A failed screening is not cached (RV5). When a capability check
+  failed, the model was saved as text-only forever until "Screen
+  models" was pressed by hand. Failures are no longer written to
+  the cache, and the status line names the model and says to
+  press Screen models to try again.
+- Pull progress names the model (RV6). The progress line showed
+  the blob hash ("pulling 7f4030143c1c: ...") instead of the model
+  being pulled.
+- The Run tab no longer looks frozen (RV7). During a long call
+  the progress line sat at "0s elapsed" until the worker reported
+  back; the elapsed time now climbs every second on its own.
+- The Providers tab scrolls (RV8). With bigger text the tab grew
+  taller than a 768 px screen and an error message overlapped the
+  next row. The whole tab is in a scroll area now. (The tab's
+  form itself is simplified in v19.)
+- The try-it box starts blank (RV9). It used to pre-select the
+  first model, breaking the nothing-selected-by-default rule.
+  Asking with no model picked now says "Pick a model first."
+- Idle progress bars show no % (RV10). A bar at 0% while nothing
+  is running reads like a stalled job; the % appears when a run
+  or a pull starts.
+- Settings nits (RV11). The header copy was jargon ("Settings the
+  app reads, set here instead of in the environment"); it now
+  reads "Settings for this app. They stay on this PC." The dialog
+  is taller at its default size so the fields fit with no
+  scrollbar. (Detecting the address and models folder instead of
+  typing them is v19.)
+- Small consistency fixes (RV12). An empty model list says
+  "Starting Ollama. The list fills in when it answers." instead of
+  showing a blank box; the template preview puts a blank line
+  between tasks; provider list rows no longer carry the checkable
+  flag.
+- Recovery (RV13). A run that fails as "Ollama down" now gets an
+  honest error — slow vs down — and a model that cannot warm up
+  fails on its own instead of ending the run; a failed screening
+  shows on screen; a stopped pull recovers without restarting.
+- RV4: the resume-of-a-failed-pair test expected 2 generate calls
+  and got 1. That was the test, not the app: a model that cannot
+  say hello cannot do the templates, so a warmup failure marks
+  the pairs failed without running a task — resuming costs exactly
+  the warmup call. The test expectation is corrected to 1.
+
 ## v17 (2026-11-15)
 
 Ollama starts itself, Speed gets a real score, and a run that

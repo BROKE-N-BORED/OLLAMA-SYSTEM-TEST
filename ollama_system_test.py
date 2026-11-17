@@ -159,7 +159,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "17"
+__version__ = "18"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -169,6 +169,11 @@ TRYIT_PREDICT = 200
 TEMPERATURE = 0
 READ_TIMEOUT = 10.0       # seconds between streamed chunks before retrying
 STALL_TIMEOUT = 120.0     # seconds with no chunk at all before giving up
+FIRST_REPLY_TIMEOUT = 300.0  # seconds allowed for the first token
+# (v18): a cold model load from disk plus prompt work on a CPU-only
+# box can take minutes; fast models answer at once, so this is a
+# ceiling, not a delay. The old 10-second window killed every
+# benchmark on a slow machine and blamed Ollama for it.
 CODE_TIMEOUT = 10.0       # seconds allowed for one code test case
 ANSWER_TRUNCATE = 2000    # chars of raw answer kept in a run file
 OLLAMA_DOWN_MESSAGE = "Ollama is not running."
@@ -177,6 +182,11 @@ OLLAMA_DOWN_RUN_MESSAGE = ("Ollama is not answering at the set address. "
 OLLAMA_DIED_MESSAGE = "Ollama stopped responding. Press Run again and the app will start it."
 UNREACHABLE = "could not reach Ollama"
 UNREACHABLE_HINT = "could not reach Ollama. Try again and the app will start it."
+SLOW_REPLY = "Ollama took too long to answer"
+# (v18): the first token did not come in FIRST_REPLY_TIMEOUT. Slow,
+# not down — it deliberately does not start with UNREACHABLE, so a
+# slow model fails its own tasks and the run carries on instead of
+# the whole run ending as if Ollama had died.
 START_OLLAMA_TIMEOUT_MSG = "Ollama could not be started. Try again."
 START_OLLAMA_MISSING_MSG = "Ollama is not installed. Install it first, then try again."
 NO_MODELS_MESSAGE = "No models installed yet. Pull one with the pull box on the Models tab."
@@ -437,8 +447,21 @@ def describe_error(exc):
     return str(exc)
 
 
+def normalize_ollama_address(value):
+    """An Ollama address with a scheme (v18): a bare host:port
+    ("127.0.0.1:11436", Ollama's own usual form) silently broke
+    every request, because urlopen needs a scheme. Empty stays
+    empty (the default); an address that already has a scheme is
+    untouched."""
+    value = (value or "").strip().rstrip("/")
+    if not value or "://" in value:
+        return value
+    return "http://" + value
+
+
 def ollama_base():
-    return os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    return normalize_ollama_address(
+        os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
 
 
 # What the environment set before this process started. The Settings
@@ -1751,17 +1774,42 @@ def save_capabilities(caps, path=None):
 def screen_ollama_model(model, cache):
     """Screen one Ollama model via /api/show, updating the cache.
 
-    Returns the capability set. Any failure leaves the cached value
-    alone (or text-only when there is none) — screening must never
-    break the model list.
+    Returns the capability set, or None when screening failed — a
+    failure is never cached (v18): the old code cached it as
+    text-only forever. The caller keeps the old value (or
+    text-only when there is none) and retries on the next refresh.
     """
     try:
         data = ollama_show(model)
     except OllamaError:
-        return set(cache.get(model, ["text"]))
+        return None
     caps = capabilities_from_show(data)
     cache[model] = sorted(caps)
     return caps
+
+
+def _set_response_read_timeout(resp, timeout):
+    """Lower the socket timeout on an open response (v18).
+
+    The first reply waits FIRST_REPLY_TIMEOUT; once it arrives, the
+    per-read timeout goes back to READ_TIMEOUT so the stall loop
+    still notices a stalled stream within STALL_TIMEOUT and Cancel
+    stays responsive. Best effort: when the socket cannot be
+    reached through this response shape, the long timeout simply
+    stays and stall detection takes longer.
+    """
+    sock = None
+    try:
+        sock = resp.fp.raw._sock
+    except AttributeError:
+        try:
+            sock = resp.fp._sock
+        except AttributeError:
+            return
+    try:
+        sock.settimeout(timeout)
+    except OSError:
+        pass
 
 
 def chat_once(model, messages, num_predict, temperature=0, tools=None,
@@ -1791,11 +1839,20 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
     )
     t_start = time.monotonic()
     try:
-        resp = urllib.request.urlopen(req, timeout=READ_TIMEOUT)
+        resp = urllib.request.urlopen(req, timeout=FIRST_REPLY_TIMEOUT)
     except urllib.error.HTTPError as exc:
         raise OllamaError(_http_error_reason(exc))
-    except (urllib.error.URLError, socket.timeout, OSError):
+    except socket.timeout:
+        # The server took the connection but never answered: slow,
+        # not down. Say so plainly — the old message blamed Ollama.
+        raise OllamaError(SLOW_REPLY)
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), socket.timeout):
+            raise OllamaError(SLOW_REPLY)
         raise OllamaError("could not reach Ollama")
+    except OSError:
+        raise OllamaError("could not reach Ollama")
+    _set_response_read_timeout(resp, READ_TIMEOUT)
     t_first = None
     done = None
     answer_parts = []
@@ -1879,11 +1936,20 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
     )
     t_start = time.monotonic()
     try:
-        resp = urllib.request.urlopen(req, timeout=READ_TIMEOUT)
+        resp = urllib.request.urlopen(req, timeout=FIRST_REPLY_TIMEOUT)
     except urllib.error.HTTPError as exc:
         raise OllamaError(_http_error_reason(exc))
-    except (urllib.error.URLError, socket.timeout, OSError):
+    except socket.timeout:
+        # The server took the connection but never answered: slow,
+        # not down. Say so plainly — the old message blamed Ollama.
+        raise OllamaError(SLOW_REPLY)
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), socket.timeout):
+            raise OllamaError(SLOW_REPLY)
         raise OllamaError("could not reach Ollama")
+    except OSError:
+        raise OllamaError("could not reach Ollama")
+    _set_response_read_timeout(resp, READ_TIMEOUT)
     t_first = None
     done = None
     answer_parts = []
@@ -5945,6 +6011,12 @@ class PullWorker(QThread):
             except Exception:
                 pass
 
+    def is_stopping(self):
+        """True once cancel() was called (v18): the worker is on its
+        way out, and a re-pull should queue behind it, not be
+        refused as already pulling."""
+        return self._cancelled
+
     def _rate_text(self, samples, completed, total):
         """Speed and remaining time from the recent progress samples:
         (monotonic time, completed bytes). Needs at least half a
@@ -5999,9 +6071,11 @@ class PullWorker(QThread):
                         self.failed.emit("Ollama stopped responding")
                         return
                     continue
-                except (OSError, ValueError):
+                except (OSError, ValueError, AttributeError):
                     # ValueError: the response was closed under us by
-                    # cancel() — a stop, not a failure.
+                    # cancel() — a stop, not a failure. AttributeError:
+                    # the same close racing the read ('NoneType' has
+                    # no 'peek' once the buffer is gone) — also a stop.
                     if self._cancelled:
                         self.cancelled.emit(self.name)
                     else:
@@ -6034,8 +6108,12 @@ class PullWorker(QThread):
                     while samples and now - samples[0][0] > 10.0:
                         samples.popleft()
                     percent = int(100 * self.last_completed / total)
+                    # v18 (RV6): the status Ollama sends here is the
+                    # layer's blob hash ("pulling 7f4030143c1c") —
+                    # show the model name instead.
                     text = (
-                        f"{status}: {self.last_completed / 1_000_000:.1f} MB "
+                        f"Pulling {self.name}: "
+                        f"{self.last_completed / 1_000_000:.1f} MB "
                         f"of {total / 1_000_000:.1f} MB"
                         f"{self._rate_text(samples, self.last_completed, total)}"
                     )
@@ -6043,9 +6121,22 @@ class PullWorker(QThread):
                     percent = -1
                     text = status
                 self.progress.emit(percent, text)
+        except Exception:
+            # v18 (RV2): never die silent. The window clears the
+            # pull slot only on a signal, so an unreported death
+            # wedges pulling until the app restarts.
+            if self._cancelled:
+                self.cancelled.emit(self.name)
+            else:
+                self.failed.emit(
+                    "The pull stopped unexpectedly. Try again.")
+            return
         finally:
             self._resp = None
-            resp.close()
+            try:
+                resp.close()
+            except Exception:
+                pass
         if self._cancelled:
             self.cancelled.emit(self.name)
             return
@@ -6166,7 +6257,7 @@ def render_template_preview(template):
     lines.append(
         f"{len(tasks)} {'task' if len(tasks) == 1 else 'tasks'}:"
     )
-    for task in tasks:
+    for index, task in enumerate(tasks):
         kind = task.get("kind", "generate")
         head = f"  {task.get('id', '?')}"
         if kind != "generate":
@@ -6182,6 +6273,9 @@ def render_template_preview(template):
             lines.append(f"    {shown}")
         if "expected" in task:
             lines.append(f"    Expected: {task['expected']}")
+        if index < len(tasks) - 1:
+            # v18 (RV12): a blank line between tasks, so they scan.
+            lines.append("")
     return "\n".join(lines)
 
 
@@ -6562,7 +6656,11 @@ class SettingsDialog(QDialog):
     def __init__(self, current, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(520, 420)
+        # v18 (RV11): tall enough that the fields fit at the default
+        # size with no scrollbar (measured: the content needs 611 px
+        # at the default font; 620 leaves a margin and still fits a
+        # 768 px screen with its title bar); bigger text still scrolls.
+        self.resize(520, 620)
         self._current = dict(current)
         self._template_sets = dict(current.get("template_sets") or {})
         self.result_values = None
@@ -6582,8 +6680,8 @@ class SettingsDialog(QDialog):
         layout.addWidget(scroll)
         layout = content_layout
         layout.addWidget(QLabel(
-            "Settings the app reads, set here instead of in the "
-            "environment."
+            # v18 (RV11): plain words, no jargon about environments.
+            "Settings for this app. They stay on this PC."
         ))
         layout.addWidget(QLabel("Models folder:"))
         folder_row = QHBoxLayout()
@@ -6758,8 +6856,10 @@ class SettingsDialog(QDialog):
                 self.models_folder_input.text().strip()
             )
         if self.ollama_host_input.isEnabled():
-            values["ollama_host"] = (
-                self.ollama_host_input.text().strip().rstrip("/")
+            # v18 (RV3): a bare address is saved with its scheme,
+            # so the field shows the working form back.
+            values["ollama_host"] = normalize_ollama_address(
+                self.ollama_host_input.text()
             )
         values["default_budget_minutes"] = self.budget_spin.value()
         values["font_point_size"] = self.font_spin.value()
@@ -6853,6 +6953,14 @@ class MainWindow(QMainWindow):
         self._run_total_steps = 0
         self._run_done_steps = 0
         self._run_current_text = ""
+        # v18 (RV7): the progress line's heartbeat. It re-renders
+        # the line every second while a run is active, so a long
+        # call that reports nothing still shows its elapsed time
+        # climbing instead of looking frozen at "0s elapsed".
+        self._progress_tick_timer = QTimer(self)
+        self._progress_tick_timer.setInterval(1000)
+        self._progress_tick_timer.timeout.connect(
+            self._refresh_progress_line)
         # R18: applying a usual template set ticks templates by code,
         # which must not clear the label the set just set.
         self._applying_template_set = False
@@ -7094,7 +7202,19 @@ class MainWindow(QMainWindow):
         # ---- Providers tab ----
         providers_tab = QWidget()
         tabs.addTab(providers_tab, "Providers")
-        providers_layout = QVBoxLayout(providers_tab)
+        # v18 (RV8): the tab scrolls. Without a scroll area the
+        # content squeezed (a Test error drew over the next row)
+        # and bigger text grew the window past the screen.
+        providers_scroll = QScrollArea()
+        providers_scroll.setWidgetResizable(True)
+        providers_scroll.setFrameShape(QFrame.NoFrame)
+        providers_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff)
+        providers_content = QWidget()
+        providers_layout = QVBoxLayout(providers_content)
+        providers_scroll.setWidget(providers_content)
+        providers_tab_layout = QVBoxLayout(providers_tab)
+        providers_tab_layout.addWidget(providers_scroll)
         providers_intro = QLabel(
             "Cloud providers, tested with the same templates as your local "
             "models. Providers and their API keys live in providers.json "
@@ -7498,6 +7618,9 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        # v18 (RV10): no % text while idle — "0%" reads like a
+        # stalled job. The % comes back when a run starts.
+        self.progress_bar.setFormat("")
         layout.addWidget(self.progress_bar)
 
         # R12: the honest progress line — current step, step count,
@@ -7561,6 +7684,11 @@ class MainWindow(QMainWindow):
         self.installed_list.currentItemChanged.connect(
             self._update_delete_model_button)
         layout.addWidget(self.installed_list)
+        # v18 (RV12): while the list is empty, say why — starting
+        # Ollama, or nothing installed yet — instead of a blank box.
+        self.installed_empty_label = QLabel("")
+        self.installed_empty_label.setWordWrap(True)
+        layout.addWidget(self.installed_empty_label)
 
         model_buttons = QHBoxLayout()
         self.refresh_button = QPushButton("Refresh")
@@ -7593,6 +7721,9 @@ class MainWindow(QMainWindow):
         self.pull_bar = QProgressBar()
         self.pull_bar.setRange(0, 100)
         self.pull_bar.setValue(0)
+        # v18 (RV10): no % text while idle — "0%" reads like a
+        # stalled pull. The % comes back when a pull starts.
+        self.pull_bar.setFormat("")
         layout.addWidget(self.pull_bar)
         self.pull_status = QLabel("")
         self.pull_status.setWordWrap(True)
@@ -7931,12 +8062,19 @@ class MainWindow(QMainWindow):
         # /api/show call per model against a dead server would stall
         # the window for seconds each.
         cache = load_capabilities()
+        screen_failed = []
         if api_up:
             changed = False
             for name in ollama_names:
                 if name not in cache:
-                    cache[name] = screen_ollama_model(name, cache)
-                    changed = True
+                    screened = screen_ollama_model(name, cache)
+                    if screened is None:
+                        # v18 (RV5): a failed screening is not
+                        # cached — the model lists as text-only
+                        # for now and is re-screened next refresh.
+                        screen_failed.append(name)
+                    else:
+                        changed = True
             if changed:
                 save_capabilities(cache)
         targets = [
@@ -7959,14 +8097,34 @@ class MainWindow(QMainWindow):
             # capability brackets, and delete needs the bare name.
             installed_item.setData(Qt.UserRole, name)
             self.installed_list.addItem(installed_item)
+        # v18 (RV12): the empty-list placeholder — visible only
+        # while the list is empty, and it says which empty it is.
+        if self.installed_list.count() == 0:
+            if ollama_error is not None:
+                self.installed_empty_label.setText(
+                    "Starting Ollama. The list fills in when it answers."
+                )
+            else:
+                self.installed_empty_label.setText(
+                    "No models installed yet. "
+                    "Pull one with the pull box below."
+                )
+            self.installed_empty_label.setVisible(True)
+        else:
+            self.installed_empty_label.setVisible(False)
         # R24: the try-it box offers the installed Ollama models,
         # keeping the current pick when it is still installed.
+        # v18 (RV9): nothing selected by default — when there is no
+        # pick to keep, the box starts blank instead of the first
+        # model, so Ask never questions a model nobody chose.
         current_tryit = self.tryit_model_combo.currentText()
         self.tryit_model_combo.clear()
         for name in ollama_names:
             self.tryit_model_combo.addItem(name)
         if current_tryit in ollama_names:
             self.tryit_model_combo.setCurrentText(current_tryit)
+        else:
+            self.tryit_model_combo.setCurrentIndex(-1)
         for provider in providers:
             for model_entry in provider["models"]:
                 targets.append(provider_target(provider, model_entry))
@@ -8025,6 +8183,16 @@ class MainWindow(QMainWindow):
             status += " " + "; ".join(warnings[:2])
             if len(warnings) > 2:
                 status += f" (+{len(warnings) - 2} more)"
+        if screen_failed:
+            # v18 (RV5): a failed screening says so, instead of
+            # silently leaving the model text-only.
+            shown = ", ".join(screen_failed[:2])
+            if len(screen_failed) > 2:
+                shown += f" (+{len(screen_failed) - 2} more)"
+            status += (
+                f" Could not check what {shown} can do. "
+                f"Press Screen models to try again."
+            )
         self.status_label.setText(status)
         self.update_template_availability()
         self.refresh_checklist()
@@ -8452,6 +8620,8 @@ class MainWindow(QMainWindow):
         self.template_list.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setValue(0)
+        # v18 (RV10): the bar shows its % while a run is on.
+        self.progress_bar.setFormat("%p%")
         # R12/R13: fresh progress state, a clean finish line, and the
         # status chip on Running.
         self._run_started_at = time.monotonic()
@@ -8459,6 +8629,7 @@ class MainWindow(QMainWindow):
         self._run_done_steps = 0
         self._run_current_text = ""
         self.progress_detail.setText("")
+        self._progress_tick_timer.start()
         self.finish_label.hide()
         self.run_chip.setText("Running")
         self.worker = BenchWorker(
@@ -8571,19 +8742,38 @@ class MainWindow(QMainWindow):
             self.pull_status.setText("Type a model name first.")
             return
         if self.pull_worker is not None:
-            if (name == self.pull_worker.name
-                    or name in self.pull_queue):
-                self.pull_status.setText(f"{name} is already pulling or queued.")
+            if not self.pull_worker.isRunning():
+                # v18 (RV2): the worker died without reporting (the
+                # old wedge) — clear the slot and pull as normal.
+                # Its partial progress stays, so the re-pull resumes.
+                worker = self.pull_worker
+                self.pull_worker = None
+                worker.wait()
+                if worker.last_total:
+                    self.pull_interrupted[worker.name] = (
+                        worker.last_completed, worker.last_total)
+            else:
+                if name in self.pull_queue:
+                    self.pull_status.setText(
+                        f"{name} is already pulling or queued.")
+                    return
+                if (name == self.pull_worker.name
+                        and not self.pull_worker.is_stopping()):
+                    self.pull_status.setText(
+                        f"{name} is already pulling or queued.")
+                    return
+                # A different model while one pulls, or the same
+                # model while its pull is stopping: queue it. The
+                # queued pull starts when the slot clears.
+                self.pull_queue.append(name)
+                self._refresh_pull_queue()
+                self.pull_input.clear()
+                count = len(self.pull_queue)
+                self.pull_status.setText(
+                    f"Queued {name}. {count} "
+                    f"{'pull' if count == 1 else 'pulls'} in the queue."
+                )
                 return
-            self.pull_queue.append(name)
-            self._refresh_pull_queue()
-            self.pull_input.clear()
-            count = len(self.pull_queue)
-            self.pull_status.setText(
-                f"Queued {name}. {count} "
-                f"{'pull' if count == 1 else 'pulls'} in the queue."
-            )
-            return
         self.pull_input.clear()
         self._begin_pull(name)
 
@@ -8611,6 +8801,8 @@ class MainWindow(QMainWindow):
         self.pull_cancel_button.setEnabled(True)
         self.pull_bar.setRange(0, 100)
         self.pull_bar.setValue(0)
+        # v18 (RV10): the % shows while a pull is on.
+        self.pull_bar.setFormat("%p%")
         if self._pull_resuming:
             done, total = self.pull_interrupted[name]
             if total:
@@ -8665,6 +8857,13 @@ class MainWindow(QMainWindow):
         self._refresh_pull_queue()
 
     def on_pull_progress(self, percent, text):
+        # v18 (RV2): ignore a stale signal from a worker that already
+        # left the slot — a re-pull clears a dead worker's slot and
+        # starts a new pull, and the old worker's queued signals
+        # still arrive afterwards. Without this the old worker's
+        # progress would overwrite the new pull's.
+        if self.sender() is not self.pull_worker:
+            return
         if percent < 0:
             self.pull_bar.setRange(0, 0)
         else:
@@ -8675,6 +8874,12 @@ class MainWindow(QMainWindow):
         self.pull_status.setText(text)
 
     def on_pull_done(self, name):
+        # v18 (RV2): ignore a stale signal from a worker that already
+        # left the slot (see on_pull_progress). Without this the old
+        # worker's done would clear the new pull's slot and wait for
+        # a running worker on the main thread — a UI freeze.
+        if self.sender() is not self.pull_worker:
+            return
         # The worker's finished signal fires while its thread is
         # still exiting: capture it, clear the attribute, and wait
         # for it before the last reference goes — dropping the
@@ -8697,6 +8902,10 @@ class MainWindow(QMainWindow):
         self._start_next_queued()
 
     def on_pull_failed(self, message):
+        # v18 (RV2): ignore a stale signal from a worker that already
+        # left the slot (see on_pull_progress).
+        if self.sender() is not self.pull_worker:
+            return
         worker = self.pull_worker
         self.pull_worker = None
         if worker is not None:
@@ -8706,6 +8915,8 @@ class MainWindow(QMainWindow):
         self.pull_cancel_button.setEnabled(False)
         self.pull_bar.setRange(0, 100)
         self.pull_bar.setValue(0)
+        # v18 (RV10): a failed pull leaves the bar idle, no "0%".
+        self.pull_bar.setFormat("")
         self.pull_status.setText(f"Pull failed: {message}")
         log_event(f"Pull failed: {message}")
         # A pull that got part-way keeps its place: pulling the same
@@ -8723,6 +8934,10 @@ class MainWindow(QMainWindow):
         """A stopped pull (R19): the bar stays where it stopped, so
         the user can see how far it got, and the model stays queued
         for a resume."""
+        # v18 (RV2): ignore a stale signal from a worker that already
+        # left the slot (see on_pull_progress).
+        if self.sender() is not self.pull_worker:
+            return
         worker = self.pull_worker
         self.pull_worker = None
         if worker is not None:
@@ -8789,8 +9004,12 @@ class MainWindow(QMainWindow):
         model = self.tryit_model_combo.currentText()
         question = self.tryit_input.text().strip()
         if not model:
-            self.tryit_answer.setPlainText(
-                "No model to ask: pull one first.")
+            if self.tryit_model_combo.count() == 0:
+                self.tryit_answer.setPlainText(
+                    "No model to ask: pull one first.")
+            else:
+                self.tryit_answer.setPlainText(
+                    "Pick a model first.")
             return
         if not question:
             self.tryit_answer.setPlainText(
@@ -8968,6 +9187,7 @@ class MainWindow(QMainWindow):
         else:
             self.run_chip.setText("Stopped")
         self._run_started_at = None
+        self._progress_tick_timer.stop()
         worker = self.worker
         self.worker = None
         if worker is not None:
@@ -9699,6 +9919,10 @@ class MainWindow(QMainWindow):
         self.provider_list.clear()
         for provider in providers:
             item = QListWidgetItem(provider["name"])
+            # v18 (RV12): read-only like the installed-models list —
+            # this PySide6 build sets ItemIsUserCheckable on a bare
+            # item by default, and Space would sprout a checkbox.
+            item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
             item.setData(Qt.UserRole, provider["name"])
             self.provider_list.addItem(item)
         keep = None

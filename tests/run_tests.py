@@ -1,9 +1,12 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v17 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v18 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1359 v16 checks are carried over; the v17 checks
-cover Ollama auto-start (Fix 1), Speed's real score (Fix 2), the mid-run
-restart and RAM check, pull auto-start, and run resume (manifests,
-Resume button, --resume headless).
+answers per model. All 1436 v17 checks are carried over; the v18 checks
+cover the review fixes RV1–RV13 — the 300 s first-reply window and the
+slow/down distinction, the pull close-race and the dead-slot recovery,
+bare-address normalisation, uncached failed screenings, the named pull
+progress, the climbing elapsed time, the Providers scroll area, the
+blank try-it box, the idle bars, the Settings wording and size, and the
+empty-list placeholder. 1481 checks in total, all green (run 3).
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -21,7 +24,7 @@ the Qt test env from AGENTS.md:
   ~/workspace/forge-v2-testenv/bin/python tests/run_tests.py
 
 Use the default HOME — overriding it breaks Qt plugin init. Takes
-about 7 minutes. Exit code 0 = every check passed. Prints PASS/FAIL
+about 40 minutes under load. Exit code 0 = every check passed. Prints PASS/FAIL
 per check.
 """
 
@@ -629,11 +632,15 @@ def main():
           app.screen_ollama_model("fake-smart:2b", {})
           == {"text", "vision", "tools", "long_context"},
           str(app.screen_ollama_model("fake-smart:2b", {})))
-    check("screen_ollama_model keeps the cache on failure",
+    # v18 (RV5): a failed screening returns None instead of the
+    # cached value or text-only — the caller keeps the old cache
+    # entry (or text-only when there is none) and retries on the
+    # next refresh. A failure is never cached as text-only forever.
+    check("screen_ollama_model returns None on failure",
           app.screen_ollama_model("no-such-model:9b", {"no-such-model:9b": ["text", "vision"]})
-          == {"text", "vision"})
-    check("screen_ollama_model unknown model is text-only",
-          app.screen_ollama_model("no-such-model:9b", {}) == {"text"})
+          is None)
+    check("screen_ollama_model returns None for an unknown model",
+          app.screen_ollama_model("no-such-model:9b", {}) is None)
 
     # ---------- v5: chat_once via the fake (text, images, tools, roles) ----------
     chat_images_before = server.chat_images_seen
@@ -1507,6 +1514,12 @@ def main():
             time.sleep(0.05)
         server4.dead = True
         server4.shutdown()
+        # v18: close the listening socket too — a dead Ollama's
+        # socket is closed (an OOM kill takes the process with
+        # it), so the next call fails fast on refused. Without
+        # the close, connections sit in the backlog unanswered
+        # and the v18 300 s first-reply window waits them out.
+        server4.server_close()
 
     killer = threading.Thread(target=_kill_server, daemon=True)
     killer.start()
@@ -3483,7 +3496,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 17", app.__version__ == "17",
+    check("__version__ is 18", app.__version__ == "18",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3497,8 +3510,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v17",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v17",
+    check("title bar shows OLLAMA SYSTEM TEST v18",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v18",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4917,10 +4930,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v17",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v17",
+        check("title bar shows v18",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v18",
               window9.windowTitle())
-        check("__version__ is 17", app.__version__ == "17", app.__version__)
+        check("__version__ is 18", app.__version__ == "18", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -8022,8 +8035,14 @@ def main():
             and window17.save_button.isEnabled(),
             timeout=120, app=qt_app)
         check("failed-pairs resume completes", resumed17b)
+        # v18 (RV4): the expectation was 2 — warmup plus the task.
+        # A model that fails its warmup never runs a task (a model
+        # that cannot say hello cannot do the templates), so a
+        # resumed failed pair costs exactly the warmup call: 1.
+        # The warmup-fail-fast behaviour is deliberate; the count
+        # was the stale part.
         check("resume retried only the failed pair",
-              server17.generate_count - gen_before_resume17b == 2,
+              server17.generate_count - gen_before_resume17b == 1,
               str(server17.generate_count - gen_before_resume17b))
         smart_files17b_after = sorted(os.listdir(smart_dir17b))
         check("the done pair was not re-run",
@@ -8269,6 +8288,594 @@ def main():
             os.environ.pop("OLLAMA_HOST", None)
         else:
             os.environ["OLLAMA_HOST"] = prior_host17c
+
+    # ---------- v18: review fixes RV1-RV13 -------------------------------
+    # RV1: a slow first token no longer kills the run. The first
+    # reply waits FIRST_REPLY_TIMEOUT (300 s); a timeout there is
+    # "slow", not "down".
+    check("first-reply window is 300 seconds",
+          app.FIRST_REPLY_TIMEOUT == 300.0,
+          str(app.FIRST_REPLY_TIMEOUT))
+    check("a slow first reply is not 'Ollama down'",
+          not app.is_unreachable(app.OllamaError(app.SLOW_REPLY))
+          and not app.SLOW_REPLY.startswith(app.UNREACHABLE),
+          app.SLOW_REPLY)
+    check("a slow first reply keeps its own message",
+          app.describe_error(app.OllamaError(app.SLOW_REPLY))
+          == app.SLOW_REPLY)
+
+    # _set_response_read_timeout restores the per-read timeout once
+    # the first reply arrives, and never crashes on a response shape
+    # it does not know.
+    class _FakeSock18:
+        def __init__(self):
+            self.timeout = None
+
+        def settimeout(self, value):
+            self.timeout = value
+
+    class _FakeRaw18:
+        def __init__(self, sock):
+            self._sock = sock
+
+    class _FakeFp18:
+        def __init__(self, raw):
+            self.raw = raw
+
+    class _FakeResp18:
+        def __init__(self, fp):
+            self.fp = fp
+
+    sock18 = _FakeSock18()
+    app._set_response_read_timeout(
+        _FakeResp18(_FakeFp18(_FakeRaw18(sock18))), app.READ_TIMEOUT)
+    check("the read timeout is restored after the first reply",
+          sock18.timeout == app.READ_TIMEOUT, str(sock18.timeout))
+    app._set_response_read_timeout(object(), app.READ_TIMEOUT)
+    check("an unknown response shape does not crash the restore",
+          True)
+
+    # RV3: address normalisation, unit level.
+    check("a bare address gains http://",
+          app.normalize_ollama_address("127.0.0.1:11436")
+          == "http://127.0.0.1:11436")
+    check("a bare hostname gains http://",
+          app.normalize_ollama_address("localhost:11434")
+          == "http://localhost:11434")
+    check("an address with a scheme is untouched",
+          app.normalize_ollama_address("https://ollama.lan:11434")
+          == "https://ollama.lan:11434")
+    check("an empty address stays empty",
+          app.normalize_ollama_address("") == ""
+          and app.normalize_ollama_address("   ") == "")
+    check("a trailing slash is trimmed",
+          app.normalize_ollama_address("http://localhost:11434/")
+          == "http://localhost:11434")
+
+    # RV12: template preview separates tasks with a blank line.
+    preview18 = app.render_template_preview({
+        "name": "T", "description": "", "capability": "text",
+        "scored": True, "num_predict": 200,
+        "tasks": [
+            {"id": "a", "prompt": "first", "expected": "1"},
+            {"id": "b", "prompt": "second", "expected": "2"},
+        ],
+    })
+    check("template preview separates tasks with a blank line",
+          "Expected: 1\n\n  b" in preview18, preview18)
+
+    # RV2: the pull close-race, deterministically — a response whose
+    # read raises AttributeError (the buffer gone under it) still
+    # reports back instead of dying silent.
+    import urllib.request as urllib_request18
+    real_urlopen18 = urllib_request18.urlopen
+
+    class _RaceResp18:
+        """A read with a stop landing mid-read: the flag goes up,
+        then the buffer is gone."""
+
+        def __init__(self, worker):
+            self.worker = worker
+
+        def readline(self):
+            self.worker._cancelled = True
+            raise AttributeError(
+                "'NoneType' object has no attribute 'peek'")
+
+        def close(self):
+            pass
+
+    class _DeadResp18:
+        def readline(self):
+            raise AttributeError(
+                "'NoneType' object has no attribute 'peek'")
+
+        def close(self):
+            pass
+
+    class _BoomResp18:
+        def readline(self):
+            raise RuntimeError("boom")
+
+        def close(self):
+            pass
+
+    signals18 = []
+    try:
+        worker18a = app.PullWorker("race-a:1b")
+        urllib_request18.urlopen = (
+            lambda req, timeout=None: _RaceResp18(worker18a))
+        worker18a.cancelled.connect(
+            lambda name: signals18.append(("cancelled", name)))
+        worker18a.failed.connect(
+            lambda msg: signals18.append(("failed", msg)))
+        worker18a.run()
+        check("a close-race on a stopping pull reports stopped",
+              signals18 == [("cancelled", "race-a:1b")], str(signals18))
+        signals18.clear()
+        urllib_request18.urlopen = (
+            lambda req, timeout=None: _DeadResp18())
+        worker18b = app.PullWorker("dead-b:1b")
+        worker18b.cancelled.connect(
+            lambda name: signals18.append(("cancelled", name)))
+        worker18b.failed.connect(
+            lambda msg: signals18.append(("failed", msg)))
+        worker18b.run()
+        check("a close-race on a live pull reports failed",
+              len(signals18) == 1 and signals18[0][0] == "failed",
+              str(signals18))
+        signals18.clear()
+        urllib_request18.urlopen = (
+            lambda req, timeout=None: _BoomResp18())
+        worker18c = app.PullWorker("boom:1b")
+        worker18c.cancelled.connect(
+            lambda name: signals18.append(("cancelled", name)))
+        worker18c.failed.connect(
+            lambda msg: signals18.append(("failed", msg)))
+        worker18c.run()
+        check("an unexpected pull error still reports back",
+              signals18 == [("failed",
+                             "The pull stopped unexpectedly. Try again.")],
+              str(signals18))
+    finally:
+        urllib_request18.urlopen = real_urlopen18
+
+    # ---------- v18: window checks ---------------------------------------
+    from PySide6.QtCore import QSettings as QSettings18
+    from PySide6.QtCore import Qt as Qt18
+    from PySide6.QtWidgets import QScrollArea as QScrollArea18
+    settings18 = QSettings18("BrokeNBored", app.APP_NAME)
+    prior18 = {
+        key: settings18.value(key)
+        for key in ("models_folder", "ollama_host",
+                    "default_budget_minutes", "template_sets",
+                    "font_point_size", "reduce_motion",
+                    "setup_dismissed", "setup_completed")
+    }
+    prior_host18 = os.environ.get("OLLAMA_HOST")
+    prior_results18 = os.environ.get("OST_RESULTS_DIR")
+    prior_providers18 = os.environ.get("OST_PROVIDERS_FILE")
+    prior_caps18 = os.environ.get("OST_CAPABILITIES_FILE")
+    prior_font18 = qt_app.font().pointSize()
+    app.save_app_settings({"models_folder": "", "ollama_host": "",
+                           "default_budget_minutes": 0, "template_sets": {},
+                           "font_point_size": 0, "reduce_motion": False})
+    settings18.remove("setup_dismissed")
+    settings18.remove("setup_completed")
+    settings18.sync()
+    results18 = os.path.join(SCRATCH, "results18")
+    os.makedirs(results18, exist_ok=True)
+    os.environ["OST_RESULTS_DIR"] = results18
+    os.environ["OST_PROVIDERS_FILE"] = os.path.join(
+        SCRATCH, "providers18.json")
+    os.environ["OST_CAPABILITIES_FILE"] = os.path.join(
+        SCRATCH, "capabilities18.json")
+    server18, _t18 = fake_ollama.start_server()
+    host18, port18 = server18.server_address
+    ollama_url18 = f"http://{host18}:{port18}"
+    os.environ["OLLAMA_HOST"] = ollama_url18
+    window18 = app.MainWindow()
+    window18.show()
+    wait_until(lambda: window18.model_list.count() == 4,
+               timeout=10, app=qt_app)
+    try:
+        # RV10: idle bars show no % — "0%" reads like a stalled job.
+        check("the run bar shows no % while idle",
+              window18.progress_bar.format() == "",
+              repr(window18.progress_bar.format()))
+        check("the pull bar shows no % while idle",
+              window18.pull_bar.format() == "",
+              repr(window18.pull_bar.format()))
+        # RV9: the try-it box starts blank — nothing selected by
+        # default, ever — and Ask with no pick says so.
+        check("the try-it box starts blank",
+              window18.tryit_model_combo.currentIndex() == -1
+              and window18.tryit_model_combo.currentText() == "",
+              repr(window18.tryit_model_combo.currentText()))
+        window18.tryit_input.setText("What is 2 plus 2?")
+        window18.tryit_ask_button.click()
+        qt_app.processEvents()
+        check("Ask with no model picked says so",
+              window18.tryit_answer.toPlainText()
+              == "Pick a model first.",
+              window18.tryit_answer.toPlainText())
+        window18.tryit_input.setText("")
+        # RV8: the Providers tab scrolls.
+        providers_tab18 = window18.tabs.widget(window18.TAB_PROVIDERS)
+        scroll18 = providers_tab18.findChild(QScrollArea18)
+        check("the Providers tab has a scroll area",
+              scroll18 is not None)
+        # RV11: Settings header is plain words, and the dialog fits
+        # at its default size with no scrollbar.
+        dialog18 = app.SettingsDialog(app.load_app_settings(), window18)
+        labels18 = [w.text() for w in dialog18.findChildren(QLabel)]
+        check("the Settings header is plain words",
+              labels18
+              and labels18[0]
+              == "Settings for this app. They stay on this PC.",
+              str(labels18[:1]))
+        dialog18.show()
+        qt_app.processEvents()
+        settings_scroll18 = dialog18.findChild(QScrollArea18)
+        check("Settings fits at its default size, no scrollbar",
+              settings_scroll18 is not None
+              and not settings_scroll18.verticalScrollBar().isVisible())
+        dialog18.reject()
+        qt_app.processEvents()
+        # RV3: Settings saves a bare address with its scheme.
+        dialog18c = app.SettingsDialog(app.load_app_settings(), window18)
+        dialog18c.ollama_host_input.setText("127.0.0.1:11436")
+        dialog18c.accept()
+        check("Settings saves a bare address with its scheme",
+              dialog18c.result_values["ollama_host"]
+              == "http://127.0.0.1:11436",
+              str(dialog18c.result_values["ollama_host"]))
+        # RV3 end to end: a bare OLLAMA_HOST still lists models.
+        os.environ["OLLAMA_HOST"] = f"{host18}:{port18}"
+        window18.refresh_models()
+        qt_app.processEvents()
+        check("a bare Ollama address still lists models",
+              window18.model_list.count() == 4,
+              str(window18.model_list.count()))
+        os.environ["OLLAMA_HOST"] = ollama_url18
+        window18.refresh_models()
+        qt_app.processEvents()
+        # RV5: a failed screening is not cached, and the screen says so.
+        real_show18 = app.ollama_show
+
+        def _show_fail18(model):
+            if model == "fake-smart:2b":
+                raise app.OllamaError("show exploded")
+            return real_show18(model)
+
+        app.ollama_show = _show_fail18
+        try:
+            app.save_capabilities({})
+            window18.refresh_models()
+            qt_app.processEvents()
+            caps18 = app.load_capabilities()
+            check("a failed screening is not cached",
+                  "fake-smart:2b" not in caps18
+                  and "fake-partial:3b" in caps18,
+                  str(sorted(caps18)))
+            check("a failed screening says so on screen",
+                  "Could not check what fake-smart:2b can do"
+                  in window18.status_label.text(),
+                  window18.status_label.text())
+            check("a failed screening still lists the model",
+                  any(window18.model_list.item(r).text().startswith(
+                      "fake-smart:2b")
+                      for r in range(window18.model_list.count())))
+        finally:
+            app.ollama_show = real_show18
+            window18.refresh_models()
+            qt_app.processEvents()
+        # RV1: a slow first token (12 s — past the old 10 s window)
+        # succeeds instead of blaming Ollama.
+        server18.headers_delay = 12
+        slow_first18 = app.generate_once(
+            "fake-smart:2b", "Say hello in one sentence.", 64)
+        check("a slow first token still answers",
+              bool((slow_first18.get("answer") or "").strip()),
+              str(slow_first18.get("answer", ""))[:80])
+        server18.headers_delay = 0
+        # RV1: past the first-reply window, the error is "slow",
+        # not "down".
+        server18.headers_delay = 5
+        real_first18 = app.FIRST_REPLY_TIMEOUT
+        try:
+            app.FIRST_REPLY_TIMEOUT = 2
+            slow_err18 = None
+            try:
+                app.generate_once(
+                    "fake-smart:2b", "Say hello in one sentence.", 64)
+            except app.OllamaError as exc:
+                slow_err18 = exc
+            check("a first reply past the window says slow, not down",
+                  slow_err18 is not None
+                  and str(slow_err18) == app.SLOW_REPLY
+                  and not app.is_unreachable(slow_err18),
+                  str(slow_err18))
+        finally:
+            app.FIRST_REPLY_TIMEOUT = real_first18
+            server18.headers_delay = 0
+        # RV1: slow models fail their warmup and the run carries on
+        # with the next model — it does not end as "Ollama down".
+        server18.headers_delay = 5
+        app.FIRST_REPLY_TIMEOUT = 2
+        try:
+            set_checked_list(window18.model_list,
+                             {"fake-smart:2b", "fake-partial:3b"})
+            set_checked_templates(window18, {"coding"})
+            window18.run_button.click()
+            slow_run18 = wait_until(
+                lambda: window18.worker is None
+                and window18.save_button.isEnabled(),
+                timeout=60, app=qt_app)
+            check("a run with slow models completes, not Ollama down",
+                  slow_run18
+                  and window18.status_label.text().startswith("Done."),
+                  window18.status_label.text())
+            check("a slow model fails plainly as slow",
+                  window18.results.get("fake-smart:2b", {}).get("status")
+                  == "failed: Ollama took too long to answer",
+                  str(window18.results.get("fake-smart:2b", {}).get(
+                      "status")))
+            check("the second slow model was tried too",
+                  window18.results.get("fake-partial:3b", {}).get(
+                      "status")
+                  == "failed: Ollama took too long to answer",
+                  str(window18.results.get("fake-partial:3b", {}).get(
+                      "status")))
+            check("slow failed pairs leave a resumable run",
+                  window18.resume_button.isEnabled())
+        finally:
+            app.FIRST_REPLY_TIMEOUT = real_first18
+            server18.headers_delay = 0
+        # RV7 + RV10: during a long call the progress line's elapsed
+        # time climbs on its own, and the run bar shows its %.
+        server18.slow = True
+        try:
+            set_checked_list(window18.model_list, {"fake-smart:2b"})
+            set_checked_templates(window18, {"coding"})
+            window18.run_button.click()
+            detail_started18 = wait_until(
+                lambda: bool(window18.progress_detail.text()),
+                timeout=10, app=qt_app)
+            detail_before18 = window18.progress_detail.text()
+            check("the run bar shows its % while a run is on",
+                  window18.progress_bar.format() == "%p%",
+                  repr(window18.progress_bar.format()))
+            wait_until(lambda: False, timeout=2.5, app=qt_app)
+            detail_after18 = window18.progress_detail.text()
+            check("the elapsed time climbs during a long call",
+                  detail_started18
+                  and detail_after18 != detail_before18
+                  and ("2s elapsed" in detail_after18
+                       or "3s elapsed" in detail_after18),
+                  f"before={detail_before18!r} "
+                  f"after={detail_after18!r}")
+        finally:
+            server18.slow = False
+            if window18.worker is not None:
+                window18.cancel_button.click()
+                wait_until(lambda: window18.worker is None,
+                           timeout=30, app=qt_app)
+        # RV2 + RV6: stop a slow pull, re-pull at once — it queues
+        # behind the dying pull instead of being refused, and the
+        # progress names the model, not a blob hash.
+        server18.pull_slow = True
+        window18.pull_input.setText("slow-a:1b")
+        window18.pull_button.click()
+        pulling18 = wait_until(
+            lambda: "MB" in window18.pull_status.text(),
+            timeout=12, app=qt_app)
+        check("pull progress names the model",
+              pulling18
+              and window18.pull_status.text().startswith(
+                  "Pulling slow-a:1b:"),
+              window18.pull_status.text())
+        window18.pull_cancel_button.click()
+        # No processEvents: the stopped signal has not arrived yet,
+        # so the old pull is still dying in its slot — or already
+        # dead with its signal still queued. Either way the re-pull
+        # must go: queued behind the dying pull, or started at once
+        # resuming the partial download. Both are correct; which one
+        # happens is a thread race, so the test accepts either.
+        window18.pull_input.setText("slow-a:1b")
+        window18.pull_button.click()
+        repull_status18 = window18.pull_status.text()
+        check("a re-pull while the old pull dies is queued or resumed",
+              repull_status18.startswith("Queued slow-a:1b")
+              or repull_status18.startswith("Resuming slow-a:1b"),
+              repull_status18)
+        queued_pull18 = wait_until(
+            lambda: window18.pull_worker is not None
+            and window18.pull_worker.name == "slow-a:1b"
+            and window18.pull_queue_list.count() == 0,
+            timeout=10, app=qt_app)
+        check("the re-pull runs (queued or resumed)",
+              queued_pull18,
+              window18.pull_worker.name
+              if window18.pull_worker is not None else "no worker")
+        window18.pull_cancel_button.click()
+        drained18 = wait_until(
+            lambda: window18.pull_worker is None,
+            timeout=10, app=qt_app)
+        check("the re-pulled pull stops cleanly", drained18)
+        server18.pull_slow = False
+        # RV2: the queue branch itself, deterministically — a worker
+        # that is still running and stopping queues the re-pull
+        # instead of refusing it. (The live test above accepts either
+        # outcome, so this stub pins the branch.)
+        class _StoppingWorker18:
+            name = "stop-q:1b"
+
+            def isRunning(self):
+                return True
+
+            def is_stopping(self):
+                return True
+
+        window18.pull_worker = _StoppingWorker18()
+        window18.pull_input.setText("stop-q:1b")
+        window18.pull_button.click()
+        check("a re-pull while the old pull stops is queued",
+              "Queued stop-q:1b" in window18.pull_status.text()
+              and window18.pull_queue_list.count() == 1,
+              window18.pull_status.text())
+        window18.pull_worker = None
+        window18.pull_queue.clear()
+        window18._refresh_pull_queue()
+        # RV2: a worker that died without reporting (the old wedge)
+        # no longer blocks the slot — a pull clears it and goes.
+        wedge18 = app.PullWorker("wedge:1b")
+        wedge18.start()
+        wedge_done18 = wait_until(
+            lambda: not wedge18.isRunning(), timeout=10, app=qt_app)
+        window18.pull_worker = wedge18
+        window18.pull_input.setText("wedge:1b")
+        window18.pull_button.click()
+        check("a dead pull worker no longer wedges the slot",
+              wedge_done18
+              and window18.pull_worker is not wedge18
+              and "already pulling or queued"
+              not in window18.pull_status.text(),
+              window18.pull_status.text())
+        wedge_pulled18 = wait_until(
+            lambda: "Pulled wedge:1b." in window18.pull_status.text(),
+            timeout=15, app=qt_app)
+        check("the pull after a wedged slot completes",
+              wedge_pulled18, window18.pull_status.text())
+        # RV10: a failed pull leaves the bar idle, no "0%".
+        server18.pull_fail = True
+        window18.pull_input.setText("fail-me:1b")
+        window18.pull_button.click()
+        failed18 = wait_until(
+            lambda: window18.pull_status.text().startswith("Pull failed:"),
+            timeout=10, app=qt_app)
+        check("a failed pull leaves the bar idle, no 0%",
+              failed18
+              and window18.pull_bar.value() == 0
+              and window18.pull_bar.format() == "",
+              f"{window18.pull_status.text()} "
+              f"value={window18.pull_bar.value()} "
+              f"format={window18.pull_bar.format()!r}")
+        server18.pull_fail = False
+        # RV12: provider list rows carry no checkbox flag.
+        app.save_providers(
+            [{"name": "fakeprov",
+              "base_url": "http://127.0.0.1:9/v1",
+              "api_key": "sk-fake-not-real", "models": []}],
+            os.environ["OST_PROVIDERS_FILE"])
+        window18.refresh_providers()
+        qt_app.processEvents()
+        prov_item18 = window18.provider_list.item(0)
+        check("provider list rows carry no checkbox flag",
+              prov_item18 is not None
+              and not (prov_item18.flags() & Qt18.ItemIsUserCheckable))
+    finally:
+        window18.close()
+        window18.deleteLater()
+        qt_app.processEvents()
+        server18.shutdown()
+        server18.server_close()
+        if prior_host18 is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host18
+        if prior_results18 is None:
+            os.environ.pop("OST_RESULTS_DIR", None)
+        else:
+            os.environ["OST_RESULTS_DIR"] = prior_results18
+        if prior_providers18 is None:
+            os.environ.pop("OST_PROVIDERS_FILE", None)
+        else:
+            os.environ["OST_PROVIDERS_FILE"] = prior_providers18
+        if prior_caps18 is None:
+            os.environ.pop("OST_CAPABILITIES_FILE", None)
+        else:
+            os.environ["OST_CAPABILITIES_FILE"] = prior_caps18
+        app.apply_font_size(0)
+        for key18, value18 in prior18.items():
+            if value18 is None:
+                settings18.remove(key18)
+            else:
+                settings18.setValue(key18, value18)
+        settings18.sync()
+        if qt_app.font().pointSize() != prior_font18:
+            app.apply_font_size(prior_font18)
+
+    # ---------- v18: empty model list placeholder --------------------------
+    # RV12: with Ollama down and nothing to list, the Models tab says
+    # Ollama is starting instead of showing a blank box. The window
+    # is built with the fake server up, then the server is swapped
+    # for a dead port with no ollama on PATH, so neither the API nor
+    # the CLI can list anything — and the starter is stubbed, so the
+    # test checks the placeholder, not the starter.
+    prior_host18b = os.environ.get("OLLAMA_HOST")
+    prior_path18b = os.environ.get("PATH")
+    prior_providers18b = os.environ.get("OST_PROVIDERS_FILE")
+    prior_caps18b = os.environ.get("OST_CAPABILITIES_FILE")
+    os.environ["OST_PROVIDERS_FILE"] = os.path.join(
+        SCRATCH, "providers18b.json")
+    os.environ["OST_CAPABILITIES_FILE"] = os.path.join(
+        SCRATCH, "capabilities18b.json")
+    server18b, _t18b = fake_ollama.start_server()
+    host18b, port18b = server18b.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host18b}:{port18b}"
+    window18b = app.MainWindow()
+    window18b.show()
+    wait_until(lambda: window18b.model_list.count() == 4,
+               timeout=10, app=qt_app)
+    try:
+        empty_dir18b = os.path.join(SCRATCH, "empty-path18b")
+        os.makedirs(empty_dir18b, exist_ok=True)
+        os.environ["PATH"] = empty_dir18b
+        os.environ["OLLAMA_HOST"] = f"http://127.0.0.1:{free_port()}"
+        window18b.starter = object()
+        window18b.refresh_models()
+        # The placeholder lives on the Models tab, which is not the
+        # opening tab — show it first, or isVisible stays False
+        # because the tab page itself is hidden.
+        window18b.tabs.setCurrentIndex(window18b.TAB_MODELS)
+        qt_app.processEvents()
+        check("an empty model list says Ollama is starting",
+              window18b.installed_empty_label.isVisible()
+              and "Starting Ollama"
+              in window18b.installed_empty_label.text(),
+              window18b.installed_empty_label.text())
+        window18b.starter = None
+        os.environ["PATH"] = prior_path18b
+        os.environ["OLLAMA_HOST"] = f"http://{host18b}:{port18b}"
+        window18b.refresh_models()
+        qt_app.processEvents()
+        check("the placeholder hides once models list again",
+              not window18b.installed_empty_label.isVisible()
+              and window18b.installed_list.count() == 4,
+              str(window18b.installed_list.count()))
+    finally:
+        window18b.close()
+        window18b.deleteLater()
+        qt_app.processEvents()
+        server18b.shutdown()
+        server18b.server_close()
+        if prior_host18b is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host18b
+        if prior_path18b is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = prior_path18b
+        if prior_providers18b is None:
+            os.environ.pop("OST_PROVIDERS_FILE", None)
+        else:
+            os.environ["OST_PROVIDERS_FILE"] = prior_providers18b
+        if prior_caps18b is None:
+            os.environ.pop("OST_CAPABILITIES_FILE", None)
+        else:
+            os.environ["OST_CAPABILITIES_FILE"] = prior_caps18b
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview

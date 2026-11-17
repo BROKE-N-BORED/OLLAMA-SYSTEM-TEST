@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v17
+# OLLAMA SYSTEM TEST v18
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,19 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v18 is the slow-machine review release, no new templates: a cold
+model on a slow PC takes longer than 10 seconds for its first
+answer, and v17 killed the whole run for that — the first reply
+now waits 5 minutes, and a model that is slow fails on its own
+while the run carries on. Stopping a pull no longer wedges
+pulling until restart; a bare Ollama address (no http://) works;
+a failed capability check is no longer saved as text-only; pull
+progress names the model instead of a blob hash; the Run tab's
+elapsed time climbs during a long call; the Providers tab scrolls;
+the try-it box starts blank; idle progress bars show no %; and
+an empty model list says Ollama is starting instead of showing
+a blank box.
 
 v17 is the Ollama-starts-itself release, no new templates: the app
 starts Ollama on its own whenever it needs it — on opening, before
