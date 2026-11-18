@@ -1,5 +1,45 @@
 # Changelog
 
+## v22 (2026-11-17)
+
+The update release: the app now checks its own GitHub repo for
+a newer Release and pulls it, through a verified path, with the
+user in charge at every step. No new templates; no new
+dependencies (the new `updates.py` module is stdlib-only).
+
+- On launch, the app silently checks GitHub for a newer
+  Release. Up to date, or GitHub unreachable: nothing happens —
+  no popup, no noise. A newer Release exists: a popup says so
+  (version + the release notes) and asks. Only on the user's
+  tap does the app pull the update. Both popups default to No.
+- The pull is verified, never a blind download. The app fetches
+  the release's target commit, fetches that commit's git tree
+  from the GitHub API, downloads the release's source zipball,
+  and checks every extracted file's git blob SHA against the
+  tree. A changed, missing, or extra file — or a truncated
+  tree, or a release with no target commit — installs nothing
+  and says so in plain words.
+- After a successful install, a popup asks: restart now? Yes
+  relaunches the app at once with the update applied. No
+  leaves the running copy alone — the new files are already on
+  disk, so the next launch runs them.
+- The install preserves your stuff: `results/`, `logs/`,
+  `.venv/`, `providers.json`, and `capabilities.json` are never
+  touched; files the new version dropped are removed; stale
+  `__pycache__` folders are cleared so no old bytecode runs.
+  A pull is refused while a run or a model pull is active.
+- Help → Check for updates runs the same check by hand and
+  always answers: the latest version, or why GitHub could not
+  be reached. `OST_NO_UPDATE_CHECK=1` turns the startup check
+  off (offline use, test runs) — it is an escape hatch, not a
+  setting.
+- Known limits: if a future version needs new dependencies the
+  updater cannot install them; the install is file-by-file,
+  not atomic, so a kill mid-install leaves a mixed tree; files
+  removed in a version you skipped linger (the old-tree
+  comparison only covers your current version). All three are
+  recorded in TEST-REPORT.
+
 ## v21 (2026-11-17)
 
 The benchmark grader release: 13 fixes from the live-run

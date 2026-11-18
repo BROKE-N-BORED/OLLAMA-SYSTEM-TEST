@@ -107,6 +107,14 @@ from collections import deque
 from datetime import datetime, timedelta
 
 try:
+    import updates
+except ImportError:
+    # v22: the update check lives in updates.py next to the app.
+    # If it is missing (an old install), the app still opens —
+    # the Help menu check says so and the startup check skips.
+    updates = None
+
+try:
     from PySide6.QtCore import (
         QCoreApplication, QEvent, QPropertyAnimation, QRect, QSettings,
         QSize, Qt, QThread, QTimer, Signal,
@@ -161,7 +169,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "21"
+__version__ = "22"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -353,6 +361,18 @@ results as a spreadsheet file or a web page, wherever you choose.
   answers), so it is safe to send to someone helping you. If the app
   crashes, it writes a crash report to the `logs` folder before it
   closes.
+
+## Keeping the app up to date
+
+When the app opens, it quietly asks GitHub whether a newer version
+is out. If you are on the latest version, nothing happens. If a
+newer version is out, the app asks whether to update: it downloads
+the new version, checks every file against the release before
+installing anything, and then asks whether to restart now. Saying
+no to the restart leaves the app running as it is, and the update
+applies the next time you open it. Help > Check for updates asks
+on demand. Your results, providers, and settings are never touched
+by an update.
 
 ## Shortcuts
 
@@ -6882,6 +6902,85 @@ class TryItWorker(QThread):
         self.answered.emit(True, answer)
 
 
+class UpdateCheckWorker(QThread):
+    """v22: asks GitHub for the latest release, off the GUI thread
+    (Pixel Forge v0.69's UpdateCheckWorker, same shape).
+
+    The check is one HTTP GET with an 8 second timeout — short,
+    but the window must never wait on the network. The result is
+    a plain dict (see updates.check_for_update): "newer",
+    "current", or "unknown" with a plain reason. check_for_update
+    never raises for a network or parsing problem, and the
+    blanket except is belt and braces — a worker must never die
+    silently. There is no cancel: the fetch is one blocking call
+    that cannot be interrupted mid-flight, so a cancel event
+    would only be read at the same moment the thread ends
+    anyway; closeEvent waits for the thread instead (at most the
+    timeout plus a little). Only the dict crosses the thread
+    boundary. manual says whether the user asked for the check —
+    the done slot tells a manual check from the silent startup
+    one by it.
+    """
+
+    done = Signal(dict)  # state, latest, tag, url, commit, notes, manual
+
+    def __init__(self, current_version, manual, parent=None):
+        super().__init__(parent)
+        self.current_version = current_version
+        self.manual = manual
+
+    def run(self):
+        try:
+            result = updates.check_for_update(self.current_version)
+        except Exception as exc:  # noqa: BLE001 - window must stay up
+            result = {"state": "unknown", "latest": None,
+                      "url": None, "tag": None, "commit": None,
+                      "notes": "", "version": None,
+                      "reason": "the update check failed: %s" % exc}
+        result["manual"] = self.manual
+        self.done.emit(result)
+
+
+class UpdatePullWorker(QThread):
+    """v22: pulls an update the user asked for — download, verify
+    against the release's file list, install. Only the verified
+    path runs: a download that does not match the release
+    installs nothing. cancelled stops the download between
+    chunks; once installing starts it runs to the end (local
+    file copies, over fast). Progress and the final result
+    cross the thread boundary as plain dicts."""
+
+    progress = Signal(dict)  # stage, done, total
+    done = Signal(dict)  # ok, version, reason
+
+    def __init__(self, release, current_version, install_dir,
+                 parent=None):
+        super().__init__(parent)
+        self.release = release
+        self.current_version = current_version
+        self.install_dir = install_dir
+        self.cancelled = False
+
+    def run(self):
+        try:
+            result = updates.pull_update(
+                self.release, self.current_version, self.install_dir,
+                progress=lambda stage, done, total: self.progress.emit(
+                    {"stage": stage, "done": done, "total": total}),
+                cancelled=lambda: self.cancelled)
+        except updates.UpdateError as exc:
+            self.done.emit({"ok": False,
+                            "version": self.release.get("version"),
+                            "reason": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001 - window must stay up
+            self.done.emit({"ok": False,
+                            "version": self.release.get("version"),
+                            "reason": "the update failed: %s" % exc})
+            return
+        self.done.emit({"ok": True, "version": result["version"]})
+
+
 class NumericItem(QTableWidgetItem):
     """Table cell that sorts by number, not by text.
 
@@ -8098,6 +8197,18 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.pull_worker = None
         self.starter = None
+        # v22: the silent update check — one worker for the check,
+        # one for the pull, the release the check found, and the
+        # folder an update installs into (the app folder; a test
+        # seam the suite and the GUI drive point at a scratch
+        # folder so a test update never touches the real tree).
+        self._update_check_started = False
+        self._update_check_worker = None
+        self._update_pull_worker = None
+        self._pending_update = None
+        self._update_install_dir = APP_DIR
+        self._check_updates_action = None
+        self._closing = False
         # v17: a run or a pull waiting for Ollama to start — the
         # starter runs it when Ollama answers, or drops it when the
         # start fails. A run is (targets, templates, pairs); a pull
@@ -9074,16 +9185,44 @@ class MainWindow(QMainWindow):
     def _clear_how_to_use_dialog(self):
         self._how_to_use_dialog = None
 
+    def showEvent(self, event):
+        # v22: the silent update check runs once per launch, after
+        # the window is up, so it never blocks startup. Silent:
+        # up to date or unreachable means nothing happens at all —
+        # only a newer release ever produces a popup. The
+        # OST_NO_UPDATE_CHECK escape hatch is for the suite (and
+        # anyone running offline on purpose); it is not a setting.
+        super().showEvent(event)
+        if self._update_check_started:
+            return
+        self._update_check_started = True
+        if updates is None:
+            return
+        if os.environ.get("OST_NO_UPDATE_CHECK"):
+            return
+        self._start_update_check(manual=False)
+
     def closeEvent(self, event):
         # Save the window's size and position so the next launch
         # opens where this one left off.
         settings = QSettings("BrokeNBored", APP_NAME)
         settings.setValue("geometry", self.saveGeometry())
+        # v22: never leave an update worker running past the
+        # window — a QThread destroyed while running aborts Qt.
+        # The pull stops between download chunks; the check is
+        # bounded by its own 8 second timeout.
+        self._closing = True
+        if self._update_pull_worker is not None:
+            self._update_pull_worker.cancelled = True
+            self._update_pull_worker.wait(5000)
+        if self._update_check_worker is not None:
+            self._update_check_worker.wait(10000)
         super().closeEvent(event)
 
     def _build_menu_bar(self):
         """A minimal menu bar: File (Save report, Quit), View (Dark
-        mode), Help (How to Use, About, Debug report)."""
+        mode), Help (How to Use, About, Debug report, Check for
+        updates)."""
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("File")
         self.save_report_action = QAction("Save report", self)
@@ -9113,6 +9252,13 @@ class MainWindow(QMainWindow):
         debug_action = QAction("Debug report", self)
         debug_action.triggered.connect(self.show_debug_report)
         help_menu.addAction(debug_action)
+        # v22: the manual update check — the user asking is an
+        # answer owed, so this one always says what it found.
+        check_updates_action = QAction("Check for updates", self)
+        check_updates_action.triggered.connect(
+            lambda: self._start_update_check(manual=True))
+        help_menu.addAction(check_updates_action)
+        self._check_updates_action = check_updates_action
 
     def _toggle_dark_mode(self, checked):
         """The View menu's Dark mode toggle: restyle the whole window
@@ -9164,6 +9310,186 @@ class MainWindow(QMainWindow):
             "It holds the app's recent log only. No API keys and no "
             "model answers. You can send it to someone helping you.",
         )
+
+    def _start_update_check(self, manual):
+        """v22: ask GitHub for the latest release, off the GUI
+        thread. manual=True means the user asked from the Help
+        menu — that check answers plainly either way. A check
+        already running is left alone."""
+        if updates is None:
+            if manual:
+                QMessageBox.information(
+                    self, "Check for updates",
+                    "This copy cannot check for updates.")
+            return
+        if self._update_check_worker is not None:
+            return
+        if self._check_updates_action is not None:
+            self._check_updates_action.setEnabled(False)
+        worker = UpdateCheckWorker(__version__, manual, parent=self)
+        self._update_check_worker = worker
+        worker.done.connect(self._on_update_check_done)
+        worker.start()
+
+    def _on_update_check_done(self, result):
+        """v22: the check answered. A startup check only speaks
+        when a newer release is out; a manual check always
+        answers. The worker is waited on before the reference is
+        dropped (a QThread destroyed while running aborts)."""
+        worker = self._update_check_worker
+        self._update_check_worker = None
+        if worker is not None:
+            worker.wait()
+        if self._check_updates_action is not None:
+            self._check_updates_action.setEnabled(True)
+        if self._closing:
+            return
+        state = result.get("state")
+        manual = result.get("manual", False)
+        if state == "newer":
+            self._pending_update = result
+            if self._ask_update(result):
+                self._start_update_pull(result)
+            else:
+                self._pending_update = None
+            return
+        if not manual:
+            return
+        if state == "current":
+            QMessageBox.information(
+                self, "Check for updates",
+                f"You are on the latest version (v{__version__}).")
+        else:
+            QMessageBox.information(
+                self, "Check for updates",
+                "Could not check for updates: %s"
+                % result.get("reason", "GitHub did not answer"))
+
+    def _ask_update(self, result):
+        """v22: the update popup. Returns True only when the user
+        taps Update now. Default is Not now — nothing is pulled
+        unless the user asks for it. Kept a method so the suite
+        can answer it without opening a dialog."""
+        notes = result.get("notes") or ""
+        text = f"OLLAMA SYSTEM TEST v{result.get('latest')} is out."
+        if notes:
+            text += f"\n\n{notes}"
+        text += "\n\nUpdate now?"
+        box = QMessageBox(self)
+        box.setWindowTitle("Update available")
+        box.setText(text)
+        update_button = box.addButton(
+            "Update now", QMessageBox.AcceptRole)
+        not_now_button = box.addButton(
+            "Not now", QMessageBox.RejectRole)
+        box.setDefaultButton(not_now_button)
+        box.setEscapeButton(not_now_button)
+        box.exec()
+        return box.clickedButton() is update_button
+
+    def _start_update_pull(self, result):
+        """v22: pull the update the user asked for. Refuses while
+        a run or a pull is active — the install replaces the
+        app's own files, and a running run reads them."""
+        if self.worker is not None or self.pull_worker is not None:
+            QMessageBox.information(
+                self, "Update",
+                "Wait for the run to finish, then check for "
+                "updates again.")
+            return
+        if self._update_pull_worker is not None:
+            return
+        worker = UpdatePullWorker(
+            result, __version__, self._update_install_dir,
+            parent=self)
+        self._update_pull_worker = worker
+        worker.progress.connect(self._on_update_pull_progress)
+        worker.done.connect(self._on_update_pull_done)
+        self.status_label.setText(
+            f"Downloading v{result.get('latest')}...")
+        worker.start()
+
+    def _on_update_pull_progress(self, update):
+        """v22: the pull's progress, on the status line."""
+        stage = update.get("stage")
+        if stage == "downloading":
+            done = update.get("done", 0)
+            total = update.get("total")
+            if total:
+                percent = int(done * 100 / total)
+                self.status_label.setText(
+                    f"Downloading the update... {percent}%")
+            else:
+                self.status_label.setText("Downloading the update...")
+        elif stage == "verifying":
+            self.status_label.setText("Checking the download...")
+        elif stage == "installing":
+            self.status_label.setText("Installing the update...")
+
+    def _on_update_pull_done(self, result):
+        """v22: the pull finished. On success the restart popup
+        asks; Yes relaunches at once, No leaves this copy
+        running and the update applies on the next launch."""
+        worker = self._update_pull_worker
+        self._update_pull_worker = None
+        if worker is not None:
+            worker.wait()
+        if self._closing:
+            return
+        version = result.get("version")
+        if not result.get("ok"):
+            self.status_label.setText("Ready.")
+            QMessageBox.warning(
+                self, "Update",
+                "The update did not install: %s"
+                % result.get("reason", "something went wrong"))
+            return
+        log_event(f"OST updated to v{version}")
+        self.status_label.setText(
+            f"v{version} is ready. Restart to use it.")
+        if self._ask_restart(version):
+            self._restart_after_update()
+        else:
+            self.status_label.setText(
+                f"v{version} is ready. It will apply the next "
+                "time you open the app.")
+
+    def _ask_restart(self, version):
+        """v22: the restart popup. Returns True only when the user
+        taps Restart now. Default is Not now — the update is
+        already on disk, so the next launch runs it either way.
+        Kept a method so the suite can answer it without opening
+        a dialog."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Update installed")
+        box.setText(
+            f"v{version} is installed.\n\n"
+            "Restart now to use it?")
+        restart_button = box.addButton(
+            "Restart now", QMessageBox.AcceptRole)
+        not_now_button = box.addButton(
+            "Not now", QMessageBox.RejectRole)
+        box.setDefaultButton(not_now_button)
+        box.setEscapeButton(not_now_button)
+        box.exec()
+        return box.clickedButton() is restart_button
+
+    def _restart_after_update(self):
+        """v22: relaunch the app with the update applied. The
+        window's geometry is saved and the settings flushed
+        first (exec replaces this process, so closeEvent never
+        runs), and the single-instance server is closed — its
+        listening socket would otherwise make the new copy
+        think another copy is already running."""
+        settings = QSettings("BrokeNBored", APP_NAME)
+        settings.setValue("geometry", self.saveGeometry())
+        settings.sync()
+        if self._instance_server is not None:
+            self._instance_server.close()
+        log_event("OST restarting after update")
+        updates.restart_app(
+            os.path.join(self._update_install_dir,
+                         "ollama_system_test.py"))
 
     def show_settings(self):
         """The Settings window (R18): models folder, Ollama address,

@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v20
+# OLLAMA SYSTEM TEST v22
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,30 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v22 is the update release, no new templates: on launch the app
+silently checks its GitHub repo for a newer Release — up to date
+or unreachable, nothing happens; a newer Release exists, a popup
+says so and asks, and only on your tap does the app pull it. The
+pull is verified: every downloaded file is checked against the
+release's own git tree, and a tampered or incomplete download
+installs nothing. After the install a popup asks whether to
+restart now — Yes relaunches at once with the update, No leaves
+the running copy alone and the update takes effect next launch.
+Your results, logs, providers, and settings are never touched,
+and Help → Check for updates runs the same check by hand.
+
+v21 is the benchmark grader release, no new templates: 13 fixes
+from the live-run findings, where 55 of 73 recorded "failures"
+across 5 finished models turned out to be grader and harness
+artifacts, not model failures — every recorded failure is now a
+real model failure and every recorded pass a real pass. Planning
+grades step coverage with partial credit; an empty answer after
+the model generated tokens is retried, then recorded not-run;
+infrastructure errors are not-run, never scored 0; timeouts
+adapt to the slowest first reply this run; and refusal grows
+from 5 tasks to 10, so the full run is 113 prompts / 100 scored
+tasks (was 108 / 95).
 
 v20 fixes two text-size defects found during v19 verification, no new
 templates: bigger text now actually re-sizes the text in the open

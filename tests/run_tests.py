@@ -1,17 +1,16 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v21 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v22 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1556 v20 checks are carried over; the v21
-checks cover the 13 benchmark grader fixes: planning step coverage
-with paraphrase alternates and partial credit, capture-failure
-retry/not-run on empty-with-tokens, infrastructure errors as
-not-run with errored run files, the empty-answer-never-passes
-guard, the adaptive first-reply timeout (300 s floor, 3x the
-slowest first reply seen), the layered final-answer number
-picker, Unicode NFKC + dash folding, JSON tool calls in reply
-text, fenced JSON in structured output, the role and rhyme
-rules, contains-all alternates, the two-direction refusal
-template (5 benign + 5 harmful), and the machine load recorded
-beside the speed.
+answers per model. All 1651 v21 checks are carried over; the v22
+checks cover the silent update check and the verified pull: version
+parsing and comparison, the three check outcomes (newer, current,
+unknown) with stubbed network, the file-list fetch and blob
+checksums, download/extract/verify against a local fake GitHub
+server, install into a fake v22 folder (user data preserved, dropped
+files removed, stale bytecode gone), the restart command and a real
+execv, and the window flow — silent startup check, manual check,
+declined update downloads nothing, accepted update with restart
+declined leaves the old copy running while a fresh launch runs the
+new version, and restart Yes relaunches.
 1651 checks in total, all green (run 4).
 
 The suite lives in the repo under tests/ and locates the app relative
@@ -51,6 +50,7 @@ import sys
 import threading
 import time
 import wave
+import zipfile
 
 # The suite lives in tests/ inside the repo; the app is at the repo
 # root, the parent of this folder. No hardcoded tree name.
@@ -69,6 +69,12 @@ os.environ["OST_RESULTS_DIR"] = RESULTS_DIR
 os.environ["OST_PROVIDERS_FILE"] = PROVIDERS_FILE
 os.environ["OST_CAPABILITIES_FILE"] = CAPABILITIES_FILE
 os.environ["OST_LOGS_DIR"] = LOGS_DIR
+# v22: the silent update check never runs in the suite — every
+# window the suite shows would otherwise ask GitHub, and a newer
+# release on the real repo would pop a dialog into the run. The
+# v22 section unsets this for its own checks, with the network
+# stubbed or pointed at the fake GitHub server, and restores it.
+os.environ["OST_NO_UPDATE_CHECK"] = "1"
 # v17: the RAM check reads MemAvailable through this override, so the
 # suite is not at the mercy of the sandbox's free RAM (which can sit
 # under a gigabyte — every fake model would be skipped). 16 GB free
@@ -84,6 +90,8 @@ sys.path.insert(0, VERIFY_DIR)
 
 import ollama_system_test as app
 import fake_ollama
+import fake_github
+import updates as updates_module
 
 PASS = 0
 FAIL = 0
@@ -3554,7 +3562,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 21", app.__version__ == "21",
+    check("__version__ is 22", app.__version__ == "22",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3568,8 +3576,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v21",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v21",
+    check("title bar shows OLLAMA SYSTEM TEST v22",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v22",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -3622,9 +3630,11 @@ def main():
           file_items == ["Save report", "Settings", "Quit"],
           str(file_items))
     help_menu7 = bar7.actions()[2].menu()
-    check("Help menu has How to Use, About and Debug report",
+    check("Help menu has How to Use, About, Debug report and "
+          "Check for updates (v22)",
           [a.text() for a in help_menu7.actions()]
-          == ["How to Use", "About", "Debug report"],
+          == ["How to Use", "About", "Debug report",
+              "Check for updates"],
           str([a.text() for a in help_menu7.actions()]))
     check("About shows __version__",
           f"v{app.__version__}" in window7.about_text(),
@@ -4988,10 +4998,10 @@ def main():
               and window9.template_list.count() == 19,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v21",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v21",
+        check("title bar shows v22",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v22",
               window9.windowTitle())
-        check("__version__ is 21", app.__version__ == "21", app.__version__)
+        check("__version__ is 22", app.__version__ == "22", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -10199,6 +10209,789 @@ def main():
             os.environ.pop("OLLAMA_HOST", None)
         else:
             os.environ["OLLAMA_HOST"] = prior_host21
+
+    # ---------- v22: silent update check + verified pull ----------
+    import urllib.error as _url_error
+
+    class _StubResponse:
+        """A canned urlopen answer: bytes + headers, usable as a
+        context manager like a real response."""
+        def __init__(self, data, headers=None):
+            self._data = io.BytesIO(data)
+            self.headers = headers or {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size=-1):
+            return self._data.read(size)
+
+    def _stub_urlopen(payload):
+        """A urlopen stub answering every URL with one JSON payload."""
+        def _open(url, timeout=None):
+            return _StubResponse(
+                json.dumps(payload).encode("utf-8"))
+        return _open
+
+    def _release_payload(tag="v23", commit="b" * 40,
+                         body="Fake v23 notes.\n\nMore words."):
+        payload = {
+            "tag_name": tag,
+            "html_url": ("https://github.com/BROKE-N-BORED/"
+                         "OLLAMA-SYSTEM-TEST/releases/tag/" + tag),
+            "body": body,
+        }
+        if commit is not None:
+            payload["target_commitish"] = commit
+        return payload
+
+    def _close_window22(window):
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+    # --- version parsing ---
+    check("parse_version v22", updates_module.parse_version("v22") == (22,))
+    check("parse_version 22", updates_module.parse_version("22") == (22,))
+    check("parse_version v0.69",
+          updates_module.parse_version("v0.69") == (0, 69))
+    check("parse_version rejects v22-beta",
+          updates_module.parse_version("v22-beta") is None)
+    check("parse_version rejects empty",
+          updates_module.parse_version("") is None)
+    check("parse_version rejects None",
+          updates_module.parse_version(None) is None)
+    check("is_newer 23 over 22",
+          updates_module.is_newer("23", "22") is True)
+    check("is_newer 22 over 22 is False",
+          updates_module.is_newer("22", "22") is False)
+    check("is_newer 21 over 22 is False",
+          updates_module.is_newer("21", "22") is False)
+    check("is_newer v23 over 22",
+          updates_module.is_newer("v23", "22") is True)
+    check("is_newer bogus is False",
+          updates_module.is_newer("bogus", "22") is False)
+
+    # --- the check, stubbed ---
+    newer22 = updates_module.check_for_update(
+        "22", urlopen=_stub_urlopen(_release_payload()))
+    check("check newer state", newer22["state"] == "newer",
+          str(newer22))
+    check("check newer latest", newer22["latest"] == "23")
+    check("check newer commit", newer22["commit"] == "b" * 40)
+    check("check newer notes first line",
+          newer22["notes"] == "Fake v23 notes.", newer22["notes"])
+    current22 = updates_module.check_for_update(
+        "22", urlopen=_stub_urlopen(_release_payload(tag="v22")))
+    check("check current state", current22["state"] == "current",
+          str(current22))
+    dev22 = updates_module.check_for_update(
+        "23", urlopen=_stub_urlopen(_release_payload(tag="v22")))
+    check("dev tree newer than latest is current",
+          dev22["state"] == "current", str(dev22))
+
+    def _raising_urlopen(url, timeout=None):
+        raise _url_error.URLError("no network here")
+
+    unknown22 = updates_module.check_for_update(
+        "22", urlopen=_raising_urlopen)
+    check("check network failure is unknown",
+          unknown22["state"] == "unknown", str(unknown22))
+    check("check unknown carries a reason",
+          bool(unknown22.get("reason")), str(unknown22))
+
+    def _bad_json_urlopen(url, timeout=None):
+        return _StubResponse(b"not json at all")
+
+    check("check bad JSON is unknown",
+          updates_module.check_for_update(
+              "22", urlopen=_bad_json_urlopen)["state"] == "unknown")
+    check("check missing tag is unknown",
+          updates_module.check_for_update(
+              "22", urlopen=_stub_urlopen({}))["state"] == "unknown")
+    check("check unparsable tag is unknown",
+          updates_module.check_for_update(
+              "22", urlopen=_stub_urlopen(
+                  _release_payload(tag="release-23")))["state"]
+          == "unknown")
+
+    # --- the file list ---
+    tree22 = updates_module.fetch_tree(
+        "b" * 40,
+        urlopen=_stub_urlopen(fake_github.build_tree(
+            fake_github.FAKE_V23_FILES)))
+    check("fetch_tree lists the files",
+          set(tree22) == set(fake_github.FAKE_V23_FILES),
+          str(sorted(tree22)))
+    check("fetch_tree checksum matches the server's",
+          tree22["README.md"][0]
+          == fake_github.git_blob_sha(b"v23 readme\n"))
+    check("fetch_tree keeps the executable mode",
+          tree22["run.sh"][1] == "100755", str(tree22["run.sh"]))
+    try:
+        updates_module.fetch_tree(
+            "b" * 40,
+            urlopen=_stub_urlopen({"tree": [], "truncated": True}))
+        check("fetch_tree truncated refuses", False, "no error raised")
+    except updates_module.UpdateError:
+        check("fetch_tree truncated refuses", True)
+
+    # --- blob checksums ---
+    check("git_blob_sha matches hashlib",
+          updates_module.git_blob_sha(b"hello\n")
+          == hashlib.sha1(b"blob 6\0hello\n").hexdigest())
+
+    # --- download, extract, verify (unit) ---
+    scratch22 = os.path.join(VERIFY_DIR, "_v22_scratch")
+    shutil.rmtree(scratch22, ignore_errors=True)
+    os.makedirs(scratch22)
+    try:
+        zip_bytes22 = fake_github.build_zipball(
+            fake_github.FAKE_V23_FILES, fake_github.V23_COMMIT)
+        progress22 = []
+
+        def _download_stub(url, timeout=None):
+            return _StubResponse(
+                zip_bytes22,
+                {"Content-Length": str(len(zip_bytes22))})
+
+        archive22 = os.path.join(scratch22, "update.zip")
+        updates_module.download_archive(
+            "v23", archive22, urlopen=_download_stub,
+            progress=lambda done, total: progress22.append(
+                (done, total)))
+        check("download writes the archive",
+              os.path.getsize(archive22) == len(zip_bytes22))
+        check("download reports progress",
+              progress22 and progress22[-1][0] == len(zip_bytes22),
+              str(progress22[-1:]))
+
+        def _cancelled22():
+            return True
+
+        try:
+            updates_module.download_archive(
+                "v23", os.path.join(scratch22, "cancelled.zip"),
+                urlopen=_download_stub, cancelled=_cancelled22)
+            check("cancelled download refuses", False, "no error raised")
+        except updates_module.UpdateError:
+            check("cancelled download refuses", True)
+        check("cancelled download leaves no file",
+              not os.path.exists(
+                  os.path.join(scratch22, "cancelled.zip")))
+
+        root22 = updates_module.extract_archive(
+            archive22, os.path.join(scratch22, "extracted"))
+        check("extract finds the top folder",
+              os.path.basename(root22).startswith(
+                  "BROKE-N-BORED-OLLAMA-SYSTEM-TEST-"),
+              root22)
+        check("extract holds the files",
+              os.path.isfile(
+                  os.path.join(root22, "ollama_system_test.py")))
+        bad_zip22 = os.path.join(scratch22, "bad.zip")
+        with open(bad_zip22, "wb") as handle:
+            handle.write(b"this is not a zip")
+        try:
+            updates_module.extract_archive(
+                bad_zip22, os.path.join(scratch22, "bad-out"))
+            check("bad zip refuses", False, "no error raised")
+        except updates_module.UpdateError:
+            check("bad zip refuses", True)
+        two_top22 = os.path.join(scratch22, "two-top.zip")
+        with zipfile.ZipFile(two_top22, "w") as zf:
+            zf.writestr("one/a.txt", b"a")
+            zf.writestr("two/b.txt", b"b")
+        try:
+            updates_module.extract_archive(
+                two_top22, os.path.join(scratch22, "two-out"))
+            check("two top folders refuse", False, "no error raised")
+        except updates_module.UpdateError:
+            check("two top folders refuse", True)
+
+        check("verify clean tree is empty",
+              updates_module.verify_extracted(root22, tree22) == [],
+              str(updates_module.verify_extracted(root22, tree22)))
+        with open(os.path.join(root22, "README.md"),
+                  "wb") as handle:
+            handle.write(b"tampered readme\n")
+        problems22 = updates_module.verify_extracted(root22, tree22)
+        check("verify names the changed file",
+              len(problems22) == 1 and "README.md" in problems22[0],
+              str(problems22))
+        with open(os.path.join(root22, "README.md"),
+                  "wb") as handle:
+            handle.write(b"v23 readme\n")
+        os.remove(os.path.join(root22, "new_file.txt"))
+        problems22 = updates_module.verify_extracted(root22, tree22)
+        check("verify names the missing file",
+              len(problems22) == 1 and "new_file.txt" in problems22[0],
+              str(problems22))
+        with open(os.path.join(root22, "new_file.txt"),
+                  "wb") as handle:
+            handle.write(b"new in v23\n")
+        with open(os.path.join(root22, "extra.txt"),
+                  "wb") as handle:
+            handle.write(b"not in the release\n")
+        problems22 = updates_module.verify_extracted(root22, tree22)
+        check("verify names the extra file",
+              len(problems22) == 1 and "extra.txt" in problems22[0],
+              str(problems22))
+        os.remove(os.path.join(root22, "extra.txt"))
+
+        # --- install into a fake v22 folder ---
+        def _build_install22(name):
+            folder = os.path.join(scratch22, name)
+            os.makedirs(os.path.join(folder, "results"), exist_ok=True)
+            os.makedirs(os.path.join(folder, "logs"), exist_ok=True)
+            os.makedirs(os.path.join(folder, ".venv", "bin"),
+                        exist_ok=True)
+            os.makedirs(os.path.join(folder, "__pycache__"),
+                        exist_ok=True)
+            for rel, data in fake_github.FAKE_V22_FILES.items():
+                path = os.path.join(folder, *rel.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(data)
+            with open(os.path.join(folder, "results", "keep.txt"),
+                      "w", encoding="utf-8") as handle:
+                handle.write("my results")
+            with open(os.path.join(folder, "logs", "keep.txt"),
+                      "w", encoding="utf-8") as handle:
+                handle.write("my logs")
+            with open(os.path.join(folder, ".venv", "bin", "python"),
+                      "w", encoding="utf-8") as handle:
+                handle.write("fake venv python")
+            with open(os.path.join(folder, "providers.json"),
+                      "w", encoding="utf-8") as handle:
+                handle.write('{"name": "mine"}')
+            with open(os.path.join(folder, "capabilities.json"),
+                      "w", encoding="utf-8") as handle:
+                handle.write('{"screened": true}')
+            with open(os.path.join(folder, "user_notes.txt"),
+                      "w", encoding="utf-8") as handle:
+                handle.write("my own file")
+            with open(os.path.join(folder, "__pycache__",
+                                   "stale.pyc"),
+                      "wb") as handle:
+                handle.write(b"stale bytecode")
+            return folder
+
+        install22 = _build_install22("install")
+        old_tree22 = fake_github.build_tree(fake_github.FAKE_V22_FILES)
+        old_tree22 = {
+            entry["path"]: (entry["sha"], entry["mode"])
+            for entry in old_tree22["tree"]
+        }
+        installed22 = updates_module.install_update(
+            root22, tree22, old_tree22, install22)
+        check("install lands the new app file",
+              open(os.path.join(install22, "ollama_system_test.py"),
+                   encoding="utf-8").read().find('"23"') >= 0)
+        check("install lands the new file",
+              os.path.isfile(os.path.join(install22, "new_file.txt")))
+        check("install removes the dropped file",
+              not os.path.exists(os.path.join(install22, "old_file.txt")))
+        check("install keeps results",
+              open(os.path.join(install22, "results", "keep.txt"),
+                   encoding="utf-8").read() == "my results")
+        check("install keeps logs",
+              open(os.path.join(install22, "logs", "keep.txt"),
+                   encoding="utf-8").read() == "my logs")
+        check("install keeps the venv",
+              os.path.isfile(os.path.join(
+                  install22, ".venv", "bin", "python")))
+        check("install keeps providers.json",
+              open(os.path.join(install22, "providers.json"),
+                   encoding="utf-8").read() == '{"name": "mine"}')
+        check("install keeps capabilities.json",
+              os.path.isfile(
+                  os.path.join(install22, "capabilities.json")))
+        check("install keeps a user file",
+              open(os.path.join(install22, "user_notes.txt"),
+                   encoding="utf-8").read() == "my own file")
+        check("install drops stale bytecode",
+              not os.path.exists(
+                  os.path.join(install22, "__pycache__")))
+        check("install restores the executable bit",
+              os.stat(os.path.join(install22, "run.sh")).st_mode
+              & 0o111 != 0)
+        check("install reports the installed files",
+              set(installed22) == set(fake_github.FAKE_V23_FILES),
+              str(installed22))
+        empty22 = os.path.join(scratch22, "empty")
+        os.makedirs(empty22)
+        try:
+            updates_module.install_update(
+                root22, tree22, old_tree22, empty22)
+            check("install refuses a non-app folder", False,
+                  "no error raised")
+        except updates_module.UpdateError:
+            check("install refuses a non-app folder", True)
+
+        # --- restart ---
+        check("restart command is this python + the app file",
+              updates_module.restart_command(
+                  "/tmp/app/ollama_system_test.py",
+                  ["ollama_system_test.py"])
+              == [sys.executable, "/tmp/app/ollama_system_test.py"])
+        check("restart command keeps launch arguments",
+              updates_module.restart_command(
+                  "/tmp/app/ollama_system_test.py",
+                  ["ollama_system_test.py", "--headless"])
+              == [sys.executable, "/tmp/app/ollama_system_test.py",
+                  "--headless"])
+        exec_calls22 = []
+
+        def _fake_execv(path, args):
+            exec_calls22.append((path, args))
+
+        updates_module.restart_app(
+            "/tmp/app/ollama_system_test.py",
+            argv=["ollama_system_test.py"], _execv=_fake_execv)
+        check("restart_app execs the app",
+              exec_calls22 == [(
+                  sys.executable,
+                  [sys.executable,
+                   "/tmp/app/ollama_system_test.py"])],
+              str(exec_calls22))
+        marker22 = os.path.join(scratch22, "restarted.txt")
+        marker_script22 = os.path.join(scratch22, "marker_app.py")
+        with open(marker_script22, "w", encoding="utf-8") as handle:
+            handle.write(
+                "open(%r, 'w').write('restarted')\n" % marker22)
+        restart_probe22 = os.path.join(scratch22, "restart_probe.py")
+        with open(restart_probe22, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import sys\n"
+                "sys.path.insert(0, %r)\n"
+                "import updates\n"
+                "updates.restart_app(%r, argv=['probe'])\n"
+                % (PKG_DIR, marker_script22))
+        probe22 = subprocess.run(
+            [sys.executable, restart_probe22],
+            capture_output=True, text=True, timeout=60)
+        check("a real restart runs the new process",
+              probe22.returncode == 0
+              and os.path.isfile(marker22)
+              and open(marker22, encoding="utf-8").read()
+              == "restarted",
+              "rc=%s err=%s" % (probe22.returncode, probe22.stderr))
+
+        # --- the full pull against the fake server ---
+        real_api22 = updates_module.API_BASE
+        real_codeload22 = updates_module.CODELOAD_BASE
+        try:
+            server22, port22 = fake_github.start_fake_github(
+                latest_tag="v23")
+            base22 = "http://127.0.0.1:%d" % port22
+            updates_module.API_BASE = base22
+            updates_module.CODELOAD_BASE = base22
+            try:
+                live22 = updates_module.check_for_update("22")
+                check("live check against the fake server is newer",
+                      live22["state"] == "newer", str(live22))
+                install_live22 = _build_install22("install-live")
+                pulled22 = updates_module.pull_update(
+                    live22, "22", install_live22)
+                check("live pull reports v23",
+                      pulled22.get("version") == "23", str(pulled22))
+                check("live pull installs the new app file",
+                      open(os.path.join(
+                          install_live22, "ollama_system_test.py"),
+                          encoding="utf-8").read().find('"23"') >= 0)
+                check("live pull keeps results",
+                      open(os.path.join(
+                          install_live22, "results", "keep.txt"),
+                          encoding="utf-8").read() == "my results")
+                check("live pull removes the dropped file",
+                      not os.path.exists(os.path.join(
+                          install_live22, "old_file.txt")))
+                check("live pull fetched the file list",
+                      any("/git/trees/" in path
+                          for path in server22.requests),
+                      str(server22.requests))
+            finally:
+                server22.shutdown()
+                server22.server_close()
+
+            server22t, port22t = fake_github.start_fake_github(
+                latest_tag="v23", tamper=True)
+            base22t = "http://127.0.0.1:%d" % port22t
+            updates_module.API_BASE = base22t
+            updates_module.CODELOAD_BASE = base22t
+            try:
+                live22t = updates_module.check_for_update("22")
+                install_tamper22 = _build_install22("install-tamper")
+                before22t = {}
+                for dirpath, _d, names in os.walk(install_tamper22):
+                    for name in names:
+                        path = os.path.join(dirpath, name)
+                        with open(path, "rb") as handle:
+                            before22t[os.path.relpath(
+                                path, install_tamper22)] = handle.read()
+                try:
+                    updates_module.pull_update(
+                        live22t, "22", install_tamper22)
+                    check("tampered download refuses", False,
+                          "no error raised")
+                except updates_module.UpdateError as exc:
+                    check("tampered download refuses", True)
+                    check("tampered download names the file",
+                          "README.md" in str(exc), str(exc))
+                after22t = {}
+                for dirpath, _d, names in os.walk(install_tamper22):
+                    for name in names:
+                        path = os.path.join(dirpath, name)
+                        with open(path, "rb") as handle:
+                            after22t[os.path.relpath(
+                                path, install_tamper22)] = handle.read()
+                check("tampered download installs nothing",
+                      before22t == after22t)
+            finally:
+                server22t.shutdown()
+                server22t.server_close()
+
+            server22c, port22c = fake_github.start_fake_github(
+                latest_tag="v23", no_commit=True)
+            base22c = "http://127.0.0.1:%d" % port22c
+            updates_module.API_BASE = base22c
+            updates_module.CODELOAD_BASE = base22c
+            try:
+                live22c = updates_module.check_for_update("22")
+                check("no-commit release still checks as newer",
+                      live22c["state"] == "newer"
+                      and live22c.get("commit") is None, str(live22c))
+                install_nocommit22 = _build_install22("install-nocommit")
+                try:
+                    updates_module.pull_update(
+                        live22c, "22", install_nocommit22)
+                    check("no-commit pull refuses", False,
+                          "no error raised")
+                except updates_module.UpdateError:
+                    check("no-commit pull refuses", True)
+                check("no-commit pull downloads nothing",
+                      not any("/zipball/" in path
+                              for path in server22c.requests),
+                      str(server22c.requests))
+            finally:
+                server22c.shutdown()
+                server22c.server_close()
+        finally:
+            updates_module.API_BASE = real_api22
+            updates_module.CODELOAD_BASE = real_codeload22
+    finally:
+        shutil.rmtree(scratch22, ignore_errors=True)
+
+    # --- the window: startup check, manual check, both popups ---
+    from PySide6.QtWidgets import QApplication as _QApplication22
+    scratch22w = os.path.join(VERIFY_DIR, "_v22w_scratch")
+    shutil.rmtree(scratch22w, ignore_errors=True)
+    os.makedirs(scratch22w)
+    real_check22 = updates_module.check_for_update
+    real_pull22 = updates_module.pull_update
+    real_restart22 = updates_module.restart_app
+    real_info22 = QMessageBox.information
+    try:
+        # The escape hatch holds everywhere else in the suite: a
+        # window shown with it set starts no check at all.
+        window22a = app.MainWindow()
+        check("Help menu has Check for updates",
+              window22a._check_updates_action is not None
+              and window22a._check_updates_action.text()
+              == "Check for updates")
+        window22a.show()
+        qt_app.processEvents()
+        check("escape hatch starts no check",
+              window22a._update_check_worker is None)
+        _close_window22(window22a)
+
+        # Startup check, current: silent, no popup offered.
+        os.environ.pop("OST_NO_UPDATE_CHECK", None)
+        try:
+            asked22 = []
+
+            def _check_current22(version, urlopen=None):
+                return {"state": "current", "latest": "22",
+                        "tag": "v22", "url": "https://example.invalid",
+                        "commit": "a" * 40, "notes": ""}
+
+            updates_module.check_for_update = _check_current22
+            window22b = app.MainWindow()
+            window22b._ask_update = lambda result: asked22.append(
+                result) or False
+            window22b.show()
+            done22b = wait_until(
+                lambda: window22b._update_check_worker is None,
+                timeout=15)
+            check("startup check current finishes", done22b)
+            check("startup check current asks nothing",
+                  asked22 == [], str(asked22))
+            check("startup check current shows no popup",
+                  _QApplication22.activeModalWidget() is None)
+            _close_window22(window22b)
+
+            # Startup check, unknown: silent too.
+            def _check_unknown22(version, urlopen=None):
+                return {"state": "unknown", "latest": None,
+                        "url": None, "tag": None, "commit": None,
+                        "notes": "", "reason": "no network here"}
+
+            updates_module.check_for_update = _check_unknown22
+            window22c = app.MainWindow()
+            window22c._ask_update = lambda result: asked22.append(
+                result) or False
+            window22c.show()
+            done22c = wait_until(
+                lambda: window22c._update_check_worker is None,
+                timeout=15)
+            check("startup check unknown finishes", done22c)
+            check("startup check unknown asks nothing",
+                  asked22 == [], str(asked22))
+            _close_window22(window22c)
+
+            # Startup check, newer + decline: asked once, no pull.
+            def _check_newer22(version, urlopen=None):
+                return {"state": "newer", "latest": "23",
+                        "tag": "v23",
+                        "url": "https://example.invalid",
+                        "commit": "b" * 40,
+                        "notes": "Fake v23 notes.",
+                        "version": "23"}
+
+            updates_module.check_for_update = _check_newer22
+            window22d = app.MainWindow()
+            window22d._ask_update = lambda result: asked22.append(
+                result) or False
+            window22d.show()
+            done22d = wait_until(
+                lambda: window22d._update_check_worker is None,
+                timeout=15)
+            check("startup check newer finishes", done22d)
+            check("startup check newer asks once",
+                  len(asked22) == 1
+                  and asked22[0].get("latest") == "23",
+                  str(asked22))
+            check("declined update starts no pull",
+                  window22d._update_pull_worker is None)
+            _close_window22(window22d)
+
+            # Newer + accept + restart No: the pull runs, the
+            # restart is declined, the old copy keeps running.
+            pulled22w = []
+
+            def _pull_stub22(release, current, install_dir,
+                             urlopen=None, progress=None,
+                             cancelled=None):
+                pulled22w.append((release.get("version"),
+                                  install_dir))
+                return {"version": "23"}
+
+            updates_module.pull_update = _pull_stub22
+            restart_calls22 = []
+            updates_module.restart_app = (
+                lambda path, argv=None, _execv=None: restart_calls22
+                .append(path))
+            window22e = app.MainWindow()
+            window22e._ask_update = lambda result: True
+            window22e._ask_restart = lambda version: False
+            window22e.show()
+            done22e = wait_until(
+                lambda: window22e._update_pull_worker is None
+                and window22e._update_check_worker is None,
+                timeout=30)
+            check("accepted update pull finishes", done22e)
+            check("accepted update pulls v23",
+                  pulled22w
+                  and pulled22w[0][0] == "23", str(pulled22w))
+            check("restart declined restarts nothing",
+                  restart_calls22 == [], str(restart_calls22))
+            check("restart declined says next launch",
+                  "next time you open the app"
+                  in window22e.status_label.text(),
+                  window22e.status_label.text())
+            _close_window22(window22e)
+
+            # Newer + accept + restart Yes: the app relaunches.
+            pulled22w.clear()
+            window22f = app.MainWindow()
+            window22f._ask_update = lambda result: True
+            window22f._ask_restart = lambda version: True
+            window22f.show()
+            done22f = wait_until(
+                lambda: window22f._update_pull_worker is None
+                and window22f._update_check_worker is None,
+                timeout=30)
+            check("restart-yes pull finishes", done22f)
+            check("restart Yes relaunches the app",
+                  len(restart_calls22) == 1
+                  and restart_calls22[0].endswith(
+                      "ollama_system_test.py"),
+                  str(restart_calls22))
+            _close_window22(window22f)
+            updates_module.pull_update = real_pull22
+            updates_module.restart_app = real_restart22
+
+            # Manual check, current: an answer is owed.
+            info22 = []
+            QMessageBox.information = (
+                lambda *args, **kwargs: info22.append(args))
+            updates_module.check_for_update = _check_current22
+            window22g = app.MainWindow()
+            window22g.show()
+            # The startup check is still running when show()
+            # returns, and a second check while one runs is left
+            # alone — wait for it before asking by hand.
+            wait_until(
+                lambda: window22g._update_check_worker is None,
+                timeout=15)
+            window22g._check_updates_action.trigger()
+            done22g = wait_until(
+                lambda: window22g._update_check_worker is None,
+                timeout=15)
+            check("manual check current finishes", done22g)
+            check("manual check current says latest",
+                  info22 and "latest version" in str(info22[-1]),
+                  str(info22))
+            _close_window22(window22g)
+
+            # Manual check, unknown: the reason, plainly.
+            info22.clear()
+            updates_module.check_for_update = _check_unknown22
+            window22h = app.MainWindow()
+            window22h.show()
+            wait_until(
+                lambda: window22h._update_check_worker is None,
+                timeout=15)
+            window22h._check_updates_action.trigger()
+            done22h = wait_until(
+                lambda: window22h._update_check_worker is None,
+                timeout=15)
+            check("manual check unknown finishes", done22h)
+            check("manual check unknown gives the reason",
+                  info22 and "no network here" in str(info22[-1]),
+                  str(info22))
+            _close_window22(window22h)
+            QMessageBox.information = real_info22
+
+            # A pull refuses while a run is active.
+            info22.clear()
+            QMessageBox.information = (
+                lambda *args, **kwargs: info22.append(args))
+            updates_module.check_for_update = _check_newer22
+            window22i = app.MainWindow()
+            window22i.worker = object()
+            window22i._start_update_pull({
+                "state": "newer", "latest": "23", "tag": "v23",
+                "url": "https://example.invalid",
+                "commit": "b" * 40, "notes": ""})
+            check("pull refused during a run",
+                  window22i._update_pull_worker is None)
+            check("pull refusal says to wait",
+                  info22 and "Wait for the run" in str(info22[-1]),
+                  str(info22))
+            window22i.worker = None
+            _close_window22(window22i)
+            QMessageBox.information = real_info22
+        finally:
+            os.environ["OST_NO_UPDATE_CHECK"] = "1"
+            updates_module.check_for_update = real_check22
+            updates_module.pull_update = real_pull22
+            updates_module.restart_app = real_restart22
+            QMessageBox.information = real_info22
+
+        # Declined update downloads nothing, against the real
+        # fake server: the check runs, the popup is declined,
+        # and no archive request ever arrives.
+        real_api22w = updates_module.API_BASE
+        real_codeload22w = updates_module.CODELOAD_BASE
+        server22w, port22w = fake_github.start_fake_github(
+            latest_tag="v23")
+        base22w = "http://127.0.0.1:%d" % port22w
+        updates_module.API_BASE = base22w
+        updates_module.CODELOAD_BASE = base22w
+        os.environ.pop("OST_NO_UPDATE_CHECK", None)
+        try:
+            asked22w = []
+            window22j = app.MainWindow()
+            window22j._ask_update = lambda result: asked22w.append(
+                result) or False
+            window22j.show()
+            done22j = wait_until(
+                lambda: window22j._update_check_worker is None,
+                timeout=15)
+            check("live declined check finishes", done22j)
+            check("live declined update is asked",
+                  len(asked22w) == 1
+                  and asked22w[0].get("latest") == "23",
+                  str(asked22w))
+            check("live declined update downloads nothing",
+                  not any("/zipball/" in path
+                          for path in server22w.requests),
+                  str(server22w.requests))
+            _close_window22(window22j)
+
+            # Accepted update, restart No, against the fake
+            # server: the new files land on disk, the running
+            # copy stays the old version, and a fresh launch
+            # runs the new one.
+            install22w = os.path.join(scratch22w, "install")
+            os.makedirs(os.path.join(install22w, "results"),
+                        exist_ok=True)
+            for rel, data in fake_github.FAKE_V22_FILES.items():
+                path = os.path.join(install22w, *rel.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(data)
+            with open(os.path.join(install22w, "results", "keep.txt"),
+                      "w", encoding="utf-8") as handle:
+                handle.write("my results")
+            window22k = app.MainWindow()
+            window22k._update_install_dir = install22w
+            window22k._ask_update = lambda result: True
+            window22k._ask_restart = lambda version: False
+            window22k.show()
+            done22k = wait_until(
+                lambda: window22k._update_pull_worker is None
+                and window22k._update_check_worker is None,
+                timeout=30)
+            check("live accepted pull finishes", done22k)
+            check("live pull installs v23 on disk",
+                  open(os.path.join(
+                      install22w, "ollama_system_test.py"),
+                      encoding="utf-8").read().find('"23"') >= 0)
+            check("live pull keeps results",
+                  open(os.path.join(
+                      install22w, "results", "keep.txt"),
+                      encoding="utf-8").read() == "my results")
+            check("running copy still says v22",
+                  window22k.windowTitle().endswith("v22"),
+                  window22k.windowTitle())
+            fresh22 = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; sys.path.insert(0, %r); "
+                 "import ollama_system_test; "
+                 "print(ollama_system_test.__version__)"
+                 % install22w],
+                capture_output=True, text=True, timeout=60)
+            check("a fresh launch runs v23",
+                  fresh22.returncode == 0
+                  and fresh22.stdout.strip() == "23",
+                  "rc=%s out=%r err=%s" % (
+                      fresh22.returncode, fresh22.stdout,
+                      fresh22.stderr))
+            _close_window22(window22k)
+        finally:
+            os.environ["OST_NO_UPDATE_CHECK"] = "1"
+            updates_module.API_BASE = real_api22w
+            updates_module.CODELOAD_BASE = real_codeload22w
+            server22w.shutdown()
+            server22w.server_close()
+    finally:
+        shutil.rmtree(scratch22w, ignore_errors=True)
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview

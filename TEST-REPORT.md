@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v21
+# TEST-REPORT — OLLAMA SYSTEM TEST v22
 
 Verified 2026-11-17 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)
 under the Qt test env from AGENTS.md: QT_QPA_PLATFORM=offscreen,
@@ -8,6 +8,118 @@ HOME breaks Qt plugin init). Plain widgets only, no OpenGL. The
 geometry round-trip ran under Xvfb instead (see the v7 report §2 —
 offscreen's 800x800 screen is smaller than the window's minimum
 width).
+
+v22 is the update release: on launch the app silently checks its
+GitHub repo for a newer Release; up to date or unreachable, nothing
+happens; a newer Release exists, a popup says so and asks, and only
+on the user's tap does the app pull it. The pull is verified: the
+app fetches the release's target commit and that commit's git tree
+from the GitHub API, downloads the release's source zipball, and
+checks every extracted file's git blob SHA against the tree — a
+changed, missing, or extra file installs nothing. After a
+successful install a popup asks whether to restart now: Yes
+relaunches at once with the update applied, No leaves the running
+copy alone and the update takes effect next launch (the new files
+are already on disk). Both popups default to No. No new templates;
+no new dependencies — the new updates.py module is stdlib-only
+and Qt-free, in the shape of Pixel Forge v0.69's updater, which
+is the model for the check half. The install preserves results/,
+logs/, .venv/, providers.json, and capabilities.json, removes
+files the new version dropped, and clears stale __pycache__
+folders; a pull is refused while a run or a model pull is
+active. Help → Check for updates runs the same check by hand
+and always answers. OST_NO_UPDATE_CHECK=1 turns the startup
+check off (offline use, test runs) — an escape hatch, not a
+setting.
+
+Verification design: nothing in the suite or the drive touches
+the live GitHub API. A fake GitHub server (tests/fake_github.py,
+a local ThreadingHTTPServer) serves releases/latest, git/trees,
+and the zipball for crafted fake v22 and v23 trees, with blob
+SHAs computed independently by hashlib; it can also serve a
+tampered zip (README.md changed after the tree was built) and a
+release with no target commit. The suite's v22 section (98 new
+checks) covers: version parsing and comparison (v22, 22, v0.69,
+rejections); check outcomes stubbed (newer, current, a dev tree
+newer than the release, unreachable, bad JSON, missing tag,
+unparsable tag); fetch_tree including truncated-tree refusal;
+git_blob_sha against a known value; download with cancel and
+progress; extract including a bad zip and two top folders;
+verify including a changed, missing, and extra file; install
+including the preserve list, a dropped file, stale bytecode,
+the exec bit, and a non-app folder refusing; restart_command
+and restart_app with a stubbed execv, plus a REAL execv in a
+subprocess that writes a marker file (the drive stubs execv —
+a real one would replace the drive process); the full pull
+against the fake server, including tampered-download-refuses
+(byte-identical snapshot before/after) and no-commit-refuses
+(no download at all); and window checks with stubbed network
+(escape hatch, startup current/unknown silent, newer+decline
+asked once with no pull, accept+restart-No with the status line
+saying next launch, accept+restart-Yes with the restart called
+on the app path, manual current/unknown answers, pull refused
+during a run) plus a live accepted pull against the fake server
+with restart No — v23 on disk, the window still v22, a fresh
+subprocess import reporting 23. The GUI drive
+(~/workspace/ost-v22-verify/gui-drive-v22.py, Xvfb 1366x768)
+exercises the REAL dialogs: current → no popup; newer → popup
+appears, Not now downloads nothing; Update now installs and
+the restart popup appears, No leaves v22 running with v23 on
+disk and a fresh launch running v23, Yes relaunches (execv
+stubbed to record the argv). The drive went 25/25
+(log ~/workspace/ost-v22-verify/gui-drive-v22.log, 7 shots in
+drive-shots/, zero QThread lines). Two probes before the suite run
+caught real defects: pull_update read release["version"] but
+check_for_update returned "latest" (fixed by carrying
+"version" on the check result), and the manual-check tests
+triggered while the startup check was still running (a second
+check while one runs is left alone — the tests now wait first).
+
+Run road (full suite, fresh copy each run, offscreen Qt env):
+run 1 cut short at 792/0, run 2 cut short at 1719/2, run 3 cut
+short at 1135/0 — all three ended mid-suite with no summary
+line and no failure recorded (environment, not the app); run
+2's two failures were a stale Help-menu expectation (the new
+Check for updates item was not in the expected list) and two
+em-dash strings in the restart lines, both fixed. Run 4 was
+the first full run: 1748/1 — the one failure was the
+_accepted update pulls v23_ window check, a stale test stub:
+_check_newer22 returned no "version" key, though the real
+check_for_update carries one since the probe fix, so the pull
+stub recorded None (test-side only — the app path was correct;
+the stub gained "version": "23"). Run 5 cut short at 829/0 by
+a VM restart mid-suite (uptime reset; no failure recorded).
+Run 6, on the fixed tree, is green: 1749 passed, 0 failed,
+zero QThread lines
+(log ~/workspace/ost-v22-verify/v22-run6.log). Total 1749
+checks: the 1651 v21 checks all still run, plus 98 new v22
+checks (105 check call sites in the v22 section, 7 of them
+the "no error raised" halves of try/except refusal pairs, so
+98 execute). The first coordinator errored on a runtime
+transport failure mid-verification with no report; a
+replacement finished the verification from the tree as left
+(the stub fix, the drive, and runs 5–6 are the replacement's).
+
+Known gaps, recorded not hidden: (a) if a future version needs
+NEW dependencies, the updater cannot install them (no pip step
+— do not invent one unverified); (b) the install is file-by-
+file, not atomic — a kill mid-install leaves a mixed tree
+(the install is fast local copies); (c) files removed in an
+OLDER version than the current one linger if the user skipped
+that version (the old-tree comparison only covers the current
+version). Known stale artifact, unchanged: tests/
+make_templates.py is the v5 template rebuild source and was
+already stale before v21 (it lacks v17's score_by in speed);
+templates/ is the source of truth and the suite does not run
+it.
+
+Not verified: the check and pull against the LIVE GitHub API
+(all verification ran against the fake server — the first real
+check happens on Joshua's PC at first launch after release,
+and the first real pull when a newer Release exists); real-PC
+rendering of the popups on 1366x768 (the drive ran at that
+size under Xvfb, but the verdict is his); a kill mid-install;
+a version that needs new dependencies.
 
 v21 is the benchmark grader release: 13 fixes from the live-run
 findings, where 55 of 73 recorded "failures" across 5 finished
