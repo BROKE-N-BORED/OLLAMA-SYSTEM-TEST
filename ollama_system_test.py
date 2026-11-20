@@ -87,6 +87,7 @@ import csv
 import html
 import io
 import json
+import math
 import os
 import platform
 import re
@@ -117,12 +118,13 @@ except ImportError:
 
 try:
     from PySide6.QtCore import (
-        QCoreApplication, QEvent, QPropertyAnimation, QRect, QSettings,
-        QSize, Qt, QThread, QTimer, QUrl, Signal,
+        QCoreApplication, QEvent, QPointF, QPropertyAnimation, QRect,
+        QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal,
     )
     from PySide6.QtGui import (
-        QAction, QDesktopServices, QFont, QIcon, QKeySequence, QPainter,
-        QPalette, QPen, QShortcut,
+        QAction, QBrush, QColor, QDesktopServices, QFont, QIcon,
+        QKeySequence, QLinearGradient, QPainter, QPalette, QPen,
+        QPolygonF, QRadialGradient, QShortcut,
     )
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (
@@ -171,7 +173,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "25"
+__version__ = "26"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -6929,6 +6931,10 @@ def latest_dialect_profile(results_dir, model, sys_id):
 class BenchWorker(QThread):
     model_started = Signal(str)
     template_done = Signal(str, dict, str)  # model, run data, file path
+    # (v26): one finished task - model, template id, task record.
+    # Purely additive: the Surface tab's live feed listens to it;
+    # nothing about how tasks run or are graded changes.
+    task_done = Signal(str, str, dict)
     model_done = Signal(str, dict)
     progress = Signal(str, int)
     # R12: the run's total step count when it starts, and the step
@@ -7808,6 +7814,8 @@ class BenchWorker(QThread):
                                     stopped["harmful"] = True
                                 records.append(stopped)
                                 task_results.append(stopped)
+                                self.task_done.emit(
+                                    label, template["id"], stopped)
                                 self._bump_progress(
                                     label, template, remaining["id"])
                             budget_stopped_repeat = True
@@ -7828,6 +7836,8 @@ class BenchWorker(QThread):
                             record["harmful"] = True
                         records.append(record)
                         task_results.append(record)
+                        self.task_done.emit(
+                            label, template["id"], record)
                     repeat_scores.append(_score_records(records)[0])
                     if budget_stopped_repeat:
                         break
@@ -7857,6 +7867,8 @@ class BenchWorker(QThread):
                                 record.update(remaining_extra)
                                 record["prompt_chars"] = len(remaining_prompt)
                             task_results.append(record)
+                            self.task_done.emit(
+                                label, template["id"], record)
                             self._bump_progress(label, template, remaining_id)
                         break
                     try:
@@ -7874,6 +7886,8 @@ class BenchWorker(QThread):
                             record.update(extra)
                             record["prompt_chars"] = len(prompt)
                         task_results.append(record)
+                        self.task_done.emit(
+                            label, template["id"], record)
                         self._bump_progress(label, template, job_id)
                         continue
                     except ProviderError as exc:
@@ -7884,6 +7898,8 @@ class BenchWorker(QThread):
                             record.update(extra)
                             record["prompt_chars"] = len(prompt)
                         task_results.append(record)
+                        self.task_done.emit(
+                            label, template["id"], record)
                         self._bump_progress(label, template, job_id)
                         continue
                     record = {
@@ -7906,6 +7922,7 @@ class BenchWorker(QThread):
                         record.update(extra)
                         record["prompt_chars"] = len(prompt)
                     task_results.append(record)
+                    self.task_done.emit(label, template["id"], record)
                     self._bump_progress(label, template, job_id)
         except OllamaUnreachable as exc:
             # (v21): Ollama died mid-template. The tasks that never
@@ -8412,6 +8429,724 @@ class BenchWorker(QThread):
             self.model_done.emit(label, result)
         self.progress.emit("Done.", 100)
         self._end_run("done")
+
+
+# ---------------------------------------------------------------------------
+# Live decision surface (v26): the shared surface-data shape, its
+# builders, the morph, and the live tracker.
+#
+# THE SHARED SURFACE-DATA SHAPE (the contract Stella's half also
+# produces - the SurfaceView widget consumes ONLY this shape, so
+# any producer can feed it):
+#
+#   {"kind": <string, e.g. "ost_scores">,
+#    "title": <string>,
+#    "x_labels": [<one label per x point>],
+#    "y_labels": [<one label per y point>],
+#    "values": [[score-or-None per y] per x]
+#              - values[x][y] is the measured score (0 to 100) at
+#                that point, or None when it was not measured
+#                (not run, not eligible, or the server died): a
+#                gap in the surface, never a made-up number,
+#    "details": {"<x index>,<y index>": <string shown when the
+#                point is tapped>},
+#    "partial": [[true/false per y] per x] (optional; true means
+#                the point is still being measured)}
+#
+# In OST: x = models, y = templates, value = the template score
+# (the measured pass share of its finished tasks). The fill the
+# widget draws between points is interpolated and VISUAL ONLY -
+# the caption under every surface says so.
+# ---------------------------------------------------------------------------
+
+SURFACE_HONESTY_CAPTION = (
+    "Points are measured scores. The smooth surface between them "
+    "is a visual guide, not measured data."
+)
+
+# The colour ramp: blue at 0, through light blue and a warm
+# yellow, to orange at 100 - the feel of the video's first frame.
+# The top stop is a deep saturated orange (255, 92, 0), deeper
+# than the video's orange on purpose: the GL renderer's tone
+# mapping lifts colours toward gold, so the ramp goes in deep
+# to land on the video's orange (the bake-off's plateau read
+# gold from a paler top stop).
+_SURFACE_STOPS = (
+    (0.0, (25, 80, 210)),
+    (40.0, (40, 170, 235)),
+    (65.0, (250, 200, 80)),
+    (100.0, (255, 92, 0)),
+)
+
+
+def surface_rgb(value, glow=True):
+    """The (red, green, blue) colour of a score: blue at 0,
+    orange at 100, with a brightness lift near the top so high
+    scores glow. Pure function - no Qt - so the suite can check
+    the ramp without a window. glow=False returns the raw ramp
+    colour with no lift: the GL scene builder feeds that to the
+    renderer, whose own lighting and tone mapping do the
+    lifting there (a white lift on top of it would wash the
+    plateau pale)."""
+    v = max(0.0, min(100.0, float(value)))
+    rgb = _SURFACE_STOPS[-1][1]
+    for (v0, c0), (v1, c1) in zip(_SURFACE_STOPS, _SURFACE_STOPS[1:]):
+        if v <= v1:
+            f = 0.0 if v1 == v0 else (v - v0) / (v1 - v0)
+            rgb = tuple(
+                round(c0[i] + (c1[i] - c0[i]) * f) for i in range(3))
+            break
+    if glow and v > 70.0:
+        # The glow lift: near the top, mix toward white a little.
+        lift = (v - 70.0) / 30.0 * 0.22
+        rgb = tuple(
+            round(c + (255 - c) * lift) for c in rgb)
+    return rgb
+
+
+def _surface_passed_text(passed):
+    """A passed count the way the cards print it: whole numbers
+    stay whole, a partial-credit sum keeps one decimal."""
+    if passed is None:
+        return None
+    if float(passed) == int(passed):
+        return str(int(passed))
+    return f"{float(passed):.1f}"
+
+
+def surface_detail_text(model, template_name, value, passed, total,
+                        partial=False):
+    """The words behind one point, shown when it is tapped:
+    model, template, score, and the passed/total behind it when
+    they are known."""
+    if value is None:
+        text = f"{model} - {template_name}: not measured"
+    else:
+        text = f"{model} - {template_name}: {value:.0f}%"
+        passed_text = _surface_passed_text(passed)
+        if passed_text is not None and total:
+            text += f" ({passed_text}/{total} tasks)"
+    if partial:
+        text += " (still being measured)"
+    return text
+
+
+class SurfaceTracker:
+    """One benchmark run's surface, kept as its tasks land.
+
+    Fed by the worker's signals: task_done grows a cell task by
+    task (the cell is partial - still being measured), and
+    template_done settles the cell at the template's real score.
+    A template that never produces a score (not eligible, not
+    measured) leaves its cell out entirely - a gap, never a 0.
+    Pure Python, no Qt: the suite drives it directly.
+    """
+
+    def __init__(self):
+        self.x_labels = []
+        self.y_ids = []
+        self.y_names = {}
+        self._score_by = {}
+        self.cells = {}
+
+    def begin(self, targets, templates, pairs=None, preloaded=None):
+        """Start tracking a run. pairs, when given, limits the
+        axes to the pairs actually running (a re-run or a resume);
+        preloaded is a resume's done pairs, {label: {template id:
+        run data}}, settled before the run starts."""
+        if pairs is not None:
+            wanted = set(pairs)
+            targets = [t for t in targets
+                       if any(label == t["label"]
+                              for label, _tid in wanted)]
+            templates = [t for t in templates
+                         if any(tid == t["id"]
+                                for _label, tid in wanted)]
+        self.x_labels = [t["label"] for t in targets]
+        self.y_ids = [t["id"] for t in templates]
+        self.y_names = {t["id"]: t.get("name") or t["id"]
+                        for t in templates}
+        self._score_by = {t["id"]: t.get("score_by")
+                          for t in templates}
+        self.cells = {}
+        for label, by_template in (preloaded or {}).items():
+            for _tid, run_data in by_template.items():
+                self.template_done(label, run_data)
+        return self
+
+    def _cell(self, label, template_id):
+        return self.cells.setdefault((label, template_id), {
+            "credit": 0.0, "total": 0, "value": None,
+            "partial": False, "settled": False, "passed": None,
+        })
+
+    def task_done(self, label, template_id, record):
+        """One finished task. The cell's value is the measured
+        pass share of the template's finished tasks so far - the
+        same credit rules _score_records uses. Not-run and
+        budget-stopped tasks never count, exactly as in the
+        score itself."""
+        if label not in self.x_labels or template_id not in self.y_ids:
+            return
+        if is_not_run(record) or is_budget_stopped(record):
+            return
+        cell = self._cell(label, template_id)
+        if cell["settled"]:
+            return
+        passed = record.get("passed")
+        if passed is not None:
+            credit = record.get(
+                "credit", 1.0 if passed is True else 0.0)
+        elif (self._score_by.get(template_id) == "speed"
+                and record.get("decode_tok_s") is not None):
+            # Speed scores its jobs by decode speed, not answers:
+            # the running cell uses the same credit the final
+            # score will.
+            credit = speed_credit(record.get("decode_tok_s"))
+        else:
+            return
+        cell["credit"] += credit
+        cell["total"] += 1
+        cell["value"] = 100.0 * cell["credit"] / cell["total"]
+        cell["passed"] = cell["credit"]
+        cell["partial"] = True
+
+    def template_done(self, label, run_data):
+        """A finished template: the cell settles at the run
+        file's real score. A template with no score (it errored,
+        or the server died) settles as a gap - not measured,
+        never a 0."""
+        template_id = run_data.get("template")
+        if label not in self.x_labels or template_id not in self.y_ids:
+            return
+        cell = self._cell(label, template_id)
+        cell["settled"] = True
+        cell["partial"] = False
+        cell["value"] = run_data.get("template_score")
+        cell["passed"] = run_data.get("passed")
+        cell["total"] = run_data.get("total") or 0
+
+    def data(self, title):
+        """The shared surface-data shape for the run so far."""
+        values = []
+        partial = []
+        details = {}
+        for xi, label in enumerate(self.x_labels):
+            column = []
+            partial_column = []
+            for yi, template_id in enumerate(self.y_ids):
+                cell = self.cells.get((label, template_id))
+                value = cell["value"] if cell else None
+                column.append(value)
+                partial_column.append(
+                    bool(cell and cell["partial"]))
+                if value is not None and cell is not None:
+                    details[f"{xi},{yi}"] = surface_detail_text(
+                        label,
+                        self.y_names.get(template_id, template_id),
+                        value, cell.get("passed"),
+                        cell.get("total"),
+                        bool(cell["partial"]))
+            values.append(column)
+            partial.append(partial_column)
+        return {
+            "kind": "ost_scores",
+            "title": title,
+            "x_labels": list(self.x_labels),
+            "y_labels": [self.y_names.get(tid, tid)
+                         for tid in self.y_ids],
+            "values": values,
+            "details": details,
+            "partial": partial,
+        }
+
+
+def surface_data_from_manifest(results_dir, manifest):
+    """A saved run's surface, rebuilt from its manifest and run
+    files: x = the run's models, y = the run's templates, each
+    value the run file's template score. Pairs that never
+    produced a scored run file stay gaps."""
+    x_labels = [t.get("label") for t in manifest.get("targets") or []]
+    y_ids = list(manifest.get("templates") or [])
+    names = {}
+    cells = {}
+    run_files = manifest.get("run_files") or {}
+    for key, rel in run_files.items():
+        label, template_id = split_pair_key(key)
+        run_data = load_run_file(os.path.join(results_dir, rel))
+        if run_data is None:
+            continue
+        names[template_id] = run_data.get("template_name") or template_id
+        cells[(label, template_id)] = run_data
+    values = []
+    details = {}
+    for xi, label in enumerate(x_labels):
+        column = []
+        for yi, template_id in enumerate(y_ids):
+            run_data = cells.get((label, template_id))
+            value = (run_data.get("template_score")
+                     if run_data else None)
+            column.append(value)
+            if value is not None and run_data is not None:
+                details[f"{xi},{yi}"] = surface_detail_text(
+                    label,
+                    names.get(template_id, template_id),
+                    value, run_data.get("passed"),
+                    run_data.get("total"))
+        values.append(column)
+    started = (manifest.get("started") or "").replace("T", " ")
+    return {
+        "kind": "ost_scores",
+        "title": f"Run {started}".strip(),
+        "x_labels": x_labels,
+        "y_labels": [names.get(tid, tid) for tid in y_ids],
+        "values": values,
+        "details": details,
+        "partial": [[False] * len(y_ids) for _ in x_labels],
+    }
+
+
+def surface_data_from_model_runs(results_dir, model_slug):
+    """One model's surface from its latest run of each template
+    (the Past runs fallback, for a run file whose manifest is
+    gone): x = the model alone, y = its templates."""
+    runs = load_model_runs(results_dir, model_slug)
+    latest = {}
+    order = []
+    name = model_slug
+    for run_data in runs:
+        template_id = run_data.get("template")
+        if not template_id:
+            continue
+        if template_id not in latest:
+            order.append(template_id)
+        latest[template_id] = run_data
+        if run_data.get("model"):
+            name = run_data["model"]
+    values = []
+    details = {}
+    column = []
+    for yi, template_id in enumerate(order):
+        run_data = latest[template_id]
+        value = run_data.get("template_score")
+        column.append(value)
+        if value is not None:
+            details[f"0,{yi}"] = surface_detail_text(
+                name, run_data.get("template_name") or template_id,
+                value, run_data.get("passed"), run_data.get("total"))
+    values.append(column)
+    return {
+        "kind": "ost_scores",
+        "title": f"{name} - latest scores",
+        "x_labels": [name],
+        "y_labels": [(latest[tid].get("template_name") or tid)
+                     for tid in order],
+        "values": values,
+        "details": details,
+        "partial": [[False] * len(order)],
+    }
+
+
+def morph_surface_data(data_a, data_b, t):
+    """Blend two surfaces over the union of their axes.
+
+    t = 0 is surface A exactly; t = 1 is surface B exactly; in
+    between, a cell both sides measured is the plain blend. THE
+    MISSING-CELL RULE: a cell measured on only one side never
+    takes the other side's value. It fades toward the floor -
+    its height is its own value times the share of the morph
+    still on its side (an A-only cell at t is worth A x (1 - t),
+    a B-only cell B x t) - and at the far end it is a gap,
+    exactly as on the side that never measured it. No score is
+    ever invented for a missing cell.
+    """
+    t = max(0.0, min(1.0, float(t)))
+    x_labels = list(data_a["x_labels"]) + [
+        x for x in data_b["x_labels"] if x not in data_a["x_labels"]]
+    y_labels = list(data_a["y_labels"]) + [
+        y for y in data_b["y_labels"] if y not in data_a["y_labels"]]
+
+    def _value(data, xi, yi):
+        try:
+            return data["values"][xi][yi]
+        except (IndexError, KeyError, TypeError):
+            return None
+
+    def _partial(data, xi, yi):
+        grid = data.get("partial") or []
+        try:
+            return bool(grid[xi][yi])
+        except (IndexError, KeyError, TypeError):
+            return False
+
+    def _detail(data, xi, yi):
+        return (data.get("details") or {}).get(f"{xi},{yi}")
+
+    values = []
+    partial = []
+    details = {}
+    for xi, x_label in enumerate(x_labels):
+        ax = (data_a["x_labels"].index(x_label)
+              if x_label in data_a["x_labels"] else None)
+        bx = (data_b["x_labels"].index(x_label)
+              if x_label in data_b["x_labels"] else None)
+        column = []
+        partial_column = []
+        for yi, y_label in enumerate(y_labels):
+            ay = (data_a["y_labels"].index(y_label)
+                  if y_label in data_a["y_labels"] else None)
+            by = (data_b["y_labels"].index(y_label)
+                  if y_label in data_b["y_labels"] else None)
+            a = (_value(data_a, ax, ay)
+                 if ax is not None and ay is not None else None)
+            b = (_value(data_b, bx, by)
+                 if bx is not None and by is not None else None)
+            if a is not None and b is not None:
+                value = a + (b - a) * t
+            elif a is not None:
+                value = a * (1.0 - t) if t < 1.0 else None
+            elif b is not None:
+                value = b * t if t > 0.0 else None
+            else:
+                value = None
+            column.append(value)
+            partial_column.append(
+                (ax is not None and ay is not None
+                 and _partial(data_a, ax, ay))
+                or (bx is not None and by is not None
+                    and _partial(data_b, bx, by)))
+            if value is not None:
+                # The detail comes from the side the morph is
+                # nearer to, when that side measured the cell.
+                near, far = ((data_a, ax, ay), (data_b, bx, by)) \
+                    if t < 0.5 else ((data_b, bx, by), (data_a, ax, ay))
+                text = None
+                for data, dx, dy in (near, far):
+                    if dx is not None and dy is not None:
+                        text = _detail(data, dx, dy)
+                    if text:
+                        break
+                if text:
+                    details[f"{xi},{yi}"] = text
+        values.append(column)
+        partial.append(partial_column)
+    return {
+        "kind": data_a.get("kind", "ost_scores"),
+        "title": f"{data_a.get('title', '')} to {data_b.get('title', '')}",
+        "x_labels": x_labels,
+        "y_labels": y_labels,
+        "values": values,
+        "details": details,
+        "partial": partial,
+    }
+
+
+def surface_filled_values(values):
+    """The visual fill over a values matrix (VISUAL ONLY): every
+    node's height, measured or interpolated. A node with no
+    measured value takes an estimate from the nearest measured
+    values along its row and its column (bilinear-style: the two
+    directions averaged when both exist). A node with no measured
+    neighbour in either direction stays None - a gap, where the
+    surface is not drawn. Measured values pass through untouched.
+    """
+    nx = len(values)
+    ny = len(values[0]) if nx else 0
+    filled = [[values[xi][yi] for yi in range(ny)] for xi in range(nx)]
+
+    def _along(get, count, index):
+        """Linear interpolation along one axis at a fixed other
+        coordinate, or None when no measured value brackets or
+        touches this point on that axis."""
+        left = None
+        step = index - 1
+        while step >= 0:
+            if get(step) is not None:
+                left = (step, get(step))
+                break
+            step -= 1
+        right = None
+        step = index + 1
+        while step < count:
+            if get(step) is not None:
+                right = (step, get(step))
+                break
+            step += 1
+        if left is not None and right is not None:
+            (i0, v0), (i1, v1) = left, right
+            return v0 + (v1 - v0) * (index - i0) / (i1 - i0)
+        if left is not None:
+            return left[1]
+        if right is not None:
+            return right[1]
+        return None
+
+    for xi in range(nx):
+        for yi in range(ny):
+            if filled[xi][yi] is not None:
+                continue
+            row_val = _along(lambda x: values[x][yi], nx, xi)
+            col_val = _along(lambda y: values[xi][y], ny, yi)
+            if row_val is not None and col_val is not None:
+                filled[xi][yi] = (row_val + col_val) / 2.0
+            elif row_val is not None:
+                filled[xi][yi] = row_val
+            elif col_val is not None:
+                filled[xi][yi] = col_val
+    return filled
+
+
+def surface_sample_filled(filled, fx, fy):
+    """The filled field's height at a fractional position - a
+    bilinear blend of the four surrounding nodes. None when any
+    corner the blend needs is a gap, so gaps stay gaps sample by
+    sample. (This is the painter's sampling, lifted to module
+    level so the GL scene builder reads the identical field.)"""
+    nx = len(filled)
+    ny = len(filled[0]) if nx else 0
+    if not nx or not ny:
+        return None
+    fx = max(0.0, min(float(nx - 1), fx))
+    fy = max(0.0, min(float(ny - 1), fy))
+    x0 = int(math.floor(fx))
+    y0 = int(math.floor(fy))
+    x1 = min(x0 + 1, nx - 1)
+    y1 = min(y0 + 1, ny - 1)
+    corners = (filled[x0][y0], filled[x1][y0],
+               filled[x1][y1], filled[x0][y1])
+    if any(c is None for c in corners):
+        return None
+    tx = fx - x0
+    ty = fy - y0
+    c00, c10, c11, c01 = corners
+    return (c00 * (1 - tx) * (1 - ty) + c10 * tx * (1 - ty)
+            + c11 * tx * ty + c01 * (1 - tx) * ty)
+
+
+def _surface_axis_subdiv(count):
+    """Render-grid subdivisions per data step on one axis:
+    about 4 per step, thinned as the axis grows so the block
+    count stays near the roughly 26-per-axis cap."""
+    if count <= 1:
+        return 1
+    return max(1, min(4, 25 // (count - 1)))
+
+
+def _surface_samples_from_filled(filled, nx, ny):
+    """Every render-grid sample of a filled field: a list of
+    (fx, fy, step_x, step_y, value) in data-index space - fx
+    over x, fy over y, the sample centres on a grid subdivided
+    about 4x per data step (a single-node axis still yields one
+    line of samples). value is None where the field is a gap:
+    the slot exists (its position in the list is stable) but
+    nothing is drawn for it."""
+    def _axis(count):
+        if count <= 1:
+            return [0.0], 0.9
+        subdiv = _surface_axis_subdiv(count)
+        return ([i / subdiv
+                 for i in range((count - 1) * subdiv + 1)],
+                1.0 / subdiv)
+
+    xs, step_x = _axis(nx)
+    ys, step_y = _axis(ny)
+    samples = []
+    for fx in xs:
+        for fy in ys:
+            samples.append(
+                (fx, fy, step_x, step_y,
+                 surface_sample_filled(filled, fx, fy)))
+    return samples
+
+
+def surface_block_samples(values):
+    """Every render-grid sample of a values matrix - the field
+    both surface renderers draw: the painter paints these as
+    blocks, the GL scene builds a column for each one. Same
+    sampling, same gaps, so the two renderers can never drift
+    apart."""
+    nx = len(values)
+    ny = len(values[0]) if nx else 0
+    if not nx or not ny:
+        return []
+    return _surface_samples_from_filled(
+        surface_filled_values(values), nx, ny)
+
+
+# ---------------------------------------------------------------------------
+# The real-3D scene description (v26 wire-in): the Surface tab
+# renders with the vendored Light Engine (Reblend's renderer -
+# see light_engine/__init__.py) when OpenGL is available. The
+# scene is described by a pure function of the surface data, in
+# plain values the suite can check without a GL context; the
+# widget layer (GLSurfaceView, below) turns the description
+# into engine objects once per axis set and then only mutates
+# them.
+#
+# The look, per Joshua's verdict on the bake-off renders: the
+# Reblend render's room and colours (near-black navy, bright
+# blue valley, deep saturated orange plateau), with SKULLPT's
+# smoothness - matte blocks, satin orbs, soft light - and a
+# cage so thin and faint it reads as a whisper of a frame.
+# ---------------------------------------------------------------------------
+
+SURFACE_FIELD = 200.0      # the plot is 200 x 200 cm
+SURFACE_MIN_H = 4.0        # a value-0 column is a short stub
+SURFACE_MAX_H = 90.0       # a value-100 column top
+SURFACE_CAGE_TOP = 104.0   # cage height, cm
+SURFACE_ORB_R = 8.5        # orb radius, cm
+SURFACE_BG_HEX = "#060a18"  # near-black navy, the video's room
+# Matte, not glossy (Joshua, on the bake-off): blocks are
+# rough, orbs are satin - a soft sheen, never mirror balls.
+SURFACE_BLOCK_ROUGHNESS = 0.85
+SURFACE_ORB_ROUGHNESS = 0.62
+
+# The scene's lights: the engine's defaults with the contrast
+# turned down - a gentler key, more fill and ambient, a quieter
+# rim - so shadows keep their shape but lose their harsh edge
+# of contrast. (The shadow map itself is 3x3 PCF-softened in
+# the engine's shader.)
+SURFACE_LIGHTS = (
+    {"name": "Key", "kind": "key",
+     "position": [-300.0, -300.0, 400.0],
+     "color": "#ffffff", "intensity": 0.72},
+    {"name": "Fill", "kind": "fill",
+     "position": [300.0, -200.0, 150.0],
+     "color": "#cfe0ff", "intensity": 0.55},
+    {"name": "Rim", "kind": "rim",
+     "position": [0.0, 400.0, 250.0],
+     "color": "#ffe8c8", "intensity": 0.30},
+    {"name": "Ambient", "kind": "ambient",
+     "position": [0.0, 0.0, 0.0],
+     "color": "#ffffff", "intensity": 0.50},
+)
+
+
+def surface_height_of(value):
+    """A score (0 to 100) as a column-top height in cm."""
+    v = max(0.0, min(100.0, float(value)))
+    return SURFACE_MIN_H + (SURFACE_MAX_H - SURFACE_MIN_H) * v / 100.0
+
+
+def surface_node_position(xi, yi, nx, ny):
+    """A data node's centre in scene space (cm). Scene x is the
+    template axis (the data's y), scene y the model axis (the
+    data's x), with model 0 at the BACK of the field - so the
+    first model reads as the far plateau, like the reference
+    video's trained frame."""
+    sx = (yi + 0.5) * (SURFACE_FIELD / ny)
+    sy = (nx - 1 - xi + 0.5) * (SURFACE_FIELD / nx)
+    return sx, sy
+
+
+def _surface_hex(value, partial=False):
+    """A score as a material colour hex: the raw ramp (no glow
+    lift - the renderer's lighting does that work). A partial
+    point (still being measured) is ghosted toward the room's
+    navy, so it reads as not-yet-solid next to the settled
+    points."""
+    r, g, b = surface_rgb(value, glow=False)
+    if partial:
+        bg = (0x06, 0x0A, 0x18)
+        r = round(r * 0.45 + bg[0] * 0.55)
+        g = round(g * 0.45 + bg[1] * 0.55)
+        b = round(b * 0.45 + bg[2] * 0.55)
+    return "#%02x%02x%02x" % (r, g, b)
+
+
+def surface_scene_description(data):
+    """The GL scene for one surface, as plain data: every
+    render-grid slot, the columns that stand on the measured
+    samples, the orbs on the measured nodes, the cage, the
+    lights and the camera. Pure - no Qt, no engine - so the
+    suite can check the whole scene without a GL context.
+
+    A gap (an unmeasured sample, or a sample whose field is a
+    gap) produces NO column: its slot is listed in "samples"
+    (the slot order is stable, so the widget can mutate objects
+    instead of rebuilding) but it is absent from "columns",
+    and a gap node has no orb. A measured node's orb height is
+    its column top; the widget rests the orb on it (centre =
+    height + radius), never half-sunk."""
+    if not data:
+        data = {}
+    x_labels = list(data.get("x_labels") or [])
+    y_labels = list(data.get("y_labels") or [])
+    values = data.get("values") or []
+    partial_grid = data.get("partial") or []
+    details = data.get("details") or {}
+    nx, ny = len(x_labels), len(y_labels)
+
+    def _value(xi, yi):
+        try:
+            return values[xi][yi]
+        except (IndexError, TypeError):
+            return None
+
+    def _partial(xi, yi):
+        try:
+            return bool(partial_grid[xi][yi])
+        except (IndexError, TypeError):
+            return False
+
+    samples = []
+    columns = []
+    if nx and ny:
+        gap = 0.35  # cm between neighbouring columns
+        for fx, fy, step_x, step_y, value in \
+                surface_block_samples(values):
+            samples.append([fx, fy])
+            if value is None:
+                continue
+            cx = (fy + 0.5) * (SURFACE_FIELD / ny)
+            cy = (nx - 1 - fx + 0.5) * (SURFACE_FIELD / nx)
+            columns.append({
+                "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                "sx": step_y * (SURFACE_FIELD / ny) - gap,
+                "sy": step_x * (SURFACE_FIELD / nx) - gap,
+                "height": surface_height_of(value),
+                "value": value,
+                "color": _surface_hex(value),
+            })
+    orbs = []
+    for xi in range(nx):
+        for yi in range(ny):
+            value = _value(xi, yi)
+            if value is None:
+                continue
+            x, y = surface_node_position(xi, yi, nx, ny)
+            orbs.append({
+                "xi": xi, "yi": yi, "x": x, "y": y,
+                "height": surface_height_of(value),
+                "value": value,
+                "color": _surface_hex(value, _partial(xi, yi)),
+                "partial": _partial(xi, yi),
+                "detail": details.get(f"{xi},{yi}", ""),
+            })
+    return {
+        "title": data.get("title", ""),
+        "x_labels": x_labels,
+        "y_labels": y_labels,
+        "field": SURFACE_FIELD,
+        "cage_top": SURFACE_CAGE_TOP,
+        "orb_radius": SURFACE_ORB_R,
+        "background": SURFACE_BG_HEX,
+        "lights": [dict(light) for light in SURFACE_LIGHTS],
+        "cage": {
+            # A whisper of a frame (Joshua, on the bake-off):
+            # bars a third of the bake-off's thickness, a colour
+            # close to the room, grid lines fainter still.
+            "margin": 6.0, "bar": 0.4, "color": "#26334d",
+            "grid_bar": 0.3, "grid_color": "#1b2740",
+        },
+        "camera": {
+            "target": [SURFACE_FIELD / 2, SURFACE_FIELD / 2, 40.0],
+            "distance": 430.0, "azimuth": -52.0, "elevation": 32.0,
+        },
+        "samples": samples,
+        "columns": columns,
+        "orbs": orbs,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -10137,6 +10872,1359 @@ class SettingsDialog(QDialog):
         super().accept()
 
 
+class SurfaceView(QWidget):
+    """The painted decision surface (v26): a software-rendered
+    voxel landscape - QPainter only, no OpenGL. This is the
+    fallback renderer: the Surface tab uses the real-3D Light
+    Engine surface (GLSurfaceView, below) when OpenGL is
+    available, and this painted surface when it is not (no GL
+    context, the offscreen platform, OST_NO_GL=1) - the same
+    data, the same sampling, a look as close as painting gets.
+
+    The look follows the reference Joshua picked: a landscape
+    of discrete 3D blocks, each block's top at its height, so
+    high areas form flat-topped plateaus with steep stepped
+    sides and low areas read as valleys. Tops are lit bright
+    (blue at 0, orange at 100), side faces are the same ramp
+    darkened, and every measured point carries a glossy orb -
+    a radial-gradient sphere with a white highlight, and a soft
+    halo behind it. A faint wireframe cage (base, corner posts,
+    top frame, back-wall grid) boxes the plot, on the same dark
+    navy background. The smooth field between measured points
+    is still only a visual guide: it is sampled into the block
+    heights, never presented as data - the orbs are the data.
+
+    Consumes ONLY the shared surface-data shape (see the surface
+    section above): any producer that emits that shape - an OST
+    run, a saved run, a morph, Stella later - can feed it.
+
+    Controls: drag rotates (azimuth and elevation, clamped),
+    scroll zooms, a click picks the nearest measured point's
+    orb and reports its detail string through point_picked. In
+    morph mode, Play/Pause sweeps the blend between the two
+    surfaces (ping-pong, about 30 frames a second, only while
+    playing); the slider position follows through
+    morph_t_changed.
+
+    Repaint discipline (the spec's hard rule): the surface paints
+    on data change, on drag, and on morph frames - never on a
+    free-running loop. Live run updates go through
+    set_data(..., coalesce=True), which collapses bursts to at
+    most about 5 repaints a second.
+    """
+
+    point_picked = Signal(str)
+    morph_t_changed = Signal(float)
+    morph_playing_changed = Signal(bool)
+
+    BACKGROUND = QColor(10, 14, 26)
+    GRID_LINE = QColor(52, 64, 92)
+    LABEL_COLOR = QColor(168, 178, 200)
+    TITLE_COLOR = QColor(226, 232, 244)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(240)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._data = None
+        self._morph_a = None
+        self._morph_b = None
+        self._morph_t = 0.0
+        self._morph_dir = 1.0
+        self._playing = False
+        self._azimuth = 52.0
+        self._elevation = 34.0
+        self._zoom = 1.0
+        self._selected = None  # (x index, y index) or None
+        self._press_pos = None
+        self._last_pos = None
+        self._dragged = False
+        self._layout_cache = None  # (key, layout) - see _layout()
+        self._morph_timer = QTimer(self)
+        self._morph_timer.setInterval(33)
+        self._morph_timer.timeout.connect(self._morph_tick)
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.setSingleShot(True)
+        self._repaint_timer.setInterval(200)
+        self._repaint_timer.timeout.connect(self.update)
+
+    # -- data ------------------------------------------------------
+
+    def set_data(self, data, coalesce=False):
+        """Show one surface (leaving morph mode). With coalesce,
+        the repaint is batched - the live run's feed uses it, so
+        a burst of finished tasks costs one paint, not twenty."""
+        self._morph_a = None
+        self._morph_b = None
+        if self._playing:
+            self._playing = False
+            self._morph_timer.stop()
+            self.morph_playing_changed.emit(False)
+        self._data = data
+        self._selected = None
+        if coalesce:
+            self._request_repaint()
+        else:
+            self.update()
+
+    def set_morph(self, data_a, data_b):
+        """Morph mode between two surfaces, starting at A."""
+        self._morph_a = data_a
+        self._morph_b = data_b
+        self._morph_t = 0.0
+        self._morph_dir = 1.0
+        self._selected = None
+        self._data = morph_surface_data(data_a, data_b, 0.0)
+        self.update()
+
+    def in_morph_mode(self):
+        return self._morph_a is not None
+
+    def morph_t(self):
+        return self._morph_t
+
+    def set_morph_t(self, t):
+        if not self.in_morph_mode():
+            return
+        self._morph_t = max(0.0, min(1.0, float(t)))
+        self._data = morph_surface_data(
+            self._morph_a, self._morph_b, self._morph_t)
+        self._selected = None
+        self.morph_t_changed.emit(self._morph_t)
+        self.update()
+
+    def is_playing(self):
+        return self._playing
+
+    def toggle_play(self):
+        if not self.in_morph_mode():
+            return
+        self._playing = not self._playing
+        if self._playing:
+            self._morph_timer.start()
+        else:
+            self._morph_timer.stop()
+        self.morph_playing_changed.emit(self._playing)
+
+    def _morph_tick(self):
+        step = 0.008  # a full sweep in about four seconds at 33 ms
+        t = self._morph_t + self._morph_dir * step
+        if t >= 1.0:
+            t = 1.0
+            self._morph_dir = -1.0
+        elif t <= 0.0:
+            t = 0.0
+            self._morph_dir = 1.0
+        self.set_morph_t(t)
+
+    def current_data(self):
+        return self._data
+
+    def _request_repaint(self):
+        if not self._repaint_timer.isActive():
+            self._repaint_timer.start()
+
+    # -- projection --------------------------------------------------
+
+    def _grid(self):
+        """(nx, ny) of the current data, (0, 0) when there is none."""
+        data = self._data
+        if not data:
+            return 0, 0
+        nx = len(data.get("x_labels") or [])
+        ny = len(data.get("y_labels") or [])
+        return nx, ny
+
+    def _project_raw(self, gx, gy, gz):
+        """Grid space to (screen x, screen y, depth), before the
+        fit-to-widget mapping. Grid units: x and y are node
+        indexes centred on 0; z is the height in the same units.
+        Larger depth = nearer the viewer."""
+        az = math.radians(self._azimuth)
+        el = math.radians(self._elevation)
+        xr = gx * math.cos(az) - gy * math.sin(az)
+        yr = gx * math.sin(az) + gy * math.cos(az)
+        sx = xr
+        sy = gz * math.sin(el) - yr * math.cos(el)
+        depth = yr * math.sin(el) + gz * math.cos(el)
+        return sx, sy, depth
+
+    @staticmethod
+    def _axis_subdiv(count):
+        """Render-grid subdivisions per data step on one axis:
+        about 4 per step like the old quad subdivision, thinned
+        as the axis grows so the block count stays near the
+        roughly 26-per-axis cap."""
+        if count <= 1:
+            return 1
+        return max(1, min(4, 25 // (count - 1)))
+
+    @classmethod
+    def _axis_margin(cls, count):
+        """How far the cage stands off the data on one axis, in
+        grid units: clear of the edge blocks, with a floor so a
+        small surface still sits inside its cage like the
+        reference's plot box."""
+        if count <= 1:
+            step = 0.9
+        else:
+            step = 1.0 / cls._axis_subdiv(count)
+        return min(0.55, max(0.22, step * 0.47 + 0.05))
+
+    def _layout(self):
+        """The fit mapping for the current data, view and size:
+        (scale, origin x, origin y). All projected node corners
+        (heights 0 and 100) and the cage corners set the bounds,
+        so the whole plot - cage included - fits the widget at
+        any rotation. Returns None when there is nothing to
+        draw. Memoised on everything that can change it: a
+        paint walks thousands of projections through this
+        mapping, and recomputing the bounds for each one (the
+        first renderer's habit) cost seconds on a full grid."""
+        nx, ny = self._grid()
+        if not nx or not ny:
+            return None
+        key = (self.width(), self.height(), self._azimuth,
+               self._elevation, self._zoom, nx, ny)
+        if self._layout_cache is not None \
+                and self._layout_cache[0] == key:
+            return self._layout_cache[1]
+        span_x = max(nx - 1, 1)
+        span_y = max(ny - 1, 1)
+        height_span = 0.55 * max(span_x, span_y)
+        margin_x = self._axis_margin(nx)
+        margin_y = self._axis_margin(ny)
+        points = []
+        corners = [(xi, yi) for xi in range(nx) for yi in range(ny)]
+        corners += [(-margin_x, -margin_y),
+                    (nx - 1 + margin_x, -margin_y),
+                    (-margin_x, ny - 1 + margin_y),
+                    (nx - 1 + margin_x, ny - 1 + margin_y)]
+        for gx0, gy0 in corners:
+            for value in (0.0, 100.0):
+                gx = gx0 - (nx - 1) / 2.0
+                gy = gy0 - (ny - 1) / 2.0
+                gz = value / 100.0 * height_span
+                sx, sy, _depth = self._project_raw(gx, gy, gz)
+                points.append((sx, sy))
+        min_x = min(p[0] for p in points)
+        max_x = max(p[0] for p in points)
+        min_y = min(p[1] for p in points)
+        max_y = max(p[1] for p in points)
+        # Room for the axis labels: x labels under the front edge,
+        # y labels to the left.
+        left, right, top, bottom = 64, 14, 26, 30
+        avail_w = max(10, self.width() - left - right)
+        avail_h = max(10, self.height() - top - bottom)
+        scale = min(avail_w / max(max_x - min_x, 0.001),
+                    avail_h / max(max_y - min_y, 0.001)) * self._zoom
+        origin_x = left + (avail_w - (max_x - min_x) * scale) / 2.0 \
+            - min_x * scale
+        # project() flips y (pixel = origin - sy * scale), so the
+        # origin anchors on max_y, not min_y.
+        origin_y = top + (avail_h - (max_y - min_y) * scale) / 2.0 \
+            + max_y * scale
+        layout = (scale, origin_x, origin_y, height_span)
+        self._layout_cache = (key, layout)
+        return layout
+
+    def project(self, xi, yi, value):
+        """The widget pixel (x, y) of one node at a score - the
+        projection the painter uses, so picking and the suite go
+        through exactly the same maths as the drawing."""
+        layout = self._layout()
+        if layout is None:
+            return None
+        scale, origin_x, origin_y, height_span = layout
+        nx, ny = self._grid()
+        gx = xi - (nx - 1) / 2.0
+        gy = yi - (ny - 1) / 2.0
+        gz = (value or 0.0) / 100.0 * height_span
+        sx, sy, _depth = self._project_raw(gx, gy, gz)
+        return origin_x + sx * scale, origin_y - sy * scale
+
+    def _project_full(self, xi, yi, value):
+        """project() plus the depth, for the painter's ordering."""
+        layout = self._layout()
+        if layout is None:
+            return None
+        scale, origin_x, origin_y, height_span = layout
+        nx, ny = self._grid()
+        gx = xi - (nx - 1) / 2.0
+        gy = yi - (ny - 1) / 2.0
+        gz = (value or 0.0) / 100.0 * height_span
+        sx, sy, depth = self._project_raw(gx, gy, gz)
+        return origin_x + sx * scale, origin_y - sy * scale, depth
+
+    def pick(self, px, py):
+        """The measured node nearest a widget pixel, or None.
+        Only measured points can be picked - the fill between
+        them is a visual guide, not data, so it has nothing to
+        report."""
+        data = self._data
+        if not data:
+            return None
+        values = data.get("values") or []
+        best = None
+        best_dist = 22.0
+        for xi, column in enumerate(values):
+            for yi, value in enumerate(column):
+                if value is None:
+                    continue
+                point = self.project(xi, yi, value)
+                if point is None:
+                    continue
+                dist = math.hypot(point[0] - px, point[1] - py)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = (xi, yi)
+        return best
+
+    def selected(self):
+        return self._selected
+
+    # -- painting ----------------------------------------------------
+
+    @staticmethod
+    def _sample_filled(filled, fx, fy):
+        """The filled field's height at a fractional position -
+        the same bilinear blend the first renderer draped, now
+        read at block centres. None when any corner the blend
+        needs is a gap, so gaps stay gaps block by block. The
+        maths lives at module level (surface_sample_filled),
+        shared with the GL scene builder."""
+        return surface_sample_filled(filled, fx, fy)
+
+    def _block_samples(self, filled, nx, ny):
+        """The render grid: (fx, fy, step_x, step_y, value) for
+        every block, sampled from the filled field at block
+        centres on a grid subdivided about 4x per data step,
+        thinned to the roughly 26-per-axis cap. A single-node
+        axis still yields one line of blocks. Shared with the
+        GL scene builder (_surface_samples_from_filled); the
+        painter keeps only the samples that draw."""
+        return [sample for sample in
+                _surface_samples_from_filled(filled, nx, ny)
+                if sample[4] is not None]
+
+    def _orb_radius(self):
+        """The painted orb radius in pixels: a chunky sphere
+        like the reference's, scaled off the plot scale (which
+        already carries the zoom), clamped so it never turns
+        into a balloon or a pinhead."""
+        layout = self._layout()
+        if layout is None:
+            return 6.0
+        return max(5.0, min(13.0, layout[0] * 0.10))
+
+    def orb_geometry(self, xi, yi):
+        """(centre x, centre y, radius) of the orb painted for
+        one measured node, or None when the node has no orb -
+        the same projection and radius the painter uses, so the
+        suite can check the orb is really on the glass."""
+        data = self._data
+        if not data:
+            return None
+        values = data.get("values") or []
+        try:
+            value = values[xi][yi]
+        except (IndexError, TypeError):
+            return None
+        if value is None:
+            return None
+        point = self.project(xi, yi, value)
+        if point is None:
+            return None
+        return point[0], point[1], self._orb_radius()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), self.BACKGROUND)
+        data = self._data
+        nx, ny = self._grid()
+        if not data or not nx or not ny:
+            painter.setPen(self.LABEL_COLOR)
+            painter.drawText(
+                self.rect(), Qt.AlignCenter,
+                "No surface to show yet.")
+            return
+        values = data.get("values") or []
+        filled = surface_filled_values(values)
+        partial = data.get("partial") or []
+
+        def _partial_at(xi, yi):
+            try:
+                return bool(partial[xi][yi])
+            except (IndexError, TypeError):
+                return False
+
+        # One projection for the whole paint: the layout is
+        # memoised and the rotation trig is worked out once,
+        # here - a full block grid walks thousands of points
+        # through it.
+        layout = self._layout()
+        if layout is None:
+            return
+        scale, origin_x, origin_y, height_span = layout
+        centre_x = (nx - 1) / 2.0
+        centre_y = (ny - 1) / 2.0
+        az = math.radians(self._azimuth)
+        el = math.radians(self._elevation)
+        cos_az, sin_az = math.cos(az), math.sin(az)
+        cos_el, sin_el = math.cos(el), math.sin(el)
+
+        def proj(fx, fy, value):
+            """Grid position + score to (pixel x, pixel y,
+            depth) - the same maths as project(), inlined."""
+            gx = fx - centre_x
+            gy = fy - centre_y
+            gz = (value or 0.0) / 100.0 * height_span
+            xr = gx * cos_az - gy * sin_az
+            yr = gx * sin_az + gy * cos_az
+            sy = gz * sin_el - yr * cos_el
+            depth = yr * sin_el + gz * cos_el
+            return (origin_x + xr * scale,
+                    origin_y - sy * scale, depth)
+
+        def _mix(color, other, frac):
+            return QColor(
+                int(color.red()
+                    + (other.red() - color.red()) * frac),
+                int(color.green()
+                    + (other.green() - color.green()) * frac),
+                int(color.blue()
+                    + (other.blue() - color.blue()) * frac))
+
+        white = QColor(255, 255, 255)
+
+        # The wireframe cage around the plot (the reference's
+        # plot box): base rectangle, four corner posts, top
+        # frame, and a faint grid on the two back walls. Drawn
+        # before the blocks, so the landscape occludes it where
+        # the two overlap - the cage reads as a box the surface
+        # sits inside.
+        margin_x = self._axis_margin(nx)
+        margin_y = self._axis_margin(ny)
+        cage_x0, cage_x1 = -margin_x, nx - 1 + margin_x
+        cage_y0, cage_y1 = -margin_y, ny - 1 + margin_y
+        cage_pen = QPen(QColor(74, 94, 134), 1)
+        wall_pen = QPen(QColor(74, 94, 134, 110), 1)
+
+        def _line(a, b, pen):
+            painter.setPen(pen)
+            painter.drawLine(int(a[0]), int(a[1]),
+                             int(b[0]), int(b[1]))
+
+        cage_corners = [(cage_x0, cage_y0), (cage_x1, cage_y0),
+                        (cage_x1, cage_y1), (cage_x0, cage_y1)]
+        for i in range(4):
+            ax_, ay_ = cage_corners[i]
+            bx_, by_ = cage_corners[(i + 1) % 4]
+            _line(proj(ax_, ay_, 0.0), proj(bx_, by_, 0.0), cage_pen)
+            _line(proj(ax_, ay_, 100.0), proj(bx_, by_, 100.0),
+                  cage_pen)
+            _line(proj(ax_, ay_, 0.0), proj(ax_, ay_, 100.0),
+                  cage_pen)
+        # The back walls - the two turned away from the viewer -
+        # get the faint grid: horizontal height lines and a few
+        # verticals, like graph paper behind glass.
+        view_x = sin_az * sin_el
+        view_y = cos_az * sin_el
+        back_x = cage_x0 if view_x >= 0 else cage_x1
+        back_y = cage_y0 if view_y >= 0 else cage_y1
+        for frac in (0.25, 0.5, 0.75):
+            _line(proj(back_x, cage_y0, frac * 100.0),
+                  proj(back_x, cage_y1, frac * 100.0), wall_pen)
+            _line(proj(cage_x0, back_y, frac * 100.0),
+                  proj(cage_x1, back_y, frac * 100.0), wall_pen)
+            _line(proj(back_x,
+                       cage_y0 + (cage_y1 - cage_y0) * frac, 0.0),
+                  proj(back_x,
+                       cage_y0 + (cage_y1 - cage_y0) * frac, 100.0),
+                  wall_pen)
+            _line(proj(cage_x0 + (cage_x1 - cage_x0) * frac,
+                       back_y, 0.0),
+                  proj(cage_x0 + (cage_x1 - cage_x0) * frac,
+                       back_y, 100.0),
+                  wall_pen)
+        # The base grid at height 0, so the landscape has a floor
+        # to sit on and gaps read as gaps.
+        painter.setPen(QPen(self.GRID_LINE, 1))
+        for xi in range(nx):
+            for yi in range(ny):
+                if xi + 1 < nx:
+                    a = proj(xi, yi, 0.0)
+                    b = proj(xi + 1, yi, 0.0)
+                    painter.drawLine(
+                        int(a[0]), int(a[1]), int(b[0]), int(b[1]))
+                if yi + 1 < ny:
+                    a = proj(xi, yi, 0.0)
+                    b = proj(xi, yi + 1, 0.0)
+                    painter.drawLine(
+                        int(a[0]), int(a[1]), int(b[0]), int(b[1]))
+        # The landscape itself: discrete blocks, one per render
+        # sample, drawn far to near by their ground depth so
+        # nearer blocks cover the sides of farther ones. Each
+        # block is a box: two viewer-facing side faces down to
+        # the base (the same ramp darkened, in two shades - the
+        # low walls read blue, like the reference's), then a lit
+        # top face with a darker edge line so the grid of cubes
+        # reads. High blocks get a soft orange halo first - a
+        # cheap bloom, so the peaks shine.
+        face_x = 1 if view_x >= 0 else -1
+        face_y = 1 if view_y >= 0 else -1
+        blocks = self._block_samples(filled, nx, ny)
+        blocks.sort(key=lambda b: proj(b[0], b[1], 0.0)[2])
+        for fx, fy, step_x, step_y, value in blocks:
+            half_x = step_x * 0.47
+            half_y = step_y * 0.47
+            x_lo, x_hi = fx - half_x, fx + half_x
+            y_lo, y_hi = fy - half_y, fy + half_y
+            base = QColor(*surface_rgb(value))
+            top_points = [proj(x_lo, y_lo, value),
+                          proj(x_hi, y_lo, value),
+                          proj(x_hi, y_hi, value),
+                          proj(x_lo, y_hi, value)]
+            top_poly = QPolygonF(
+                [QPointF(p[0], p[1]) for p in top_points])
+            if value > 70.0:
+                # A soft radial bloom behind the top face - no
+                # hard edge, so the peak reads as glow, not as a
+                # smudge pasted behind the block.
+                halo_alpha = int(16 + 44 * (value - 70.0) / 30.0)
+                cxp = sum(p[0] for p in top_points) / 4.0
+                cyp = sum(p[1] for p in top_points) / 4.0
+                halo_w = max(p[0] for p in top_points) \
+                    - min(p[0] for p in top_points)
+                halo_h = max(p[1] for p in top_points) \
+                    - min(p[1] for p in top_points)
+                halo_grad = QRadialGradient(
+                    QPointF(cxp, cyp),
+                    max(halo_w, halo_h) * 0.95,
+                    QPointF(cxp, cyp))
+                halo_grad.setColorAt(
+                    0.0, QColor(255, 122, 16, halo_alpha))
+                halo_grad.setColorAt(
+                    1.0, QColor(255, 122, 16, 0))
+                painter.setBrush(QBrush(halo_grad))
+                painter.setPen(Qt.NoPen)
+                painter.drawEllipse(
+                    QPointF(cxp, cyp),
+                    halo_w * 0.95, max(halo_h * 0.95, 2.0))
+            # The side faces: the x-facing wall, then the
+            # y-facing wall, each from the top edge down to the
+            # base plane.
+            fx_face = x_hi if face_x > 0 else x_lo
+            side = QPolygonF([
+                QPointF(*proj(fx_face, y_lo, value)[:2]),
+                QPointF(*proj(fx_face, y_hi, value)[:2]),
+                QPointF(*proj(fx_face, y_hi, 0.0)[:2]),
+                QPointF(*proj(fx_face, y_lo, 0.0)[:2])])
+            painter.setBrush(QBrush(base.darker(165)))
+            painter.setPen(Qt.NoPen)
+            painter.drawPolygon(side)
+            fy_face = y_hi if face_y > 0 else y_lo
+            side = QPolygonF([
+                QPointF(*proj(x_lo, fy_face, value)[:2]),
+                QPointF(*proj(x_hi, fy_face, value)[:2]),
+                QPointF(*proj(x_hi, fy_face, 0.0)[:2]),
+                QPointF(*proj(x_lo, fy_face, 0.0)[:2])])
+            painter.setBrush(QBrush(base.darker(135)))
+            painter.setPen(Qt.NoPen)
+            painter.drawPolygon(side)
+            # The top face: a slight vertical gradient, lighter
+            # at the top edge, so the tops read lit, not flat.
+            top_base = _mix(base, white, 0.06)
+            top_light = _mix(base, white, 0.26)
+            ys = [p[1] for p in top_points]
+            if max(ys) - min(ys) > 2.0:
+                gradient = QLinearGradient(0, min(ys), 0, max(ys))
+                gradient.setColorAt(0.0, top_light)
+                gradient.setColorAt(1.0, top_base)
+                painter.setBrush(QBrush(gradient))
+            else:
+                painter.setBrush(QBrush(top_base))
+            painter.setPen(QPen(base.darker(150), 1))
+            painter.drawPolygon(top_poly)
+        # The measured points, on top of the blocks: glossy
+        # orbs, like the spheres on the reference - a radial-
+        # gradient sphere with an offset white highlight and a
+        # soft halo behind it. A point still being measured is
+        # a ghost orb: translucent fill, dashed outline. The
+        # selection keeps its clear white ring. Drawn far to
+        # near, so a nearer orb overlaps a farther one.
+        orb_radius = self._orb_radius()
+        orbs = []
+        for xi in range(nx):
+            for yi in range(ny):
+                value = values[xi][yi]
+                if value is None:
+                    continue
+                point = proj(xi, yi, value)
+                orbs.append((point[2], xi, yi, value, point))
+        orbs.sort(key=lambda orb: orb[0])
+        for _depth, xi, yi, value, point in orbs:
+            cxp, cyp = point[0], point[1]
+            color = QColor(*surface_rgb(value))
+            if _partial_at(xi, yi):
+                ghost = QColor(color)
+                ghost.setAlpha(110)
+                painter.setBrush(QBrush(ghost))
+                painter.setPen(QPen(color.lighter(160), 1,
+                                    Qt.DashLine))
+                painter.drawEllipse(
+                    QPointF(cxp, cyp), orb_radius, orb_radius)
+            else:
+                halo_grad = QRadialGradient(
+                    QPointF(cxp, cyp), orb_radius * 1.9,
+                    QPointF(cxp, cyp))
+                halo = QColor(color)
+                halo.setAlpha(64)
+                halo_grad.setColorAt(0.0, halo)
+                halo.setAlpha(0)
+                halo_grad.setColorAt(1.0, halo)
+                painter.setBrush(QBrush(halo_grad))
+                painter.setPen(Qt.NoPen)
+                painter.drawEllipse(
+                    QPointF(cxp, cyp),
+                    orb_radius * 1.9, orb_radius * 1.9)
+                gradient = QRadialGradient(
+                    QPointF(cxp - orb_radius * 0.35,
+                            cyp - orb_radius * 0.35),
+                    orb_radius * 1.35,
+                    QPointF(cxp - orb_radius * 0.35,
+                            cyp - orb_radius * 0.35))
+                gradient.setColorAt(0.0, _mix(color, white, 0.75))
+                gradient.setColorAt(0.35, _mix(color, white, 0.35))
+                gradient.setColorAt(0.75, color)
+                gradient.setColorAt(1.0, color.darker(125))
+                painter.setBrush(QBrush(gradient))
+                painter.setPen(QPen(color.darker(160), 1))
+                painter.drawEllipse(
+                    QPointF(cxp, cyp), orb_radius, orb_radius)
+                painter.setBrush(
+                    QBrush(QColor(255, 255, 255, 235)))
+                painter.setPen(Qt.NoPen)
+                painter.drawEllipse(
+                    QPointF(cxp - orb_radius * 0.38,
+                            cyp - orb_radius * 0.42),
+                    orb_radius * 0.20, orb_radius * 0.20)
+            if self._selected == (xi, yi):
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor(255, 255, 255), 2))
+                painter.drawEllipse(
+                    QPointF(cxp, cyp),
+                    orb_radius + 4, orb_radius + 4)
+        # Axis labels: x along the front edge (the last y row),
+        # y along the left edge (the first x column). Each sits
+        # on a dark backing, so it stays readable where the
+        # raised surface passes behind it.
+        painter.setPen(self.LABEL_COLOR)
+        font = painter.font()
+        font.setPointSize(max(7, font.pointSize() - 2))
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        backing = QColor(10, 14, 26, 178)
+
+        def _label(rect, align, text):
+            painter.setBrush(QBrush(backing))
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(rect)
+            painter.setPen(self.LABEL_COLOR)
+            painter.drawText(rect, align, text)
+
+        for xi, label in enumerate(data.get("x_labels") or []):
+            point = self._project_full(xi, ny - 1, 0.0)
+            text = metrics.elidedText(str(label), Qt.ElideRight, 96)
+            _label(QRect(int(point[0]) - 48, int(point[1]) + 6, 96, 16),
+                   Qt.AlignHCenter | Qt.AlignTop, text)
+        for yi, label in enumerate(data.get("y_labels") or []):
+            point = self._project_full(0, yi, 0.0)
+            text = metrics.elidedText(str(label), Qt.ElideRight, 60)
+            _label(QRect(int(point[0]) - 64, int(point[1]) - 8, 60, 16),
+                   Qt.AlignRight | Qt.AlignVCenter, text)
+        title = data.get("title") or ""
+        if title:
+            painter.setPen(self.TITLE_COLOR)
+            title_font = painter.font()
+            title_font.setPointSize(font.pointSize() + 1)
+            painter.setFont(title_font)
+            painter.drawText(10, 18, title)
+
+    # -- interaction ---------------------------------------------------
+
+    def mousePressEvent(self, event):
+        self._press_pos = event.position()
+        self._last_pos = event.position()
+        self._dragged = False
+
+    def mouseMoveEvent(self, event):
+        if self._press_pos is None:
+            return
+        pos = event.position()
+        total = math.hypot(pos.x() - self._press_pos.x(),
+                           pos.y() - self._press_pos.y())
+        if total > 4:
+            self._dragged = True
+        if self._dragged and self._last_pos is not None:
+            dx = pos.x() - self._last_pos.x()
+            dy = pos.y() - self._last_pos.y()
+            self._azimuth += dx * 0.35
+            self._elevation = max(
+                8.0, min(85.0, self._elevation - dy * 0.3))
+            self.update()
+        self._last_pos = pos
+
+    def mouseReleaseEvent(self, event):
+        was_drag = self._dragged
+        self._press_pos = None
+        self._last_pos = None
+        self._dragged = False
+        if was_drag:
+            return
+        pos = event.position()
+        hit = self.pick(pos.x(), pos.y())
+        self._selected = hit
+        if hit is None:
+            self.point_picked.emit("")
+        else:
+            detail = (self._data.get("details") or {}).get(
+                f"{hit[0]},{hit[1]}", "")
+            self.point_picked.emit(detail)
+        self.update()
+
+    def wheelEvent(self, event):
+        steps = event.angleDelta().y() / 120.0
+        if steps:
+            self._zoom = max(0.5, min(3.0, self._zoom * (1.12 ** steps)))
+            self.update()
+
+
+# ---------------------------------------------------------------------------
+# The real-3D surface (v26 wire-in): the vendored Light Engine
+# in the Surface tab, with the painted surface as its fallback.
+# The engine import is LAZY - a launch without PySide6, a
+# headless run, and the offscreen suite never touch it.
+# ---------------------------------------------------------------------------
+
+_LIGHT_ENGINE_MODS = None
+
+
+def _load_light_engine():
+    """Import the vendored Light Engine. Returns (scene module,
+    viewport module). Raises on failure - the caller decides
+    what a failure means (the painted surface)."""
+    global _LIGHT_ENGINE_MODS
+    if _LIGHT_ENGINE_MODS is not None:
+        return _LIGHT_ENGINE_MODS
+    if APP_DIR not in sys.path:
+        sys.path.insert(0, APP_DIR)
+    from light_engine import scene as _scene_mod
+    from light_engine import viewport as _viewport_mod
+    _LIGHT_ENGINE_MODS = (_scene_mod, _viewport_mod)
+    return _LIGHT_ENGINE_MODS
+
+
+def gl_surface_available():
+    """(can the Surface tab use the real-3D renderer, why not):
+    the checks that can be made without a GL context. A context
+    can still fail after these pass (a driver without OpenGL
+    3.3); GLSurfaceView notices that at first show and falls
+    back to the painted surface, so a wrong "yes" here costs a
+    swap, never a dead tab."""
+    if os.environ.get("OST_NO_GL"):
+        return False, "OST_NO_GL is set"
+    if QApplication.instance() is not None \
+            and QApplication.platformName() == "offscreen":
+        return False, "the offscreen platform has no GL context"
+    try:
+        _load_light_engine()
+    except Exception as exc:  # ImportError and anything under it
+        return False, f"the Light Engine did not import: {exc}"
+    return True, ""
+
+
+_SURFACE_VIEWPORT_CLS = None
+
+
+def _surface_viewport_class():
+    """The vendored Viewport dressed for the surface - defined
+    lazily, like the engine import it stands on."""
+    global _SURFACE_VIEWPORT_CLS
+    if _SURFACE_VIEWPORT_CLS is not None:
+        return _SURFACE_VIEWPORT_CLS
+    _scene_mod, viewport_mod = _load_light_engine()
+
+    class SurfaceViewport(viewport_mod.Viewport):
+        """Reblend's viewport as OST's surface: the navy room
+        (the app's stock clear is dark grey), no floor grid
+        (the cage is scene geometry), the gizmo suppressed
+        (nothing here is the user's to drag but the camera),
+        and no modal shader-error dialog - when the renderer
+        cannot start, the host notices and swaps in the
+        painted surface instead of popping an error over a
+        benchmark.
+
+        Clicks pick orbs by projection: the host supplies
+        _surface_pick(x, y) -> (x index, y index) or None,
+        which projects the orbs' world positions through this
+        viewport's own view/projection matrices; the result
+        comes back through surface_picked. Dragging still
+        orbits and the wheel still zooms - those are the
+        engine's own handlers, untouched."""
+
+        surface_picked = Signal(object)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.set_gizmo_suppressed(True)
+            self._surface_pick = None
+            self._shown_callback = None
+
+        def initializeGL(self):
+            super().initializeGL()
+            if self._gl is not None:
+                self._gl.glClearColor(0.024, 0.039, 0.094, 1.0)
+
+        def _draw_grid(self, gl, proj, view):
+            pass
+
+        def _show_shader_error(self):
+            pass
+
+        def showEvent(self, event):
+            super().showEvent(event)
+            if self._shown_callback is not None:
+                callback = self._shown_callback
+                self._shown_callback = None
+                callback()
+
+        def mouseReleaseEvent(self, event):
+            # The engine's own release also ray-picks an object
+            # and arms the selection; here a click (a press that
+            # did not become a drag) goes to the surface's
+            # projection picker instead. The drag bookkeeping
+            # is the engine's own, kept identical.
+            if (self._press_pos is not None
+                    and event.button() == Qt.LeftButton):
+                moved = (event.position().toPoint()
+                         - self._press_pos).manhattanLength()
+                if moved < 5 and self._surface_pick is not None:
+                    pos = event.position().toPoint()
+                    self.surface_picked.emit(
+                        self._surface_pick(pos.x(), pos.y()))
+            self._drag_button = None
+            self._drag_pos = None
+            self._press_pos = None
+            super(viewport_mod.Viewport, self).mouseReleaseEvent(
+                event)
+
+    _SURFACE_VIEWPORT_CLS = SurfaceViewport
+    return SurfaceViewport
+
+
+def _surface_cage_objects(scene_mod, desc):
+    """The cage as engine objects, from the description: base
+    and top rectangles, four posts, and faint horizontal lines
+    on the two back walls (the +y wall and the -x wall, as the
+    default camera sees them). Nothing casts or receives a
+    shadow - the frame must never darken the data."""
+    cage = desc["cage"]
+    field = desc["field"]
+    top = desc["cage_top"]
+    m = cage["margin"]
+    t = cage["bar"]
+    x0, x1, y0, y1 = -m, field + m, -m, field + m
+    bars = []
+
+    def bar(name, cx, cy, cz, sx, sy, sz, color):
+        obj = scene_mod.new_object(
+            "box", name=name, position=[cx, cy, cz],
+            params={"size": [sx, sy, sz]},
+            material={"base_color": color, "roughness": 0.7,
+                      "metalness": 0.0})
+        obj["cast_shadow"] = False
+        obj["receive_shadow"] = False
+        bars.append(obj)
+
+    for z in (0.6, top):
+        bar("cage", (x0 + x1) / 2, y0, z, x1 - x0, t, t,
+            cage["color"])
+        bar("cage", (x0 + x1) / 2, y1, z, x1 - x0, t, t,
+            cage["color"])
+        bar("cage", x0, (y0 + y1) / 2, z, t, y1 - y0, t,
+            cage["color"])
+        bar("cage", x1, (y0 + y1) / 2, z, t, y1 - y0, t,
+            cage["color"])
+    for px in (x0, x1):
+        for py in (y0, y1):
+            bar("cage post", px, py, top / 2, t, t, top,
+                cage["color"])
+    gt = cage["grid_bar"]
+    for z in (26.0, 52.0, 78.0):
+        bar("cage grid", (x0 + x1) / 2, y1, z, x1 - x0, gt, gt,
+            cage["grid_color"])
+        bar("cage grid", x0, (y0 + y1) / 2, z, gt, y1 - y0, gt,
+            cage["grid_color"])
+    return bars
+
+
+class GLSurfaceView(QWidget):
+    """The Surface tab's real-3D surface: the vendored Light
+    Engine drawing the shared surface-data shape as a voxel
+    landscape - matte blocks, satin orbs resting on their
+    columns, a whisper-thin cage, in a near-black navy room.
+
+    The host carries SurfaceView's exact API (the window and
+    the Compare wiring cannot tell the two apart) and owns the
+    state - current data, the morph and its Play/Pause - while
+    the drawing is delegated: to the GL viewport while it is
+    healthy, and to a plain SurfaceView if the GL context
+    never comes up (old driver, no GL). `uses_gl` says which
+    child is live; a swap keeps the data, the morph and the
+    selection, so the tab is never dead and never loses the
+    run it was showing.
+
+    Scene discipline: the engine scene is BUILT only when the
+    axis set (models x templates) changes. Every update after
+    that - each task landing in a live run, each morph frame -
+    only mutates the objects already there: a column's scale,
+    position and colour, an orb's position, colour and
+    visibility. Live (coalesced) updates apply at most once
+    every 500 ms.
+    """
+
+    point_picked = Signal(str)
+    morph_t_changed = Signal(float)
+    morph_playing_changed = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(240)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._data = None
+        self._morph_a = None
+        self._morph_b = None
+        self._morph_t = 0.0
+        self._morph_dir = 1.0
+        self._playing = False
+        self._selected = None
+        self._morph_timer = QTimer(self)
+        self._morph_timer.setInterval(33)
+        self._morph_timer.timeout.connect(self._morph_tick)
+        self._apply_timer = QTimer(self)
+        self._apply_timer.setSingleShot(True)
+        self._apply_timer.setInterval(500)
+        self._apply_timer.timeout.connect(self._apply_now)
+        self._painter = None
+        self._viewport = None
+        self._scene_mod = None
+        self._uses_gl = False
+        self._gl_scene = None
+        self._gl_axes = None
+        self._gl_columns = {}
+        self._gl_orbs = {}
+        self._gl_desc = None
+        try:
+            self._build_gl_child()
+        except Exception:
+            self._viewport = None
+            self._uses_gl = False
+            self._build_painter_child()
+        self._layout.addWidget(self._child_widget())
+        if self._uses_gl:
+            # The empty cage stands in the room from the start,
+            # before any run gives it data.
+            self._gl_apply(None)
+
+    # -- children ---------------------------------------------------
+
+    def _child_widget(self):
+        return self._viewport if self._uses_gl else self._painter
+
+    def _build_gl_child(self):
+        scene_mod, _viewport_mod = _load_light_engine()
+        self._scene_mod = scene_mod
+        viewport = _surface_viewport_class()(self)
+        viewport.set_quality_mode("final")
+        viewport._surface_pick = self._gl_pick
+        viewport.surface_picked.connect(self._on_gl_picked)
+        viewport._shown_callback = self._arm_gl_health_check
+        self._viewport = viewport
+        self._uses_gl = True
+
+    def _build_painter_child(self):
+        if self._painter is not None:
+            return
+        painter = SurfaceView(self)
+        painter.point_picked.connect(self.point_picked)
+        self._painter = painter
+
+    @property
+    def uses_gl(self):
+        return self._uses_gl
+
+    def _arm_gl_health_check(self):
+        QTimer.singleShot(1500, self._check_gl_health)
+
+    def _check_gl_health(self):
+        """First show + a grace period: if the context never
+        came up (no GL, or a driver without OpenGL 3.3 - the
+        engine records that as _shader_error), swap in the
+        painted surface with the same data."""
+        if not self._uses_gl or self._viewport is None:
+            return
+        vp = self._viewport
+        if vp._gl is None or vp._shader_error is not None \
+                or not vp.isValid():
+            self._swap_to_painter()
+
+    def _swap_to_painter(self):
+        if not self._uses_gl:
+            return
+        self._uses_gl = False
+        viewport, self._viewport = self._viewport, None
+        if viewport is not None:
+            self._layout.removeWidget(viewport)
+            viewport.hide()
+            viewport.deleteLater()
+        self._gl_scene = None
+        self._gl_axes = None
+        self._gl_columns = {}
+        self._gl_orbs = {}
+        self._build_painter_child()
+        self._layout.addWidget(self._painter)
+        if self._data is not None:
+            self._painter.set_data(self._data)
+
+    # -- the SurfaceView API -----------------------------------------
+
+    def set_data(self, data, coalesce=False):
+        """Show one surface (leaving morph mode). With
+        coalesce, a GL apply is batched to at most one every
+        500 ms - the live run's feed uses it."""
+        self._morph_a = None
+        self._morph_b = None
+        if self._playing:
+            self._playing = False
+            self._morph_timer.stop()
+            self.morph_playing_changed.emit(False)
+        self._data = data
+        self._selected = None
+        self._apply_display(coalesce=coalesce)
+
+    def set_morph(self, data_a, data_b):
+        """Morph mode between two surfaces, starting at A. The
+        scene is built once, for the union axes the morph data
+        carries; every step after that is a mutation."""
+        self._morph_a = data_a
+        self._morph_b = data_b
+        self._morph_t = 0.0
+        self._morph_dir = 1.0
+        self._selected = None
+        self._data = morph_surface_data(data_a, data_b, 0.0)
+        self._apply_display()
+
+    def in_morph_mode(self):
+        return self._morph_a is not None
+
+    def morph_t(self):
+        return self._morph_t
+
+    def set_morph_t(self, t):
+        if not self.in_morph_mode():
+            return
+        self._morph_t = max(0.0, min(1.0, float(t)))
+        self._data = morph_surface_data(
+            self._morph_a, self._morph_b, self._morph_t)
+        self._selected = None
+        self.morph_t_changed.emit(self._morph_t)
+        self._apply_display()
+
+    def is_playing(self):
+        return self._playing
+
+    def toggle_play(self):
+        if not self.in_morph_mode():
+            return
+        self._playing = not self._playing
+        if self._playing:
+            self._morph_timer.start()
+        else:
+            self._morph_timer.stop()
+        self.morph_playing_changed.emit(self._playing)
+
+    def _morph_tick(self):
+        step = 0.008  # a full sweep in about four seconds
+        t = self._morph_t + self._morph_dir * step
+        if t >= 1.0:
+            t = 1.0
+            self._morph_dir = -1.0
+        elif t <= 0.0:
+            t = 0.0
+            self._morph_dir = 1.0
+        self.set_morph_t(t)
+
+    def current_data(self):
+        return self._data
+
+    def selected(self):
+        return self._selected
+
+    def _apply_display(self, coalesce=False):
+        if self._uses_gl:
+            if coalesce:
+                if not self._apply_timer.isActive():
+                    self._apply_timer.start()
+            else:
+                self._apply_timer.stop()
+                self._apply_now()
+        elif self._painter is not None:
+            self._painter.set_data(self._data, coalesce=coalesce)
+
+    def _apply_now(self):
+        if self._uses_gl:
+            self._gl_apply(self._data)
+
+    # -- picking ------------------------------------------------------
+
+    def pick(self, px, py):
+        """The measured node nearest a widget pixel, or None -
+        through whichever child is live."""
+        if self._uses_gl:
+            return self._gl_pick(px, py)
+        if self._painter is not None:
+            return self._painter.pick(px, py)
+        return None
+
+    def project(self, xi, yi, value):
+        """The widget pixel (x, y) of one node at a score,
+        through the live child's own projection."""
+        if self._uses_gl:
+            desc = self._gl_desc
+            if not desc:
+                return None
+            nx = len(desc["x_labels"])
+            ny = len(desc["y_labels"])
+            if not nx or not ny:
+                return None
+            x, y = surface_node_position(xi, yi, nx, ny)
+            z = surface_height_of(value or 0.0) \
+                + desc["orb_radius"]
+            return self._gl_project(x, y, z)
+        if self._painter is not None:
+            return self._painter.project(xi, yi, value)
+        return None
+
+    def orb_geometry(self, xi, yi):
+        """(centre x, centre y, radius) in pixels of one
+        measured node's orb, or None - the live child's own
+        geometry, so a check can prove the orb is on the
+        glass."""
+        if self._uses_gl:
+            data = self._data
+            if not data:
+                return None
+            values = data.get("values") or []
+            try:
+                value = values[xi][yi]
+            except (IndexError, TypeError):
+                return None
+            if value is None:
+                return None
+            centre = self.project(xi, yi, value)
+            if centre is None:
+                return None
+            desc = self._gl_desc
+            nx = len(desc["x_labels"])
+            ny = len(desc["y_labels"])
+            x, y = surface_node_position(xi, yi, nx, ny)
+            radius = desc["orb_radius"]
+            z = surface_height_of(value) + radius
+            edge = self._gl_project(x + radius, y, z)
+            if edge is None:
+                return None
+            return centre[0], centre[1], abs(edge[0] - centre[0])
+        if self._painter is not None:
+            return self._painter.orb_geometry(xi, yi)
+        return None
+
+    def _gl_project(self, x, y, z):
+        """World point to widget pixel through the viewport
+        camera's own view/projection matrices (the same
+        matrices its paint uses). None when the point is
+        behind the camera."""
+        vp = self._viewport
+        if vp is None:
+            return None
+        from PySide6.QtGui import QVector3D
+        proj, view = vp._matrices()
+        combined = proj * view
+        flat = combined.data()
+        w = flat[3] * x + flat[7] * y + flat[11] * z + flat[15]
+        if w <= 1e-6:
+            return None
+        ndc = combined.map(QVector3D(x, y, z))
+        width = max(1, vp.width())
+        height = max(1, vp.height())
+        return ((ndc.x() + 1.0) / 2.0 * width,
+                (1.0 - ndc.y()) / 2.0 * height)
+
+    def _gl_pick(self, px, py):
+        """The measured node whose orb projects nearest the
+        pixel, within about 22 px - the design's picking rule,
+        run on the viewport's own camera maths."""
+        desc = self._gl_desc
+        if not desc or not desc["orbs"]:
+            return None
+        radius = desc["orb_radius"]
+        best = None
+        best_dist = 22.0
+        for orb in desc["orbs"]:
+            point = self._gl_project(
+                orb["x"], orb["y"], orb["height"] + radius)
+            if point is None:
+                continue
+            dist = math.hypot(point[0] - px, point[1] - py)
+            if dist < best_dist:
+                best_dist = dist
+                best = (orb["xi"], orb["yi"])
+        return best
+
+    def _on_gl_picked(self, hit):
+        self._selected = hit
+        vp = self._viewport
+        if vp is not None:
+            orb_obj = self._gl_orbs.get(hit) if hit else None
+            vp.selected_id = orb_obj["id"] if orb_obj else None
+            vp.update()
+        if hit is None or not self._data:
+            self.point_picked.emit("")
+        else:
+            detail = (self._data.get("details") or {}).get(
+                f"{hit[0]},{hit[1]}", "")
+            self.point_picked.emit(detail)
+
+    # -- the engine scene ----------------------------------------------
+
+    def _gl_apply(self, data):
+        vp = self._viewport
+        if vp is None:
+            return
+        desc = surface_scene_description(data)
+        self._gl_desc = desc
+        axes = (tuple(desc["x_labels"]), tuple(desc["y_labels"]))
+        if self._gl_scene is None or axes != self._gl_axes:
+            self._gl_build(desc)
+        else:
+            self._gl_mutate(desc)
+        vp.update()
+
+    def _gl_build(self, desc):
+        """A fresh scene for a new axis set: the slab, the
+        cage, one unit-box object per render-grid slot and one
+        unit-sphere object per node - all transforms and
+        colours come from _gl_mutate, so a build and an update
+        can never disagree about where things stand."""
+        scene_mod = self._scene_mod
+        scene = scene_mod.new_scene("OST surface")
+        scene["lights"] = desc["lights"]
+        objects = scene["objects"]
+        field = desc["field"]
+        slab = scene_mod.new_object(
+            "box", name="base slab",
+            position=[field / 2, field / 2, -2.05],
+            params={"size": [field + 28, field + 28, 4.0]},
+            material={"base_color": "#0a1120", "roughness": 0.95,
+                      "metalness": 0.0})
+        slab["cast_shadow"] = False
+        objects.append(slab)
+        objects.extend(_surface_cage_objects(scene_mod, desc))
+        self._gl_columns = {}
+        for fx, fy in desc["samples"]:
+            obj = scene_mod.new_object(
+                "box", name="column", position=[0.0, 0.0, 0.0],
+                params={"size": [1.0, 1.0, 1.0]},
+                material={"base_color": "#000000",
+                          "roughness": SURFACE_BLOCK_ROUGHNESS,
+                          "metalness": 0.0})
+            obj["visible"] = False
+            objects.append(obj)
+            self._gl_columns[(fx, fy)] = obj
+        self._gl_orbs = {}
+        nx = len(desc["x_labels"])
+        ny = len(desc["y_labels"])
+        for xi in range(nx):
+            for yi in range(ny):
+                obj = scene_mod.new_object(
+                    "sphere", name="orb", position=[0.0, 0.0, 0.0],
+                    params={"radius": 1.0, "segments": 24,
+                            "rings": 12},
+                    material={"base_color": "#000000",
+                              "roughness": SURFACE_ORB_ROUGHNESS,
+                              "metalness": 0.0})
+                obj["visible"] = False
+                objects.append(obj)
+                self._gl_orbs[(xi, yi)] = obj
+        self._gl_scene = scene
+        self._gl_axes = (tuple(desc["x_labels"]),
+                         tuple(desc["y_labels"]))
+        vp = self._viewport
+        vp.set_scene(scene)
+        camera = desc["camera"]
+        vp.target = tuple(camera["target"])
+        vp.distance = camera["distance"]
+        vp.azimuth = camera["azimuth"]
+        vp.elevation = camera["elevation"]
+        self._gl_mutate(desc)
+
+    def _gl_mutate(self, desc):
+        """Move the standing scene to a new description: no
+        object is created or destroyed - a column's scale,
+        position and colour, an orb's position, colour and
+        visibility. A gap sample hides its column; a gap node
+        hides its orb; a morph frame is just another mutate."""
+        columns = {(c["fx"], c["fy"]): c for c in desc["columns"]}
+        for key, obj in self._gl_columns.items():
+            col = columns.get(key)
+            if col is None:
+                obj["visible"] = False
+                continue
+            obj["visible"] = True
+            obj["position"] = [col["cx"], col["cy"],
+                               col["height"] / 2.0]
+            obj["scale"] = [col["sx"], col["sy"], col["height"]]
+            obj["material"]["base_color"] = col["color"]
+        orbs = {(o["xi"], o["yi"]): o for o in desc["orbs"]}
+        radius = desc["orb_radius"]
+        for key, obj in self._gl_orbs.items():
+            orb = orbs.get(key)
+            if orb is None:
+                obj["visible"] = False
+                continue
+            obj["visible"] = True
+            # The orb rests ON its column: centre one radius
+            # above the column top, never half-sunk.
+            obj["position"] = [orb["x"], orb["y"],
+                               orb["height"] + radius]
+            obj["scale"] = [radius, radius, radius]
+            obj["material"]["base_color"] = orb["color"]
+
+
+def make_surface_view(parent=None):
+    """The surface widget for a tab: the real-3D surface when
+    OpenGL is available, the painted surface otherwise. Both
+    carry the same API, so the window cannot tell them apart -
+    and when the GL context fails after a "yes" from the
+    pre-checks, GLSurfaceView swaps its own child and the tab
+    still never goes dead."""
+    if gl_surface_available()[0]:
+        return GLSurfaceView(parent)
+    return SurfaceView(parent)
+
+
 class MainWindow(QMainWindow):
     # Tab order (R1): setup, run, models, then the v1-v9 tabs.
     TAB_SETUP = 0
@@ -10147,6 +12235,7 @@ class MainWindow(QMainWindow):
     TAB_COMPARE = 5
     TAB_PROVIDERS = 6
     TAB_DIALECT = 7
+    TAB_SURFACE = 8
 
     def __init__(self, instance_server=None):
         super().__init__()
@@ -10247,6 +12336,11 @@ class MainWindow(QMainWindow):
         self._applied_template_set = None
         self.results = {}
         self.result_order = []
+        # v26: the live surface's tracker - the running run's
+        # scores as they land, feeding the Surface tab. _surface_live
+        # is True while the surface on show belongs to a run.
+        self._surface_tracker = SurfaceTracker()
+        self._surface_live = False
         self.templates = []
         self.providers = []
         # The provider being edited on the Providers tab: a working copy
@@ -10326,6 +12420,12 @@ class MainWindow(QMainWindow):
         self.delete_run_button = QPushButton("Delete run")
         self.delete_run_button.clicked.connect(self.delete_selected_run)
         self.delete_run_button.setEnabled(False)
+        # v26: the selected run on the Surface tab.
+        self.history_surface_button = QPushButton("View surface")
+        self.history_surface_button.clicked.connect(
+            self.show_history_surface)
+        self.history_surface_button.setEnabled(False)
+        history_bottom.addWidget(self.history_surface_button)
         self.store_size_label = QLabel("Results use n/a")
         history_bottom.addWidget(self.delete_run_button)
         history_bottom.addWidget(self.store_size_label)
@@ -10436,7 +12536,21 @@ class MainWindow(QMainWindow):
         # ---- Compare tab ----
         compare_tab = QWidget()
         tabs.addTab(compare_tab, "Compare")
-        compare_layout = QVBoxLayout(compare_tab)
+        # v26: the tab scrolls (the v20 treatment from the
+        # Profiles tab). The surface morph section made the
+        # tab's content taller than a 1366x768 screen at bigger
+        # text; the scroll area's minimum is small, so the
+        # window still fits and the tab scrolls instead.
+        compare_scroll = QScrollArea()
+        compare_scroll.setWidgetResizable(True)
+        compare_scroll.setFrameShape(QFrame.NoFrame)
+        compare_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff)
+        compare_content = QWidget()
+        compare_layout = QVBoxLayout(compare_content)
+        compare_scroll.setWidget(compare_content)
+        compare_tab_layout = QVBoxLayout(compare_tab)
+        compare_tab_layout.addWidget(compare_scroll)
         compare_layout.addWidget(QLabel(
             "Two models side by side: their latest score on each "
             "template they ran, plus their overall score and speed. "
@@ -10497,6 +12611,65 @@ class MainWindow(QMainWindow):
         compare_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         compare_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         compare_layout.addWidget(self.compare_table)
+        # v26: the surface morph - two saved runs on the shared
+        # surface, blended from the first to the second (before a
+        # trim and after it, before training and after). Nothing
+        # is picked by default.
+        morph_intro26 = QLabel(
+            "Surface morph: pick two saved runs and watch the "
+            "scores move from the first run's surface to the "
+            "second's. Drag to turn it, scroll to zoom, tap a "
+            "point for its score."
+        )
+        morph_intro26.setWordWrap(True)
+        compare_layout.addWidget(morph_intro26)
+        morph_row = QHBoxLayout()
+        morph_row.addWidget(QLabel("Run 1:"))
+        self.compare_run_a = QComboBox()
+        self.compare_run_a.setSizeAdjustPolicy(
+            QComboBox.AdjustToContents)
+        self.compare_run_a.currentIndexChanged.connect(
+            self._update_compare_morph)
+        morph_row.addWidget(self.compare_run_a)
+        morph_row.addWidget(QLabel("Run 2:"))
+        self.compare_run_b = QComboBox()
+        self.compare_run_b.setSizeAdjustPolicy(
+            QComboBox.AdjustToContents)
+        self.compare_run_b.currentIndexChanged.connect(
+            self._update_compare_morph)
+        morph_row.addWidget(self.compare_run_b)
+        morph_row.addStretch()
+        compare_layout.addLayout(morph_row)
+        self.compare_surface = make_surface_view()
+        self.compare_surface.setMinimumHeight(260)
+        self.compare_surface.point_picked.connect(
+            self._on_compare_surface_picked)
+        self.compare_surface.morph_t_changed.connect(
+            self._on_morph_t_changed)
+        self.compare_surface.morph_playing_changed.connect(
+            self._on_morph_playing_changed)
+        compare_layout.addWidget(self.compare_surface, 1)
+        morph_controls = QHBoxLayout()
+        self.compare_morph_button = QPushButton("Play")
+        self.compare_morph_button.clicked.connect(
+            self._on_compare_morph_play)
+        self.compare_morph_button.setEnabled(False)
+        morph_controls.addWidget(self.compare_morph_button)
+        self.compare_morph_slider = QSlider(Qt.Horizontal)
+        self.compare_morph_slider.setRange(0, 100)
+        self.compare_morph_slider.setValue(0)
+        self.compare_morph_slider.setEnabled(False)
+        self.compare_morph_slider.valueChanged.connect(
+            self._on_compare_morph_slider)
+        morph_controls.addWidget(self.compare_morph_slider, 1)
+        compare_layout.addLayout(morph_controls)
+        self.compare_surface_detail = QLabel(
+            "Pick two runs to morph between their surfaces.")
+        self.compare_surface_detail.setWordWrap(True)
+        compare_layout.addWidget(self.compare_surface_detail)
+        compare_layout.addWidget(QLabel(SURFACE_HONESTY_CAPTION))
+        self._compare_surface_a = None
+        self._compare_surface_b = None
 
         # ---- Providers tab ----
         providers_tab = QWidget()
@@ -10681,6 +12854,7 @@ class MainWindow(QMainWindow):
         provider_columns.addWidget(self.provider_stack, 1)
         providers_layout.addLayout(provider_columns)
         self._build_dialect_tab(tabs)
+        self._build_surface_tab(tabs)
         tabs.currentChanged.connect(self.on_tab_changed)
 
         # R22: Tab in visual order on every tab, and focus that comes
@@ -12165,6 +14339,14 @@ class MainWindow(QMainWindow):
         self.worker.run_started.connect(self.on_run_started)
         self.worker.step_progress.connect(self.on_step_progress)
         self.worker.run_finished.connect(self.on_run_finished)
+        # v26: the Surface tab's live feed - every finished task
+        # grows its cell, every finished template settles it.
+        self.worker.task_done.connect(self._on_surface_task_done)
+        self.worker.template_done.connect(
+            self._on_surface_template_done)
+        self.worker.run_finished.connect(
+            self._on_surface_run_finished)
+        self._surface_begin_run(targets, templates, pairs, resume)
         # v17: a resumed run shows the whole run — the done pairs
         # load into the results before the worker starts.
         if resume is not None:
@@ -12949,11 +15131,14 @@ class MainWindow(QMainWindow):
              self.tryit_ask_button, self.tryit_answer],
             [self.history_model_combo, self.history_refresh_button,
              self.history_list, self.history_scrub_slider,
-             self.history_view, self.delete_run_button],
+             self.history_view, self.delete_run_button,
+             self.history_surface_button],
             [self.profile_model_combo, self.profile_regen_button,
              self.profile_view],
             [self.compare_model_a, self.compare_model_b,
-             self.compare_table],
+             self.compare_table, self.compare_run_a,
+             self.compare_run_b, self.compare_morph_button,
+             self.compare_morph_slider, self.compare_surface],
             [self.provider_list, self.provider_add_button,
              self.provider_remove_button,
              self.provider_add_empty_button,
@@ -12974,6 +15159,7 @@ class MainWindow(QMainWindow):
                self.dialect_run_button, self.dialect_cancel_button,
                self.dialect_summary, self.dialect_report_combo,
                self.dialect_report_button, self.dialect_folder_button],
+            [self.surface_view],
         ]
         for chain in chains:
             for first, second in zip(chain, chain[1:]):
@@ -13027,6 +15213,8 @@ class MainWindow(QMainWindow):
             return self.provider_list
         if index == self.TAB_DIALECT:
             return self.dialect_model_list
+        if index == self.TAB_SURFACE:
+            return self.surface_view
         return None
 
     def refresh_history(self):
@@ -13067,6 +15255,10 @@ class MainWindow(QMainWindow):
         self.delete_run_button.setEnabled(
             selected and self.worker is None
         )
+        if hasattr(self, "history_surface_button"):
+            self.history_surface_button.setEnabled(
+                selected and self.worker is None
+            )
 
     def delete_selected_run(self):
         """Delete the selected run: its file and its media folder go,
@@ -13296,6 +15488,7 @@ class MainWindow(QMainWindow):
             if current in models:
                 combo.setCurrentIndex(models.index(current) + 1)
         self._update_compare()
+        self.refresh_compare_runs()
 
     def _update_compare(self, _index=None):
         """Fill the compare table from the two picked models, or show
@@ -13382,6 +15575,113 @@ class MainWindow(QMainWindow):
             NumericItem(compared["speed_b"],
                         fmt_toks(compared["speed_b"])),
         )
+
+    # -- compare surface morph (v26) --------------------------------
+
+    def refresh_compare_runs(self):
+        """The Compare tab's run pickers for the surface morph:
+        every saved run, newest first, nothing picked by default.
+        Picks survive a refresh while their run still exists."""
+        if not hasattr(self, "compare_run_a"):
+            return
+        results_dir = get_results_dir()
+        current_a = self.compare_run_a.currentData()
+        current_b = self.compare_run_b.currentData()
+        manifests = list_manifests(results_dir)
+        run_ids = [m.get("run_id") for m in manifests]
+        for combo, current in ((self.compare_run_a, current_a),
+                               (self.compare_run_b, current_b)):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Pick a run", None)
+            for manifest in manifests:
+                started = (manifest.get("started") or "").replace(
+                    "T", " ")
+                labels = ", ".join(
+                    t.get("label", "")
+                    for t in manifest.get("targets") or [])
+                combo.addItem(f"{started} - {labels}",
+                              manifest.get("run_id"))
+            combo.blockSignals(False)
+            if current in run_ids:
+                combo.setCurrentIndex(run_ids.index(current) + 1)
+        self._update_compare_morph()
+
+    def _set_morph_controls(self, enabled):
+        self.compare_morph_button.setEnabled(enabled)
+        self.compare_morph_slider.setEnabled(enabled)
+        if not enabled and self.compare_surface.is_playing():
+            self.compare_surface.toggle_play()
+
+    def _update_compare_morph(self, _index=None):
+        """Load the picked runs' surfaces: both picked (and
+        different) starts the morph at Run 1; one picked shows
+        that run's surface alone; the same run twice says so."""
+        if not hasattr(self, "compare_run_a"):
+            return
+        run_a = self.compare_run_a.currentData()
+        run_b = self.compare_run_b.currentData()
+        self._compare_surface_a = None
+        self._compare_surface_b = None
+        results_dir = get_results_dir()
+        if run_a:
+            manifest = load_manifest(results_dir, run_a)
+            if manifest is not None:
+                self._compare_surface_a = surface_data_from_manifest(
+                    results_dir, manifest)
+        if run_b:
+            manifest = load_manifest(results_dir, run_b)
+            if manifest is not None:
+                self._compare_surface_b = surface_data_from_manifest(
+                    results_dir, manifest)
+        if self._compare_surface_a and self._compare_surface_b:
+            if run_a == run_b:
+                self.compare_surface.set_data(self._compare_surface_a)
+                self.compare_surface_detail.setText(
+                    "That is the same run twice. Pick two "
+                    "different runs to see the morph.")
+                self._set_morph_controls(False)
+                return
+            self.compare_morph_slider.blockSignals(True)
+            self.compare_morph_slider.setValue(0)
+            self.compare_morph_slider.blockSignals(False)
+            self.compare_surface.set_morph(
+                self._compare_surface_a, self._compare_surface_b)
+            self.compare_surface_detail.setText(
+                "Press Play, or drag the slider, to move from "
+                "Run 1 to Run 2. Tap a point to see its score.")
+            self._set_morph_controls(True)
+        elif self._compare_surface_a or self._compare_surface_b:
+            self.compare_surface.set_data(
+                self._compare_surface_a or self._compare_surface_b)
+            self.compare_surface_detail.setText(
+                "One run picked. Pick the second run to morph "
+                "between them.")
+            self._set_morph_controls(False)
+        else:
+            self.compare_surface.set_data(None)
+            self.compare_surface_detail.setText(
+                "Pick two runs to morph between their surfaces.")
+            self._set_morph_controls(False)
+
+    def _on_compare_morph_slider(self, value):
+        self.compare_surface.set_morph_t(value / 100.0)
+
+    def _on_morph_t_changed(self, t):
+        self.compare_morph_slider.blockSignals(True)
+        self.compare_morph_slider.setValue(round(t * 100))
+        self.compare_morph_slider.blockSignals(False)
+
+    def _on_compare_morph_play(self):
+        self.compare_surface.toggle_play()
+
+    def _on_morph_playing_changed(self, playing):
+        self.compare_morph_button.setText(
+            "Pause" if playing else "Play")
+
+    def _on_compare_surface_picked(self, text):
+        if text:
+            self.compare_surface_detail.setText(text)
 
     def _update_compare_glance(self, compared):
         """The Compare tab's glance (R14/R16): one tile per model and
@@ -13883,6 +16183,136 @@ class MainWindow(QMainWindow):
         layout.addLayout(report_row)
         self.dialect_worker = None
         self._dialect_folders = {}
+
+    def _build_surface_tab(self, tabs):
+        """The Surface tab (v26): the live 3D decision surface in
+        its own workspace. During a run it builds as tasks finish;
+        after the run it keeps the final surface. A finished run
+        from Past runs can be loaded here too (its View surface
+        button)."""
+        surface_tab = QWidget()
+        tabs.addTab(surface_tab, "Surface")
+        layout = QVBoxLayout(surface_tab)
+        intro = QLabel(
+            "Scores as a landscape: one point for each model and "
+            "test, and the height is the score. Orange peaks are "
+            "strong areas, blue valleys are weak ones. Drag to "
+            "turn the surface, scroll to zoom, tap a point to see "
+            "the score behind it."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.surface_status_label = QLabel(
+            "No run yet. When a test run starts, its scores "
+            "appear here as they land."
+        )
+        self.surface_status_label.setWordWrap(True)
+        layout.addWidget(self.surface_status_label)
+        self.surface_view = make_surface_view()
+        self.surface_view.setMinimumHeight(340)
+        self.surface_view.point_picked.connect(self._on_surface_picked)
+        layout.addWidget(self.surface_view, 1)
+        self.surface_detail_label = QLabel(
+            "Tap a point on the surface to see the score behind it."
+        )
+        self.surface_detail_label.setWordWrap(True)
+        layout.addWidget(self.surface_detail_label)
+        self.surface_caption_label = QLabel(SURFACE_HONESTY_CAPTION)
+        self.surface_caption_label.setWordWrap(True)
+        layout.addWidget(self.surface_caption_label)
+
+    # -- live surface feed (v26) ------------------------------------
+
+    def _surface_begin_run(self, targets, templates, pairs=None,
+                             resume=None):
+        """A run starts: the Surface tab tracks it from its first
+        task. A resume's finished pairs are settled on the
+        surface before the worker starts, like the results
+        table does."""
+        preloaded = resume[1] if resume is not None else None
+        self._surface_tracker.begin(
+            targets, templates, pairs, preloaded)
+        self._surface_live = True
+        self.surface_status_label.setText(
+            "Live run: scores land here as each task finishes.")
+        self.surface_detail_label.setText(
+            "Tap a point on the surface to see the score behind it.")
+        self.surface_view.set_data(
+            self._surface_tracker.data("Live run"))
+
+    def _on_surface_task_done(self, label, template_id, record):
+        if not self._surface_live:
+            return
+        self._surface_tracker.task_done(label, template_id, record)
+        self.surface_view.set_data(
+            self._surface_tracker.data("Live run"), coalesce=True)
+
+    def _on_surface_template_done(self, name, run_data, _path):
+        if not self._surface_live:
+            return
+        self._surface_tracker.template_done(name, run_data)
+        self.surface_view.set_data(
+            self._surface_tracker.data("Live run"), coalesce=True)
+
+    def _on_surface_run_finished(self, reason):
+        if not self._surface_live:
+            return
+        self.surface_view.set_data(
+            self._surface_tracker.data("Latest run"))
+        if reason == "done":
+            self.surface_status_label.setText(
+                "Run finished. This is its final surface - it "
+                "stays here until the next run or until you open "
+                "a saved run from Past runs.")
+        elif reason == "ollama_down":
+            self.surface_status_label.setText(
+                "The run stopped when Ollama went down. Points "
+                "still hollow were being measured when it stopped; "
+                "templates with no point were never measured.")
+        else:
+            self.surface_status_label.setText(
+                "Run cancelled. Points still hollow were being "
+                "measured when it stopped; the scores shown are "
+                "the tasks that did finish.")
+
+    def _on_surface_picked(self, text):
+        self.surface_detail_label.setText(
+            text or "Tap a point on the surface to see the score "
+                    "behind it.")
+
+    def show_history_surface(self):
+        """Past runs' View surface: load the selected run onto
+        the Surface tab - the whole run it belongs to when its
+        manifest is still there, else the model's latest score
+        on each template."""
+        item = self.history_list.currentItem()
+        if item is None:
+            return
+        path = item.data(Qt.UserRole)
+        results_dir = get_results_dir()
+        data = None
+        source = ""
+        for manifest in list_manifests(results_dir):
+            run_files = manifest.get("run_files") or {}
+            if any(os.path.normpath(os.path.join(results_dir, rel))
+                   == os.path.normpath(path)
+                   for rel in run_files.values()):
+                data = surface_data_from_manifest(results_dir, manifest)
+                source = "the run this result belongs to"
+                break
+        if data is None:
+            slug = self.history_model_combo.currentData()
+            if not slug:
+                return
+            data = surface_data_from_model_runs(results_dir, slug)
+            source = "this model's latest score on each template"
+        self._surface_live = False
+        self.surface_view.set_data(data)
+        self.surface_status_label.setText(
+            f"Showing {source}: {data.get('title', '')}.")
+        self.surface_detail_label.setText(
+            "Tap a point on the surface to see the score behind it.")
+        self.tabs.setCurrentIndex(self.TAB_SURFACE)
 
     def refresh_dialect_models(self):
         """The Dialect tab's picker mirrors the Run setup list's

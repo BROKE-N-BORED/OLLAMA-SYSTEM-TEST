@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v25
+# OLLAMA SYSTEM TEST v26
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,30 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v26 adds the live 3D decision surface, on its own Surface
+tab: the scores as a landscape of 3D blocks - one point for
+each model and template, the height is the score, blue is
+low and orange is high, flat-topped plateaus with stepped
+sides, and a satin orb on every point. The surface is real
+3D, rendered by Reblend's Light Engine, vendored into the
+app (see "The surface graph" below); where OpenGL is not
+available, the app paints the same surface in 2D instead.
+The surface builds live while a run goes, one point
+per finished task, and stays in the tab when the run ends.
+Past runs can be opened on it too (the View surface button
+on the Past runs tab), and the Compare tab gains a surface
+morph: pick two saved runs and play or drag the blend from
+the first run's surface to the second's - before a trim and
+after it, before training and after. Drag turns the
+surface, scroll zooms, and tapping a point shows the exact
+model, template, and score behind it. Every point is a real
+measured score; the blocks between points are interpolated -
+a visual guide only, and the caption under every surface
+says so. A template that was not run or not measured is a
+gap in the surface, never a made-up number. The benchmark
+itself is untouched. See "The surface graph" below for the
+shared surface-data shape other tools (Stella) build to.
 
 v25 adds the Prompt Dialect Test, on its own Dialect tab: the
 same tasks asked six different ways — Plain, Structured,
@@ -331,8 +355,18 @@ remembered next time.
    (top bar the first model, bottom bar the second), and a table of
    their latest score on each template they ran, plus their overall
    score and speed. Picking the same model twice shows a message
-   instead of a duplicated table.
-9. File > Settings holds the models folder, the Ollama address, and
+   instead of a duplicated table. Below the table, the surface
+   morph: pick two saved runs (Run 1 and Run 2, nothing picked to
+   start with) and the tab shows their surfaces on the shared
+   surface graph - press Play or drag the slider to move from the
+   first run to the second.
+9. The Surface tab shows the run's surface: it builds live while
+   a run goes and keeps the finished surface afterwards. The
+   Past runs tab's View surface button loads a saved run onto
+   it - the whole run the picked result belongs to when its
+   record is still there, else that model's latest score on
+   each template.
+10. File > Settings holds the models folder, the Ollama address, and
    the default time budget. Each model remembers its usual
    templates: tick a model and its usual templates tick with it,
    with a label saying which set is active; a run saves the
@@ -341,11 +375,89 @@ remembered next time.
    holds the accessibility options: Bigger text (one tap for
    larger text everywhere, with the size still adjustable on its
    own) and Reduce motion (no fade effects).
-10. Shortcuts: Ctrl+R runs, Ctrl+S saves the report, Esc cancels a
+11. Shortcuts: Ctrl+R runs, Ctrl+S saves the report, Esc cancels a
    run. The File menu has Save report, Settings, and Quit; Help has
    How to Use, the full manual in its own window; About, which
    shows the version (also in the title bar); and Debug report,
    which saves a scrubbed copy of the app's log (see below).
+
+## The surface graph
+
+The Surface tab (and the morph on the Compare tab) draws the
+scores as a 3D block landscape: models along one flat axis,
+templates along the other, score (0 to 100) as the height.
+Each block's top sits at its height, so high scores form
+flat-topped plateaus with steep stepped sides and low
+scores read as valleys. Blue is low, orange is high, every
+measured point carries a satin orb, and a thin, faint
+wireframe cage boxes the plot. The surface is rendered in
+real 3D by the Light Engine from Reblend (Joshua's own
+renderer), vendored into this app in the light_engine/
+folder from Reblend v0.2-pkl - the app carries its own
+copy and never depends on the Reblend repo at runtime. The
+light on the blocks is real lighting and shadow, not a
+painted effect and not bloom; the blocks and orbs are
+finished matte, with a soft sheen. Live updates move the
+blocks that changed instead of rebuilding the scene, at
+most about twice a second, and a morph moves them frame by
+frame - so it never slows a run down. If OpenGL is not
+available on the machine (or OST_NO_GL=1 is set), the tab
+falls back to the app's own 2D painting of the same
+surface - same data, same controls - so the tab is never
+dead. SKULLPT was tried for this surface and not used: one
+still image from it took about three minutes, and a live
+surface needs new frames in well under a second.
+
+Honest scope, the same rule the whole app follows: every
+point on the surface is a real measured score. The blocks
+between the points are interpolated so the shape is
+easy to read - they are a visual guide, not measured data, and
+the caption under the surface says exactly that. A cell that
+was not run, was not eligible, or could not be measured is
+left out: a gap in the surface, never a zero and never a
+guess. While a template is still running, its point is a
+pale ghost orb and its height is the pass share of the tasks
+finished so far; when the template finishes, the point
+settles at the template's real score.
+
+The morph's missing-cell rule: a cell measured in only one
+of the two runs never takes the other run's value. It fades
+toward the floor as the morph crosses (its height is its own
+score times the share of the morph still on its side) and is
+a gap at the far end, exactly as on the side that never
+measured it. At the two ends the morph is the two runs'
+surfaces exactly.
+
+### The shared surface-data shape
+
+The surface widget reads one plain data shape, and nothing
+else. It is the contract Stella's half is built to as well,
+so any tool that produces this shape can feed the same
+widget:
+
+```json
+{
+  "kind": "ost_scores",
+  "title": "Run 2026-11-20 10:00:00",
+  "x_labels": ["model-a:2b", "model-b:1b"],
+  "y_labels": ["Instruction", "Math"],
+  "values": [[90.0, 42.0], [0.0, null]],
+  "details": {"0,0": "model-a:2b - Instruction: 90% (9/10 tasks)"},
+  "partial": [[false, false], [false, false]]
+}
+```
+
+- `kind`: a string naming what the values are ("ost_scores"
+  here; a producer with other values names its own).
+- `title`: shown at the top of the surface.
+- `x_labels`, `y_labels`: one label per point along each
+  flat axis. In OST, x is models and y is templates.
+- `values`: `values[x][y]` is the measured score (0 to 100)
+  at that point, or `null` when it was not measured - a gap.
+- `details`: optional; `"x,y"` (the point's indexes) maps to
+  the words shown when the point is tapped.
+- `partial`: optional; `partial[x][y]` is true while that
+  point is still being measured (drawn as a hollow ring).
 
 ## Run it without the window (headless)
 

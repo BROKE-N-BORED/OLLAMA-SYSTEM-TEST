@@ -1,7 +1,8 @@
 #!/bin/sh
 # OLLAMA SYSTEM TEST - one-time install.
 # Creates a private folder (.venv) with PySide6-Essentials, the only
-# package the app needs (QtCore + QtWidgets; no WebEngine/Addons).
+# package the app needs (QtCore + QtWidgets + QtOpenGLWidgets for
+# the Surface tab's real-3D view; no WebEngine/Addons).
 # The version is pinned in requirements.txt to the one the v6 suite
 # was verified against. The install is verified before this script
 # reports success: if the check fails, it says so loudly.
@@ -29,7 +30,15 @@ if ! .venv/bin/python -c "import PySide6" 2>/dev/null; then
   echo "Try running sh install.sh again."
   exit 1
 fi
-if ! .venv/bin/python -m py_compile ollama_system_test.py; then
+# The Surface tab's real-3D view needs the OpenGL widgets module.
+# It ships inside PySide6-Essentials, but check it honestly: if it
+# were missing, the app would silently lose its 3D surface.
+if ! .venv/bin/python -c "import PySide6.QtOpenGLWidgets, shiboken6" 2>/dev/null; then
+  echo "Install failed: the OpenGL widgets module cannot be imported."
+  echo "Try running sh install.sh again."
+  exit 1
+fi
+if ! .venv/bin/python -m py_compile ollama_system_test.py light_engine/*.py; then
   echo "Install failed: ollama_system_test.py does not compile."
   exit 1
 fi

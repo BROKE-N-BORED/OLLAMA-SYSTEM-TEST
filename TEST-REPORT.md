@@ -1,3 +1,365 @@
+# TEST-REPORT — OLLAMA SYSTEM TEST v26
+
+Verified 2026-11-20 in a Linux sandbox (x86_64, PySide6 6.12.0,
+Python 3.12.3) under the Qt test env from AGENTS.md:
+QT_QPA_PLATFORM=offscreen for the suite, Xvfb + xcb for the GUI
+drive, LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-
+linux-gnu, venv ~/workspace/forge-v2-testenv/bin/python, default
+HOME, TMPDIR on tmpfs.
+
+v26 adds the Live 3D Decision Surface Graph: the scores as a
+landscape - models along one axis, templates along the other,
+height is the score 0-100, orange peaks where a model is
+strong, blue valleys where it is weak. The shipped surface
+is rendered in real 3D by Reblend's Light Engine, vendored
+into the app - see the wire-in section at the end of this
+report. The renderer described in this section, a QWidget
+with plain QPainter painting (no OpenGL, no new
+dependencies, stdlib plus the existing PySide6 only), is
+kept as the fallback for machines where OpenGL is not
+available, and it paints a voxel landscape, matching the
+reference video Joshua picked: the filled field is sampled
+on a render grid (about 4 subdivisions per data step, capped
+near 26 blocks per axis) and each sample is drawn as a 3D
+block - a lit top face (a slight vertical gradient over the
+score ramp, with a darker edge line so the grid of cubes
+reads) at the sample height, and the two viewer-facing side
+faces down to the base in the same ramp darkened, so high
+areas form flat-topped plateaus with steep stepped sides and
+low areas read as valleys; blocks above 70 get a soft radial
+orange bloom behind the top face. Each measured point is a
+glossy orb - a radial-gradient sphere with an offset white
+highlight and a soft halo - drawn at its node; a point still
+being measured is a ghost orb (translucent fill, dashed
+outline), and the picked point keeps a white ring. A faint
+wireframe cage (base rectangle, corner posts, top frame, and
+a grid on the two back walls) boxes the plot on the same
+dark navy background, and the layout bounds include the
+cage, so the whole plot fits the widget at any rotation.
+Blocks and orbs are painter-sorted back to front by ground
+depth; the layout mapping is memoised and a paint computes
+its rotation trig once, so a full block grid paints fast.
+Click-picking goes through the same projection as before,
+with the radius widened to 22 px now that the orbs are the
+targets. An earlier renderer for this same feature drew a
+smooth continuous draped sheet with small ring markers; it
+was verified working but it did not look like the video -
+no blocks, no steps, no orbs, no cage, no shine - and
+Joshua caught it on sight ("No its not - watch the video
+again"). The renderer was rebuilt to the voxel landscape
+before v26 shipped; the data shape, the tracker, the tab
+wiring, the live updates, the morph maths, and the honesty
+caption are exactly the ones the first renderer shipped
+with. Defect (4) below and the first drive's screenshots
+belong to that first renderer; its quad subdivision is
+gone, replaced by the blocks. A new Surface tab shows the
+current run's surface building live: the
+benchmark worker gained one additive signal carrying each
+finished task record, a SurfaceTracker turns those into cells
+(a running pass share with a partial flag while the template
+is still going, settling at the template score when it
+finishes), and the view repaints on new data only, coalesced
+through a 200 ms single-shot timer (about 5 repaints a second
+at most during a run), so a run is never slowed by the
+picture. After the run the final surface stays in the tab.
+Past runs gains a View surface button that loads the picked
+run onto the Surface tab (the whole run from its manifest
+when it is still there, else the model's latest score per
+template). The Compare tab gains a surface morph: two run
+pickers (nothing picked by default), a Play/Pause button and
+a slider; the surface moves between the two runs over the
+union of their axes. The missing-cell rule, stated in the
+code, the README and the CHANGELOG: t=0 is Run 1 exactly and
+t=1 is Run 2 exactly; a cell measured on both sides blends
+linearly; a cell measured on one side only is worth its value
+times the remaining distance (Run-1-only: value x (1 - t),
+Run-2-only: value x t) and is a gap at the far end - no score
+is ever invented for a missing cell, and the detail text
+comes from the side the morph is nearer to. Everywhere the
+surface appears, the honesty caption stands under it:
+"Points are measured scores. The smooth surface between them
+is a visual guide, not measured data." The fill between
+measured cells is interpolated from the nearest measured
+values along the row and the column and is visual only;
+not-run, not-eligible and not-measured cells are None - no
+point, a gap. The SurfaceView consumes one shared surface-
+data shape (kind, title, x_labels, y_labels, values as
+values[x][y] with null for gaps, details keyed "x,y",
+optional partial flags), documented in the README as the
+contract Stella's half is built to. The benchmark itself is
+untouched: no template, grader, settings, or dialect change.
+
+Verification. Full suite, fresh copy of the final tree,
+offscreen Qt env: 1975 passed, 0 failed (run 4, log
+~/workspace/ost-v26-verify/full4.log) - the v25 suite's 1944
+checks plus 31 new v26 checks. The v26 section covers the
+colour ramp's ends; the surface builders (from hand-saved run
+files and from a manifest: axes, the values matrix, details
+carrying the score and the passed/total, gaps carrying no
+details); the morph maths (t=0 reproduces Run 1 exactly, t=1
+Run 2 exactly, t=0.5 the per-cell average where both sides
+have values, the one-sided fade rule, union axes, near-side
+details); the fill interpolation; picking through the widget's
+own projection (a projected marker picks its own cell, a far
+point picks nothing); a render smoke (a known 3x3 matrix
+paints non-blank with strongly blue and strongly orange
+pixels, unchanged under the voxel renderer) plus an orb
+check (the sphere at a measured node's projected centre is
+not the plain block-top colour, and its highlight puts a
+near-white pixel inside the disc, read through the widget's
+own orb_geometry); the live hook (a real BenchWorker run against the
+fake server feeding a SurfaceTracker through the new signal:
+partial snapshots mid-template, settled values after, and the
+finished run's manifest rebuilding the same surface); and the
+window wiring (the Surface tab and its exact caption, the
+empty state, the Compare pickers starting unpicked, two
+seeded runs starting the morph at Run 1 with the exact
+starting matrix, the slider blending to the exact midpoint
+matrix and on to Run 2, Play/Pause toggling, and View surface
+loading a saved run onto the Surface tab).
+
+Four defects were found by verification and fixed in place.
+(1) The painter's layout anchored its vertical origin on the
+wrong end of the projected bounds, so at some rotations the
+surface overflowed the top of the widget (a 100-point landed
+at y=-73 in the probe); the origin now anchors on max_y, the
+end the y-flip in project() actually uses. (2) The default
+azimuth (-52 degrees) made the low blue side sit HIGHER on
+screen than the high orange side - a numeric probe over a
+known cliff showed screen-y [67, 42, 21] for scores 100, 55,
+5, exactly backwards; at +52 degrees the same probe reads
+[26, 141, 261], peak highest, and +52 is the default.
+(3) The first full-suite run failed the standing screen-fit
+checks: the Compare tab's new morph section pushed the
+window's minimum size to 1462x964 at 14 pt, over a 1366x768
+screen, and the geometry round-trip probe failed with it.
+The Compare tab now scrolls, the v20 treatment the Profiles
+tab already had; the window minimum at 14 pt measures
+1103x610 and the probe passes. (4) The first GUI drive's
+finished surface was one flat teal sheet: with two models
+every quad spans the whole 100-to-0 drop, so each quad's mean
+colour was 50 and the cliff was invisible in the fill (the
+geometry and the markers were right). Each quad is now
+subdivided 4x4 and each sub-quad coloured by its own
+interpolated height, so a steep drop reads as a blue-to-
+orange ramp; a pixel census of the same cliff went from
+all-mid to 5910 blue and 2915 orange sampled pixels against
+30 mid. (This fix belonged to the first renderer; the voxel
+rebuild replaced the subdivided quads with blocks, and the
+same cliff now renders as a staircase of cubes - see the
+rebuild paragraph at the top of this report.)
+
+Run road (full suite, fresh copy each run, offscreen Qt env):
+run 1 reached 1965 passed / 5 failed - the four screen-fit
+failures of defect (3) above, plus one test-side failure: the
+morph checks assumed at least two saved runs would be
+left in the shared results store by the earlier sections and
+only one was; the section now seeds its own two runs and
+picks them by run id. Run 2, from the fixed tree, passed end
+to end: 1975 / 0 - but it predates the quad subdivision of
+defect (4), so it does not cover the final tree. Run 3, on
+the final code, reached 1966 / 7, and all seven were
+verification-environment faults, not app defects: a
+capabilities.json my own window probes had written into the
+build tree (the suite's leak check caught it; the file was
+removed at the source), and the TMPDIR directory not being
+recreated before the launch, which broke the geometry
+probe's xvfb-run (mktemp has nowhere to write) and the five
+single-instance lock checks (their sockets live under
+TMPDIR). Run 4, with the tree cleaned and TMPDIR in place,
+passed end to end on the final tree: 1975 / 0. The v26
+section also passes standalone (31 / 0,
+~/workspace/ost-v26-verify/tail_v26.py).
+
+The GUI drive (Xvfb 1366x768, three runs of
+~/workspace/ost-v26-verify/drive_v26.py against the fake
+Ollama server; logs drive.log, drive2.log, drive3.log) passed
+end to end. Run 1 (fake-smart:2b + fake-dumb:1b over
+Instruction, Math, Coding): the drive caught the surface
+mid-run with a partial cell showing, and the finished surface
+reads exactly [[100, 100, 100], [0, 0, 0]] - in the final
+screenshots an orange plateau along the fake-smart edge
+falling through yellow and cyan to a deep blue valley along
+the fake-dumb edge, markers on every point, the honesty
+caption under the surface (drive-surface-live.png,
+drive-surface-done.png). Interaction was exercised for real:
+a QTest drag turned the view (azimuth 52.0 to 97.5, elevation
+34.0 to 49.0), a wheel event zoomed 1.0 to 1.12, and a click
+on the projected fake-smart x Instruction marker selected
+that cell and showed "fake-smart:2b - Instruction: 100%
+(10/10 tasks)" (drive-surface-rotated.png,
+drive-surface-picked.png). Run 2 (fake-partial:3b +
+fake-dumb:1b) fed the Compare morph: at t=0 the surface is
+Run 1 (the fake-smart column stands orange; the fake-partial
+column, measured only in Run 2, is a gap, as the rule says);
+at t=0.5 the smart peak has sunk to its halfway fade and the
+partial column has risen halfway, the sheet mostly blue-cyan;
+at t=1 the surface is Run 2 (smart column gone to a gap,
+partial standing at its 60 in pale yellow-green, dumb flat at
+0). Play set the morph moving (t reached 0.856 inside 1.2 s)
+and Pause stopped it (drive-morph-t0.png, drive-morph-t50.png,
+drive-morph-t1.png). The Compare tab scrolls, so the drive
+scrolls the morph section into view before those shots, the
+way a user would.
+
+Known gaps, stated plainly. The surface is verified against
+the fake server only; its first surface from real models on
+Joshua's PC is still to come, like every version's real-PC
+verdict. Dialect runs write no run manifest (pre-existing),
+so View surface and the morph cover normal benchmark runs.
+Surface data is rebuilt from the saved run files each time
+it is shown; there is no separate surface file. A run with a
+single model draws its markers on the base grid with no
+filled sheet between them - there is nothing to fill with
+one column - and a single template is the same by rows. The
+morph pickers list runs from the manifest store; a run whose
+manifest was deleted falls back, in Past runs, to the model's
+latest-per-template surface instead.
+
+## v26 wire-in: the surface rendered by Reblend's Light Engine
+
+After the painter renderer above was verified, Joshua
+ordered a bake-off: the same test surface built in Reblend
+and in SKULLPT, rendered from the video's angle. Reblend's
+Light Engine won - dark navy room, wireframe cage, stepped
+voxel field, orbs with real light on them, and a warm
+re-render of about half a second under software GL.
+SKULLPT's cubes were prettier up close but its background
+came out slate instead of navy, its orbs were matte clay,
+and one still took 168 seconds end to end, which settles it
+for a live surface. Joshua approved the wire-in ("Go with
+Reblend") with two look changes of his own: smoother and
+less shiny than the bake-off render (he liked SKULLPT's
+matte feel), and a thinner, fainter cage - "a whisper of a
+frame, not a structure". Bake-off artifacts and renders:
+~/workspace/ost-v26-verify/bakeoff/,
+~/workspace/ost-v26-verify/bakeoff-reblend.png,
+~/workspace/ost-v26-verify/bakeoff-skullpt.png.
+
+What was vendored. The minimal Light Engine subset from
+Reblend v0.2-pkl (~/workspace/reblend-v02-pkl-build/reblend)
+now lives in the app tree as the light_engine/ package:
+__init__.py (with the VENDORED note) plus animation.py,
+geometry.py, meshfile.py, particles.py, scene.py,
+shaders.py, style.py, textures.py and viewport.py, copied
+byte-identical (the import closure of light_engine.scene
+and the Viewport; shaders are inline strings in the engine
+and its textures are procedural, so no asset files were
+needed). Not taken: the editor window, the part dial, the
+inspector, packs, the updater, video export and the mesh
+importers. OST carries its own copy and never depends on
+the Reblend repo at runtime; the engine files are unedited
+- every adaptation lives in a SurfaceViewport subclass in
+ollama_system_test.py (navy clear colour, the floor grid
+suppressed, the engine's modal shader-error dialog silenced
+in favour of the fallback swap, click routing to the host's
+picker).
+
+How the GL surface works. A pure function,
+surface_scene_description(data), turns the unchanged
+surface-data shape into a scene description: the same
+filled field the painter samples (the two renderers can
+never disagree about the field), one column slot per render
+sample, one orb per measured node resting ON its column
+(centre at column top + radius - the bake-off's half-sunk
+orbs are fixed), gaps producing neither. The colour ramp's
+top was deepened to (255, 92, 0) so the plateau stays the
+video's saturated orange through the engine's ACES tone
+mapping instead of washing gold. Per Joshua's direction:
+block roughness 0.85 and orb roughness 0.62 (satin, a soft
+sheen, not mirror gloss), the light rig softened below the
+engine's defaults (key 0.72, fill 0.55, rim 0.30, ambient
+0.50) with the engine's 3x3 PCF shadow filtering, and the
+cage built from 0.4 cm bars in a dim blue-grey with 0.3 cm
+back-wall grid lines - roughly a third of the bake-off's
+bar thickness, in a colour close to the background. Live
+updates mutate, never rebuild: the scene is built when the
+axis set changes (one shared unit-box mesh scaled per
+column, one unit-sphere mesh per orb, so a mutation is a
+transform + colour write and rebuilds no geometry), and
+each data update - coalesced to at most one apply per
+500 ms - rewrites the affected transforms and colours. The
+Compare morph does the same per frame: both runs' fields
+are built once and the slider/Play position interpolates
+heights and colours by mutation; the missing-side rule is
+unchanged (a gap cell has no column and no orb at the far
+end). Picking projects each orb's world position through
+the viewport camera's own view/projection matrices and
+takes the nearest within 22 px, the same radius as the
+painter; the engine's own drag-orbit and wheel-zoom camera
+controls are used as they are. Drag, zoom, pick, morph,
+Play/Pause - the GL host carries the painter widget's exact
+interface, so the tab wiring did not change.
+
+Fallback. gl_surface_available() says no when OST_NO_GL is
+set, when the Qt platform is offscreen (the suite), or when
+the engine will not import; the factory then embeds the
+QPainter voxel SurfaceView. If a context still fails at
+runtime (driver trouble), a health check 1.5 s after the
+tab is first shown swaps the GL child for the painter with
+the same data - no dead tab, no crash. Empty data builds an
+empty cage with the tab's calm label; a single row or
+column draws its blocks and orbs in a line.
+
+Install. No requirements change: QtOpenGL and
+QtOpenGLWidgets both ship inside PySide6-Essentials 6.12.0
+(verified against the installed package's file list), which
+requirements.txt already pins. install.sh now also verifies
+that PySide6.QtOpenGLWidgets and shiboken6 import, failing
+loudly if they do not, and compiles light_engine/*.py
+alongside the app.
+
+Verification of the final tree. Full suite, fresh copy,
+offscreen Qt env: 1983 passed, 0 failed (log
+~/workspace/ost-v26-verify/full-gl.log) - the painter tree's
+1975 plus 7 new wire-in checks (the ramp's deepened top, the
+scene-description builder: orb per measured node, none for
+a gap node, no column for a neighbourless gap, orbs resting
+on their columns, partial flags, the whisper cage; fallback
+selection under offscreen; the vendored engine importing),
+and the v26 section also passes standalone at 39 / 0. One
+standalone failure seen on the way was the tail harness's
+own accumulated scratch state, not the app: with a clean
+scratch the section is 39 / 0. The GUI drive under Xvfb +
+xcb at 1366x768 (~/workspace/ost-v26-verify/drive_gl_v26.py,
+run twice) drove the real window through the fake-server
+runs with the GL surface live: the Surface tab is the GL
+host (uses_gl true, context healthy, no fallback swap), a
+mid-run screenshot catches the surface building - a partial
+orange plateau with a settled orb and a darker ghosted
+partial orb on top (drive-gl-live.png); the finished
+surface is the stepped deep-orange plateau falling to the
+blue valley, satin orbs resting on their columns, the cage
+a whisper (drive-gl-done.png, and the raw framebuffer in
+drive-gl-done-fb.png); a drag rotated the camera and a
+wheel zoomed it (drive-gl-rotated.png); a click on the
+projected fake-smart x Instruction orb selected the cell
+and showed its detail line, with the engine's selection box
+around the orb (drive-gl-picked.png); the Compare morph at
+t=0.5 blends by mutation and Play/Pause run
+(drive-gl-morph-t50.png). Read against the reference frames
+(ref-video-frame-1.png, ref-video-frame-3.png) and the
+SKULLPT bake-off: the room, the saturated colours and the
+stepped plateaus match the video; the finish matches the
+matte feel Joshua picked from the SKULLPT render. A second
+drive with OST_NO_GL=1 confirmed the fallback: the painter
+surface, same finished data (drive-fallback.png).
+
+Known gaps of the wire-in, stated plainly. The GL path is
+verified under Mesa's software GL (llvmpipe) in this
+sandbox; Joshua's PC runs the same Mesa stack, but the
+first real-PC verdict on the 3D surface is still his. The
+GL view draws no axis labels - model and template names
+come from tapping a point, as in the video; the painter
+fallback draws the labels. With only one measured cell, its
+orb stands before any field exists under it, because the
+fill needs a 2x2 corner neighbourhood - the same behaviour
+in both renderers. Two cosmetic notes: the engine prints
+QOpenGLTexture teardown warnings on stderr at process exit
+(after the window is closed; harmless), and if a GL context
+fails slowly the fallback swap can land up to about 1.5 s
+after the tab is first shown.
+
 # TEST-REPORT — OLLAMA SYSTEM TEST v25
 
 Verified 2026-11-20 in a Linux sandbox (x86_64, PySide6 6.12.0,

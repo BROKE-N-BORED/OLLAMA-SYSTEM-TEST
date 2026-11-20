@@ -1,5 +1,72 @@
 # Changelog
 
+## v26 (2026-11-20)
+
+The live 3D decision surface: the scores as a landscape you
+can read at a glance - orange peaks where a model is strong,
+blue valleys where it is weak.
+
+- A new Surface tab. While a run goes, the surface builds
+  live: every finished task lands as a point (models along
+  one axis, templates along the other, height is the score).
+  A point whose template is still running is a pale ghost
+  orb at the pass share of the tasks finished so far; when
+  the template finishes, the point settles at its real
+  score. When the run ends, the final surface stays in the
+  tab.
+- The landscape is a field of 3D blocks, drawn the way the
+  reference video draws it: flat-topped orange plateaus
+  where scores are high, stepped sides down to blue
+  valleys, a satin orb resting on every measured point,
+  and a thin, faint wireframe cage around the plot, all on
+  a dark navy background. (The first renderer drew a smooth
+  draped sheet instead, and the second painted the blocks
+  in 2D; both were replaced before this release shipped -
+  the shipped surface is real 3D.)
+- The surface is rendered in real 3D by the Light Engine
+  from Reblend, vendored into the app (the light_engine/
+  folder, from Reblend v0.2-pkl) - real lighting and
+  shadows, a matte finish, nothing extra to install: the
+  OpenGL widgets module ships inside the PySide6-Essentials
+  the app already installs, and the installer now checks
+  for it by name. Live updates move the blocks that
+  changed instead of rebuilding the scene, at most about
+  twice a second. Drag turns it, scroll zooms, and tapping
+  a point shows the model, the template, the score, and
+  the passed/total behind it. If OpenGL is not available,
+  the tab falls back to the app's own 2D painting of the
+  same surface, so it is never dead; OST_NO_GL=1 forces
+  the fallback.
+- Past runs tab: a View surface button loads the picked
+  run onto the Surface tab - the whole run it belongs to
+  when its record is still there, else that model's latest
+  score on each template.
+- Compare tab: a surface morph. Pick two saved runs
+  (nothing is picked to start with) and press Play or drag
+  the slider to move from the first run's surface to the
+  second's - before a trim and after it, before training
+  and after. A cell measured in only one run never takes
+  the other run's value: it fades toward the floor across
+  the morph and is a gap at the far end.
+- Honesty, as always: every point is a real measured
+  score. The blocks between points are interpolated so
+  the shape reads easily - a visual guide, not measured
+  data, and the caption under every surface says so. A
+  template that was not run, not eligible, or not measured
+  is a gap, never a zero and never a guess.
+- The surface widget reads one shared data shape (kind,
+  title, x/y labels, values with null for gaps, per-point
+  details, partial flags), documented in the README - the
+  same shape Stella's half is built to, so the two apps
+  share one surface.
+- The benchmark itself is unchanged: no template, grader,
+  or dialect change. One additive worker signal reports
+  each finished task to the surface feed; how tasks run
+  and are graded is exactly as before.
+- The Compare tab scrolls now (the same treatment the
+  Profiles and Providers tabs already had), so the window
+  still fits a 1366x768 screen at the biggest text size.
+
 ## v25 (2026-11-20)
 
 The Prompt Dialect Test: the same tasks, asked six different

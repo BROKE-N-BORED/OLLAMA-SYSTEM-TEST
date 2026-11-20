@@ -1,6 +1,19 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v25 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v26 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All v24 checks are carried over (pins updated
+answers per model. All v25 checks are carried over (pins updated
+where v26 deliberately changes behavior - the version pin, the
+tab count, and the fake GitHub "newer release" story, named in
+the TEST-REPORT); the v26 checks cover the live 3D decision
+surface: the surface-data builders (matrix, details, partial
+flags, gaps for not-measured cells), the morph maths (the
+endpoints are the two surfaces exactly, the middle is the
+per-cell blend, and the missing-cell fade rule), picking through
+the widget's own projection, a render smoke (a strongly blue and
+a strongly orange pixel from a known matrix), the live hook (a
+real worker run feeding the tracker - partial while a template
+runs, settled at its score when it finishes), the Surface tab
+with its honesty caption, and the Compare tab's run pickers
+starting unpicked. All v24 checks are carried over (pins updated
 where v25 deliberately changes behavior - the version pin and the
 tab count, named in the TEST-REPORT); the v25 checks cover the
 Prompt Dialect Test: the six prompt wrappers (the task text
@@ -902,11 +915,11 @@ def main():
     check("start Ollama button present", window.start_ollama_button is not None)
     check("pull input and button present",
           window.pull_input is not None and window.pull_button is not None)
-    check("eight tabs incl Run setup, Run, Models and Dialect",
-          window.tabs.count() == 8
-          and [window.tabs.tabText(i) for i in range(8)] ==
+    check("nine tabs incl Run setup, Run, Models, Dialect and Surface",
+          window.tabs.count() == 9
+          and [window.tabs.tabText(i) for i in range(9)] ==
           ["Run setup", "Run", "Models", "Past runs", "Profiles",
-           "Compare", "Providers", "Dialect"],
+           "Compare", "Providers", "Dialect", "Surface"],
           str([window.tabs.tabText(i) for i in range(window.tabs.count())]))
 
     from PySide6.QtWidgets import QLabel, QPushButton
@@ -3629,7 +3642,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 25", app.__version__ == "25",
+    check("__version__ is 26", app.__version__ == "26",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3643,8 +3656,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v25",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v25",
+    check("title bar shows OLLAMA SYSTEM TEST v26",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v26",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4470,8 +4483,8 @@ def main():
         check("v8 window lists 4 local + 3 provider models",
               window8.model_list.count() == 7,
               str(window8.model_list.count()))
-        check("window has 8 tabs with Compare after Profiles",
-              window8.tabs.count() == 8
+        check("window has 9 tabs with Compare after Profiles",
+              window8.tabs.count() == 9
               and window8.tabs.tabText(5) == "Compare",
               str([window8.tabs.tabText(i)
                    for i in range(window8.tabs.count())]))
@@ -5090,10 +5103,10 @@ def main():
               and window9.template_list.count() == 20,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v25",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v25",
+        check("title bar shows v26",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v26",
               window9.windowTitle())
-        check("__version__ is 25", app.__version__ == "25", app.__version__)
+        check("__version__ is 26", app.__version__ == "26", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -11033,7 +11046,7 @@ def main():
         real_api22w = updates_module.API_BASE
         real_codeload22w = updates_module.CODELOAD_BASE
         server22w, port22w = fake_github.start_fake_github(
-            latest_tag="v26")
+            latest_tag="v27")
         base22w = "http://127.0.0.1:%d" % port22w
         updates_module.API_BASE = base22w
         updates_module.CODELOAD_BASE = base22w
@@ -11050,7 +11063,7 @@ def main():
             check("live declined check finishes", done22j)
             check("live declined update is asked",
                   len(asked22w) == 1
-                  and asked22w[0].get("latest") == "26",
+                  and asked22w[0].get("latest") == "27",
                   str(asked22w))
             check("live declined update downloads nothing",
                   not any("/zipball/" in path
@@ -11065,7 +11078,7 @@ def main():
             install22w = os.path.join(scratch22w, "install")
             os.makedirs(os.path.join(install22w, "results"),
                         exist_ok=True)
-            for rel, data in fake_github.FAKE_V25_FILES.items():
+            for rel, data in fake_github.FAKE_V26_FILES.items():
                 path = os.path.join(install22w, *rel.split("/"))
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "wb") as handle:
@@ -11083,16 +11096,16 @@ def main():
                 and window22k._update_check_worker is None,
                 timeout=30)
             check("live accepted pull finishes", done22k)
-            check("live pull installs v26 on disk",
+            check("live pull installs v27 on disk",
                   open(os.path.join(
                       install22w, "ollama_system_test.py"),
-                      encoding="utf-8").read().find('"26"') >= 0)
+                      encoding="utf-8").read().find('"27"') >= 0)
             check("live pull keeps results",
                   open(os.path.join(
                       install22w, "results", "keep.txt"),
                       encoding="utf-8").read() == "my results")
-            check("running copy still says v25",
-                  window22k.windowTitle().endswith("v25"),
+            check("running copy still says v26",
+                  window22k.windowTitle().endswith("v26"),
                   window22k.windowTitle())
             fresh22 = subprocess.run(
                 [sys.executable, "-c",
@@ -11101,9 +11114,9 @@ def main():
                  "print(ollama_system_test.__version__)"
                  % install22w],
                 capture_output=True, text=True, timeout=60)
-            check("a fresh launch runs v26",
+            check("a fresh launch runs v27",
                   fresh22.returncode == 0
-                  and fresh22.stdout.strip() == "26",
+                  and fresh22.stdout.strip() == "27",
                   "rc=%s out=%r err=%s" % (
                       fresh22.returncode, fresh22.stdout,
                       fresh22.stderr))
@@ -11881,6 +11894,482 @@ def main():
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview
+
+    # ---------- v26: the live 3D decision surface ----------
+    # The shared surface-data shape and its builders (matrix,
+    # details, partial flags, gaps where nothing was measured),
+    # the morph maths with the missing-cell rule, picking and
+    # rendering through the widget itself, the live hook (a real
+    # worker run feeding a tracker: partial while a template
+    # runs, settled at its score when it finishes), and the
+    # Surface tab / Compare morph wiring on a real window.
+
+    check("v26 surface colour at 0 is strongly blue",
+          app.surface_rgb(0) == (25, 80, 210),
+          str(app.surface_rgb(0)))
+    rgb100_26 = app.surface_rgb(100)
+    check("v26 surface colour at 100 is strongly orange",
+          rgb100_26[0] > 240 and 60 < rgb100_26[1] < 190
+          and rgb100_26[2] < 110, str(rgb100_26))
+
+    # The manifest builder, from hand-saved run files: a scored
+    # template, a template whose run has no score (a gap, never
+    # a 0), a skipped pair, and a pair that never ran.
+    results_dir26 = os.path.join(SCRATCH, "surface-results")
+    os.makedirs(results_dir26, exist_ok=True)
+
+    def _run26(model, template_id, name, score, passed, total, stamp):
+        return app.save_run_file(results_dir26, model, "sys26", {
+            "template": template_id, "template_name": name,
+            "template_score": score, "passed": passed,
+            "total": total, "tasks": [],
+        }, stamp=stamp)
+
+    path26_smart_inst = _run26(
+        "fake-smart:2b", "instruction", "Instruction", 90.0, 9, 10,
+        datetime(2026, 11, 20, 10, 0, 0))
+    path26_smart_math = _run26(
+        "fake-smart:2b", "math", "Math", None, None, 10,
+        datetime(2026, 11, 20, 10, 1, 0))
+    path26_dumb_inst = _run26(
+        "fake-dumb:1b", "instruction", "Instruction", 0.0, 0, 10,
+        datetime(2026, 11, 20, 10, 2, 0))
+    manifest26 = {
+        "run_id": "20261120-100000",
+        "started": "2026-11-20T10:00:00",
+        "status": "done", "system_id": "sys26",
+        "targets": [{"label": "fake-smart:2b"},
+                    {"label": "fake-dumb:1b"}],
+        "templates": ["instruction", "math", "vision"],
+        "pairs": {
+            "fake-smart:2b|instruction": "done",
+            "fake-smart:2b|math": "done",
+            "fake-smart:2b|vision": "skipped",
+            "fake-dumb:1b|instruction": "done",
+            "fake-dumb:1b|math": "pending",
+            "fake-dumb:1b|vision": "skipped",
+        },
+        "run_files": {
+            "fake-smart:2b|instruction": os.path.relpath(
+                path26_smart_inst, results_dir26),
+            "fake-smart:2b|math": os.path.relpath(
+                path26_smart_math, results_dir26),
+            "fake-dumb:1b|instruction": os.path.relpath(
+                path26_dumb_inst, results_dir26),
+        },
+    }
+    app.save_manifest(results_dir26, manifest26)
+    data26 = app.surface_data_from_manifest(results_dir26, manifest26)
+    check("v26 manifest surface axes are models by templates",
+          data26["kind"] == "ost_scores"
+          and data26["x_labels"] == ["fake-smart:2b", "fake-dumb:1b"]
+          and data26["y_labels"] == ["Instruction", "Math", "vision"],
+          str((data26["x_labels"], data26["y_labels"])))
+    check("v26 manifest surface matrix, gaps where unmeasured",
+          data26["values"] == [[90.0, None, None], [0.0, None, None]],
+          str(data26["values"]))
+    check("v26 manifest surface details carry score and counts",
+          "90%" in data26["details"].get("0,0", "")
+          and "9/10" in data26["details"].get("0,0", "")
+          and "1,1" not in data26["details"]
+          and "0,1" not in data26["details"],
+          str(data26["details"]))
+
+    data26b = app.surface_data_from_model_runs(
+        results_dir26, app.slugify_model("fake-smart:2b"))
+    check("v26 model-runs surface takes the latest per template",
+          data26b["x_labels"] == ["fake-smart:2b"]
+          and data26b["values"][0][
+              data26b["y_labels"].index("Instruction")] == 90.0
+          and data26b["values"][0][
+              data26b["y_labels"].index("Math")] is None,
+          str(data26b["values"]))
+
+    # The morph: endpoints exact, middle blended, and the
+    # missing-cell rule (a cell only one side measured fades
+    # toward the floor and is a gap at the far end - it never
+    # takes the other side's value).
+    morph_a26 = {
+        "kind": "ost_scores", "title": "Run A",
+        "x_labels": ["m1"], "y_labels": ["t1", "t2"],
+        "values": [[80.0, None]],
+        "details": {"0,0": "A says"},
+        "partial": [[False, False]],
+    }
+    morph_b26 = {
+        "kind": "ost_scores", "title": "Run B",
+        "x_labels": ["m1", "m2"], "y_labels": ["t1", "t2"],
+        "values": [[40.0, 60.0], [70.0, 30.0]],
+        "details": {"0,0": "B says", "0,1": "B only",
+                    "1,0": "B m2"},
+        "partial": [[False, False], [False, False]],
+    }
+    morph0_26 = app.morph_surface_data(morph_a26, morph_b26, 0.0)
+    morph5_26 = app.morph_surface_data(morph_a26, morph_b26, 0.5)
+    morph1_26 = app.morph_surface_data(morph_a26, morph_b26, 1.0)
+    check("v26 morph at t=0 is surface A exactly",
+          morph0_26["values"] == [[80.0, None], [None, None]],
+          str(morph0_26["values"]))
+    check("v26 morph at t=1 is surface B exactly",
+          morph1_26["values"] == [[40.0, 60.0], [70.0, 30.0]],
+          str(morph1_26["values"]))
+    check("v26 morph at t=0.5 blends and fades single-side cells",
+          morph5_26["values"] == [[60.0, 30.0], [35.0, 15.0]],
+          str(morph5_26["values"]))
+    check("v26 morph axes are the union, details from the near side",
+          morph5_26["x_labels"] == ["m1", "m2"]
+          and morph5_26["details"].get("0,0") == "B says"
+          and app.morph_surface_data(
+              morph_a26, morph_b26, 0.25)["details"].get("0,0")
+          == "A says",
+          str(morph5_26["details"]))
+
+    check("v26 the fill interpolates between measured neighbours",
+          app.surface_filled_values([[100.0, None], [None, 0.0]])
+          == [[100.0, 50.0], [50.0, 0.0]])
+    check("v26 the fill leaves a neighbourless point a gap",
+          app.surface_filled_values([[None]]) == [[None]])
+
+    # The widget: picking goes through its own projection, and a
+    # known matrix renders with both ends of the ramp present.
+    view26 = app.SurfaceView()
+    view26.resize(640, 420)
+    view26.set_data({
+        "kind": "ost_scores", "title": "Smoke",
+        "x_labels": ["a", "b", "c"], "y_labels": ["t1", "t2", "t3"],
+        "values": [[100.0, 100.0, 0.0], [100.0, 100.0, 0.0],
+                   [0.0, 0.0, 0.0]],
+        "details": {"0,0": "a - t1: 100%"},
+        "partial": [[False] * 3 for _ in range(3)],
+    })
+    view26.show()
+    qt_app.processEvents()
+    point26 = view26.project(0, 0, 100.0)
+    check("v26 picking at a projected marker returns its cell",
+          point26 is not None
+          and view26.pick(point26[0], point26[1]) == (0, 0),
+          str(point26))
+    point26b = view26.project(2, 2, 0.0)
+    check("v26 picking at the low corner returns its cell",
+          point26b is not None
+          and view26.pick(point26b[0], point26b[1]) == (2, 2),
+          str(point26b))
+    check("v26 picking far from every marker returns nothing",
+          view26.pick(1, 1) is None)
+    image26 = view26.grab().toImage()
+    blue26 = orange26 = other26 = 0
+    for px in range(0, image26.width(), 2):
+        for py in range(0, image26.height(), 2):
+            color = image26.pixelColor(px, py)
+            if color.blue() > 150 and color.red() < 110:
+                blue26 += 1
+            elif (color.red() > 200 and 60 < color.green() < 190
+                    and color.blue() < 110):
+                orange26 += 1
+            elif color != app.SurfaceView.BACKGROUND:
+                other26 += 1
+    check("v26 render smoke: blue and orange both on the surface",
+          blue26 > 0 and orange26 > 0 and other26 > 0,
+          f"blue={blue26} orange={orange26} other={other26}")
+    # The orbs are really painted: the sphere at the 100%
+    # node's centre is not the plain block-top colour, and the
+    # glossy highlight puts a near-white pixel inside its disc.
+    from PySide6.QtGui import QColor as _QColor26
+    orb26 = view26.orb_geometry(0, 0)
+    orb_centre26 = None
+    orb_shine26 = False
+    if orb26 is not None:
+        ocx26, ocy26, orad26 = orb26
+        orb_centre26 = image26.pixelColor(int(ocx26), int(ocy26))
+        step26 = max(1, int(orad26 // 3))
+        for px in range(int(ocx26 - orad26), int(ocx26 + orad26),
+                        step26):
+            for py in range(int(ocy26 - orad26),
+                            int(ocy26 + orad26), step26):
+                c26 = image26.pixelColor(px, py)
+                if c26.red() > 235 and c26.green() > 235 \
+                        and c26.blue() > 235:
+                    orb_shine26 = True
+    check("v26 a glossy orb is painted at a measured node",
+          orb26 is not None and orb_centre26 is not None
+          and orb_centre26 != _QColor26(*app.surface_rgb(100))
+          and orb_shine26,
+          f"orb={orb26} centre={orb_centre26} shine={orb_shine26}")
+    view26.set_morph(morph_a26, morph_b26)
+    check("v26 the widget morph starts at surface A",
+          view26.in_morph_mode()
+          and view26.current_data()["values"]
+          == [[80.0, None], [None, None]],
+          str(view26.current_data()["values"]))
+    view26.set_morph_t(0.5)
+    check("v26 the widget morph follows the slider maths",
+          view26.current_data()["values"]
+          == [[60.0, 30.0], [35.0, 15.0]],
+          str(view26.current_data()["values"]))
+    view26.close()
+
+    # The live hook: a real run against the fake server, its
+    # signals feeding a tracker the way the window wires them.
+    server26, _thread26 = fake_ollama.start_server()
+    host26, port26 = server26.server_address
+    prior_host26 = os.environ.get("OLLAMA_HOST")
+    os.environ["OLLAMA_HOST"] = f"http://{host26}:{port26}"
+    try:
+        templates26, _warns26 = _real_load_templates24()
+        by26 = {t["id"]: t for t in templates26}
+        template26 = dict(by26["instruction"])
+        template26["repeats"] = 1
+        targets26 = [
+            app.ollama_target(
+                "fake-smart:2b",
+                app.capabilities_from_show(
+                    app.ollama_show("fake-smart:2b"))),
+            app.ollama_target(
+                "fake-dumb:1b",
+                app.capabilities_from_show(
+                    app.ollama_show("fake-dumb:1b"))),
+        ]
+        tracker26 = app.SurfaceTracker()
+        tracker26.begin(targets26, [template26])
+        snaps26 = []
+
+        def _task26(label, template_id, record):
+            tracker26.task_done(label, template_id, record)
+            snap = tracker26.data("Live")
+            xi = tracker26.x_labels.index(label)
+            yi = tracker26.y_ids.index(template_id)
+            snaps26.append(
+                (label, snap["values"][xi][yi],
+                 snap["partial"][xi][yi]))
+
+        worker26 = app.BenchWorker(
+            targets26, [template26], "sys26", app.machine_info(),
+            results_dir26)
+        worker26.task_done.connect(_task26)
+        worker26.template_done.connect(
+            lambda label, run_data, path:
+                tracker26.template_done(label, run_data))
+        finished26 = {}
+        worker26.run_finished.connect(
+            lambda reason: finished26.__setitem__("done", reason))
+        worker26.start()
+        ok26 = wait_until(lambda: finished26.get("done"),
+                          timeout=300, app=qt_app)
+        worker26.wait()
+        check("v26 the live-hook run finishes", ok26
+              and finished26.get("done") == "done", str(finished26))
+        check("v26 cells are partial while their template runs",
+              any(label == "fake-smart:2b" and partial
+                  and value == 100.0
+                  for label, value, partial in snaps26)
+              and any(label == "fake-dumb:1b" and partial
+                      and value == 0.0
+                      for label, value, partial in snaps26),
+              str(snaps26[:3]))
+        final26 = tracker26.data("Latest run")
+        check("v26 cells settle at the template scores",
+              final26["values"] == [[100.0], [0.0]]
+              and not any(any(row) for row in final26["partial"])
+              and "100%" in final26["details"].get("0,0", "")
+              and "10/10" in final26["details"].get("0,0", ""),
+              str(final26["values"]))
+        manifest_data26 = app.surface_data_from_manifest(
+            results_dir26, worker26._manifest)
+        check("v26 the finished run's manifest rebuilds its surface",
+              manifest_data26["values"] == [[100.0], [0.0]],
+              str(manifest_data26["values"]))
+    finally:
+        if prior_host26 is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host26
+        server26.shutdown()
+
+    # The window wiring: the Surface tab with its honesty
+    # caption, the Compare run pickers starting unpicked, a
+    # history surface load, and the Compare morph itself. Two
+    # runs are seeded into the shared results store first, so
+    # the morph checks do not depend on how many runs the
+    # earlier sections happened to leave there.
+    shared26 = app.get_results_dir()
+
+    def _seed26(run_id, started, stamp, smart_score):
+        files26 = {}
+        pairs26 = {}
+        for label, score in (("fake-smart:2b", smart_score),
+                             ("fake-dumb:1b", 100.0 - smart_score)):
+            path = app.save_run_file(shared26, label, "sys26w", {
+                "template": "instruction",
+                "template_name": "Instruction",
+                "template_score": score,
+                "passed": int(score / 10), "total": 10,
+                "tasks": [],
+            }, stamp=stamp)
+            key = app.pair_key(label, "instruction")
+            files26[key] = os.path.relpath(path, shared26)
+            pairs26[key] = "done"
+        app.save_manifest(shared26, {
+            "run_id": run_id, "started": started, "status": "done",
+            "system_id": "sys26w",
+            "targets": [{"label": "fake-smart:2b"},
+                        {"label": "fake-dumb:1b"}],
+            "templates": ["instruction"], "pairs": pairs26,
+            "run_files": files26,
+        })
+
+    _seed26("20261120-080000-v26", "2026-11-20T08:00:00",
+            datetime(2026, 11, 20, 8, 0, 0), 80.0)
+    _seed26("20261120-090000-v26", "2026-11-20T09:00:00",
+            datetime(2026, 11, 20, 9, 0, 0), 30.0)
+    window26 = app.MainWindow()
+    window26.show()
+    qt_app.processEvents()
+    check("v26 the Surface tab carries the honesty caption",
+          window26.surface_caption_label.text()
+          == app.SURFACE_HONESTY_CAPTION,
+          window26.surface_caption_label.text())
+    check("v26 the surface starts empty with its calm message",
+          window26.surface_view.current_data() is None
+          and window26.surface_status_label.text().startswith(
+              "No run yet"),
+          window26.surface_status_label.text())
+    check("v26 the Compare run pickers start unpicked",
+          window26.compare_run_a.currentData() is None
+          and window26.compare_run_b.currentData() is None)
+    manifests26 = app.list_manifests(app.get_results_dir())
+    picker_ids26 = [window26.compare_run_a.itemData(i)
+                    for i in range(window26.compare_run_a.count())]
+    check("v26 the morph pickers list the saved runs",
+          "20261120-080000-v26" in picker_ids26
+          and "20261120-090000-v26" in picker_ids26
+          and window26.compare_run_a.count()
+          == len(manifests26) + 1,
+          f"{len(manifests26)} manifests")
+
+    def _pick26(combo, run_id):
+        for i in range(combo.count()):
+            if combo.itemData(i) == run_id:
+                combo.setCurrentIndex(i)
+                return True
+        return False
+
+    picked26 = _pick26(window26.compare_run_a, "20261120-080000-v26") \
+        and _pick26(window26.compare_run_b, "20261120-090000-v26")
+    if picked26:
+        qt_app.processEvents()
+        check("v26 two picked runs start the morph at Run 1",
+              window26.compare_surface.in_morph_mode()
+              and window26.compare_surface.morph_t() == 0.0
+              and window26.compare_surface.current_data()["values"]
+              == [[80.0], [20.0]]
+              and window26.compare_morph_slider.isEnabled()
+              and window26.compare_morph_button.isEnabled(),
+              str(window26.compare_surface.current_data()["values"]))
+        window26.compare_morph_slider.setValue(50)
+        qt_app.processEvents()
+        check("v26 the morph slider blends the two runs",
+              window26.compare_surface.morph_t() == 0.5
+              and window26.compare_surface.current_data()["values"]
+              == [[55.0], [45.0]],
+              str(window26.compare_surface.current_data()["values"]))
+        window26.compare_morph_slider.setValue(100)
+        qt_app.processEvents()
+        check("v26 the morph slider drives the blend to Run 2",
+              window26.compare_surface.morph_t() == 1.0
+              and window26.compare_surface.current_data()["values"]
+              == [[30.0], [70.0]],
+              str(window26.compare_surface.current_data()["values"]))
+        window26.compare_morph_button.click()
+        qt_app.processEvents()
+        playing26 = window26.compare_surface.is_playing()
+        window26.compare_morph_button.click()
+        qt_app.processEvents()
+        check("v26 Play and Pause toggle the morph",
+              playing26
+              and not window26.compare_surface.is_playing()
+              and window26.compare_morph_button.text() == "Play")
+    if window26.history_list.count():
+        window26.history_list.setCurrentRow(0)
+        qt_app.processEvents()
+        enabled26 = window26.history_surface_button.isEnabled()
+        window26.show_history_surface()
+        qt_app.processEvents()
+        check("v26 View surface loads the run onto the Surface tab",
+              enabled26
+              and window26.tabs.currentIndex()
+              == window26.TAB_SURFACE
+              and window26.surface_view.current_data() is not None
+              and window26.surface_status_label.text().startswith(
+                  "Showing"),
+              window26.surface_status_label.text())
+    window26.close()
+
+    # --- v26 GL wire-in: scene description, ramp, fallback ---
+    # The ramp's top is the deepened saturated orange (the
+    # bake-off plateau read gold through the engine's tone
+    # mapping; the raw ramp colour the GL builder feeds the
+    # engine is deepened). glow=False reads the raw ramp.
+    check("v26 GL: the colour ramp tops out at the deep orange",
+          app.surface_rgb(100.0, glow=False) == (255, 92, 0)
+          and app.surface_rgb(0.0, glow=False) == (25, 80, 210))
+    # The pure scene-description builder: known data in, columns
+    # and orbs out. A gap node makes no orb; a neighbourless gap
+    # makes no column; orbs rest on their columns (an orb's
+    # height IS its column's top); partial orbs are flagged.
+    desc_data = {
+        "kind": "ost_scores", "title": "Desc",
+        "x_labels": ["m1", "m2"],
+        "y_labels": ["t1", "t2", "t3"],
+        "values": [[100.0, 50.0, None], [0.0, 25.0, 80.0]],
+        "details": {"0,0": "m1 - t1: 100% (10/10 tasks)"},
+        "partial": [[False, True, False], [False, False, False]],
+    }
+    desc = app.surface_scene_description(desc_data)
+    desc_orbs = {(o["xi"], o["yi"]): o for o in desc["orbs"]}
+    check("v26 GL: the scene description carries one orb per "
+          "measured node and none for the gap node",
+          set(desc_orbs) == {(0, 0), (0, 1), (1, 0), (1, 1),
+                             (1, 2)}
+          and len(desc["columns"]) == len(desc["samples"]) > 0,
+          f"orbs={sorted(desc_orbs)}")
+    lone = app.surface_scene_description({
+        "x_labels": ["m"], "y_labels": ["t"], "values": [[None]],
+        "details": {}, "partial": [[False]]})
+    check("v26 GL: a neighbourless gap makes no column and "
+          "no orb",
+          lone["columns"] == [] and lone["orbs"] == []
+          and len(lone["samples"]) == 1)
+    check("v26 GL: orbs rest on their columns, partial orbs "
+          "are flagged, the cage is a whisper",
+          desc_orbs[(0, 0)]["height"]
+          == app.surface_height_of(100.0)
+          and desc_orbs[(1, 0)]["height"]
+          == app.surface_height_of(0.0)
+          and desc_orbs[(0, 1)]["partial"] is True
+          and desc_orbs[(0, 0)]["color"] == "#ff5c00"
+          and desc["cage"]["bar"] == 0.4)
+    # Fallback selection: this suite runs offscreen, where no GL
+    # context can exist - the factory must hand back the painter,
+    # and the window's surfaces must be painters.
+    ok_gl, why_gl = app.gl_surface_available()
+    check("v26 GL: offscreen reports GL unavailable with a "
+          "reason",
+          ok_gl is False and "offscreen" in why_gl, why_gl)
+    check("v26 GL: the factory falls back to the painter widget "
+          "when GL is unavailable",
+          type(app.make_surface_view()) is app.SurfaceView
+          and getattr(window26.surface_view, "uses_gl", False)
+          is False
+          and getattr(window26.compare_surface, "uses_gl",
+                      False) is False)
+    # The vendored engine imports cleanly (it is only ever
+    # imported lazily, so the no-PySide6 launch path and the
+    # offscreen suite never pay for it).
+    import light_engine.scene as _le_scene
+    import light_engine.viewport as _le_viewport
+    check("v26 GL: the vendored Light Engine imports",
+          hasattr(_le_viewport, "Viewport")
+          and hasattr(_le_scene, "new_scene"))
 
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
