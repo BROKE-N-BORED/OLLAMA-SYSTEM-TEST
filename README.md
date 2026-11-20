@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v24
+# OLLAMA SYSTEM TEST v25
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,20 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v25 adds the Prompt Dialect Test, on its own Dialect tab: the
+same tasks asked six different ways — Plain, Structured,
+Terse, With examples, Step by step, and Tagged — graded by the
+same marking as the normal tests. The result is a
+Communication Profile on the model's report card, a
+prompt_profile.json with the scores and a ready-to-use wrapper
+in the winning shape, and a plain-words Prompt Report that
+says how the model likes to be talked to, what it does not
+like, and the rules the scores earned (there is no set number
+of rules — a rule exists only when a shape clearly helps or
+hurts). The test is local Ollama models only, and it watches
+how a model answers; it does not look inside the model's
+weights. The normal benchmark is untouched.
 
 v24 is the accuracy release: the scores now measure the model,
 not the test. Every scored template grows to at least 10 tasks

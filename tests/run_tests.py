@@ -1,6 +1,16 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v24 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v25 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1774 v23 checks are carried over (pins updated
+answers per model. All v24 checks are carried over (pins updated
+where v25 deliberately changes behavior - the version pin and the
+tab count, named in the TEST-REPORT); the v25 checks cover the
+Prompt Dialect Test: the six prompt wrappers (the task text
+survives inside every shape, the few-shot examples leak no
+expected answers and carry no digits), the Communication Profile
+arithmetic, the dynamic rules (earned effects only, strongest
+first, none from an all-tied table), the plain-words Prompt
+Report, the Dialect tab (present, nothing picked by default),
+and one end-to-end dialect run against stubbed calls where
+Step-by-step is rigged to win. All 1774 v23 checks are carried over (pins updated
 where v24 deliberately changes behavior — each is named in the v24
 section and the TEST-REPORT); the v24 checks cover the accuracy
 list: the loop guard (a runaway repeated answer is cut and graded
@@ -46,6 +56,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import socket
@@ -891,10 +902,11 @@ def main():
     check("start Ollama button present", window.start_ollama_button is not None)
     check("pull input and button present",
           window.pull_input is not None and window.pull_button is not None)
-    check("seven tabs incl Run setup, Run and Models", window.tabs.count() == 7
-          and [window.tabs.tabText(i) for i in range(7)] ==
+    check("eight tabs incl Run setup, Run, Models and Dialect",
+          window.tabs.count() == 8
+          and [window.tabs.tabText(i) for i in range(8)] ==
           ["Run setup", "Run", "Models", "Past runs", "Profiles",
-           "Compare", "Providers"],
+           "Compare", "Providers", "Dialect"],
           str([window.tabs.tabText(i) for i in range(window.tabs.count())]))
 
     from PySide6.QtWidgets import QLabel, QPushButton
@@ -3617,7 +3629,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 24", app.__version__ == "24",
+    check("__version__ is 25", app.__version__ == "25",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3631,8 +3643,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v24",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v24",
+    check("title bar shows OLLAMA SYSTEM TEST v25",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v25",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4458,8 +4470,8 @@ def main():
         check("v8 window lists 4 local + 3 provider models",
               window8.model_list.count() == 7,
               str(window8.model_list.count()))
-        check("window has 7 tabs with Compare after Profiles",
-              window8.tabs.count() == 7
+        check("window has 8 tabs with Compare after Profiles",
+              window8.tabs.count() == 8
               and window8.tabs.tabText(5) == "Compare",
               str([window8.tabs.tabText(i)
                    for i in range(window8.tabs.count())]))
@@ -5078,10 +5090,10 @@ def main():
               and window9.template_list.count() == 20,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v24",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v24",
+        check("title bar shows v25",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v25",
               window9.windowTitle())
-        check("__version__ is 24", app.__version__ == "24", app.__version__)
+        check("__version__ is 25", app.__version__ == "25", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -5931,7 +5943,9 @@ def main():
     check("preview says local runs cost nothing",
           "nothing to pay" in pv13["text"], pv13["text"])
     check("preview total steps matches the counter",
-          pv13["total_steps"] == 6, str(pv13["total_steps"]))
+          pv13["total_steps"] == app.count_run_steps(
+              [tgt13], [by_id13["coding"]]),
+          str(pv13["total_steps"]))
     check("preview cost is None for a local-only run",
           pv13["cost"] is None)
     # A past run at 100 tok/s makes the same preview much shorter
@@ -11019,7 +11033,7 @@ def main():
         real_api22w = updates_module.API_BASE
         real_codeload22w = updates_module.CODELOAD_BASE
         server22w, port22w = fake_github.start_fake_github(
-            latest_tag="v24")
+            latest_tag="v26")
         base22w = "http://127.0.0.1:%d" % port22w
         updates_module.API_BASE = base22w
         updates_module.CODELOAD_BASE = base22w
@@ -11036,7 +11050,7 @@ def main():
             check("live declined check finishes", done22j)
             check("live declined update is asked",
                   len(asked22w) == 1
-                  and asked22w[0].get("latest") == "24",
+                  and asked22w[0].get("latest") == "26",
                   str(asked22w))
             check("live declined update downloads nothing",
                   not any("/zipball/" in path
@@ -11051,7 +11065,7 @@ def main():
             install22w = os.path.join(scratch22w, "install")
             os.makedirs(os.path.join(install22w, "results"),
                         exist_ok=True)
-            for rel, data in fake_github.FAKE_V23_FILES.items():
+            for rel, data in fake_github.FAKE_V25_FILES.items():
                 path = os.path.join(install22w, *rel.split("/"))
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "wb") as handle:
@@ -11069,16 +11083,16 @@ def main():
                 and window22k._update_check_worker is None,
                 timeout=30)
             check("live accepted pull finishes", done22k)
-            check("live pull installs v24 on disk",
+            check("live pull installs v26 on disk",
                   open(os.path.join(
                       install22w, "ollama_system_test.py"),
-                      encoding="utf-8").read().find('"24"') >= 0)
+                      encoding="utf-8").read().find('"26"') >= 0)
             check("live pull keeps results",
                   open(os.path.join(
                       install22w, "results", "keep.txt"),
                       encoding="utf-8").read() == "my results")
-            check("running copy still says v23",
-                  window22k.windowTitle().endswith("v23"),
+            check("running copy still says v25",
+                  window22k.windowTitle().endswith("v25"),
                   window22k.windowTitle())
             fresh22 = subprocess.run(
                 [sys.executable, "-c",
@@ -11087,9 +11101,9 @@ def main():
                  "print(ollama_system_test.__version__)"
                  % install22w],
                 capture_output=True, text=True, timeout=60)
-            check("a fresh launch runs v24",
+            check("a fresh launch runs v26",
                   fresh22.returncode == 0
-                  and fresh22.stdout.strip() == "24",
+                  and fresh22.stdout.strip() == "26",
                   "rc=%s out=%r err=%s" % (
                       fresh22.returncode, fresh22.stdout,
                       fresh22.stderr))
@@ -11541,6 +11555,329 @@ def main():
     finally:
         app.start_ollama_process = real_starter24
         server24.dead = False
+
+    # ---------- v25: the Prompt Dialect Test ----------
+    # The six wrappers (task text survives, examples leak
+    # nothing), the profile arithmetic, the dynamic rules, the
+    # Prompt Report, and one end-to-end dialect run against
+    # stubbed calls where Step-by-step is rigged to win.
+    templates25, _warns25 = _real_load_templates24()
+    by25 = {t["id"]: t for t in templates25}
+
+    for category in app.DIALECT_CATEGORIES:
+        for task in by25[category]["tasks"][:3]:
+            prompt = task["prompt"]
+            for shape in app.DIALECT_SHAPES:
+                wrapped = app.dialect_wrap(shape, prompt, category)
+                if shape == "terse":
+                    check(f"v25 terse keeps the {category} task text",
+                          wrapped == re.sub(
+                              r"\s+", " ", prompt).strip(),
+                          wrapped[:80])
+                else:
+                    check(f"v25 {shape} keeps the {category} task text",
+                          prompt in wrapped, wrapped[:80])
+    check("v25 terse drops a leading polite phrase",
+          app.dialect_wrap("terse", "Please write a haiku about rain.",
+                           "instruction")
+          == "write a haiku about rain.")
+    check("v25 the plain wrapper template is the slot alone",
+          app.dialect_wrapper_template("plain", "coding") == "{task}")
+    check("v25 the structured template carries the slot",
+          "{task}" in app.dialect_wrapper_template(
+              "structured", "coding"))
+
+    def _leaves25(value):
+        if isinstance(value, dict):
+            leaves = []
+            for item in value.values():
+                leaves.extend(_leaves25(item))
+            return leaves
+        if isinstance(value, list):
+            leaves = []
+            for item in value:
+                leaves.extend(_leaves25(item))
+            return leaves
+        return [value]
+
+    def _leak_values25(task):
+        rule = task.get("rule")
+        if rule == "schema":
+            schema = task.get("expected") or {}
+            return list((schema.get("properties") or {}).keys())
+        if rule == "code":
+            values = []
+            for test in task.get("tests") or []:
+                values += _leaves25(test.get("expected"))
+                values += _leaves25(test.get("args"))
+            return values
+        if rule == "tool_call":
+            return _leaves25(task.get("expected_args"))
+        return _leaves25(task.get("expected"))
+
+    for category in app.DIALECT_CATEGORIES:
+        example_text = app.DIALECT_EXAMPLES[category]
+        leaks = []
+        for task in by25[category]["tasks"]:
+            for value in _leak_values25(task):
+                if isinstance(value, str) and len(value) >= 2:
+                    if re.search(r"\b" + re.escape(value) + r"\b",
+                                 example_text, re.IGNORECASE):
+                        leaks.append((task["id"], value))
+                elif (isinstance(value, (int, float))
+                        and not isinstance(value, bool)):
+                    if str(value) in example_text:
+                        leaks.append((task["id"], value))
+        check(f"v25 {category} examples leak no expected answers",
+              not leaks, str(leaks[:3]))
+        check(f"v25 {category} examples carry no digits",
+              not any(ch.isdigit() for ch in example_text))
+
+    table25 = {
+        "instruction": {"plain": 64.0, "structured": 82.0,
+                        "terse": 60.0, "example": 66.0,
+                        "stepwise": 70.0, "tagged": 62.0},
+        "reasoning": {"plain": 50.0, "structured": 55.0,
+                      "terse": 48.0, "example": 52.0,
+                      "stepwise": 75.0, "tagged": 51.0},
+        "coding": {"plain": 80.0, "structured": 78.0,
+                   "terse": 79.0, "example": 81.0,
+                   "stepwise": 55.0, "tagged": 77.0},
+        "structured_output": {"plain": 70.0, "structured": 72.0,
+                              "terse": 68.0, "example": 71.0,
+                              "stepwise": 69.0, "tagged": 73.0},
+        "tool_calling": {"plain": 90.0, "structured": 90.0,
+                         "terse": 88.0, "example": 90.0,
+                         "stepwise": 89.0, "tagged": 90.0},
+    }
+    profile25 = app.compute_dialect_profile(
+        "fake-smart:2b", table25, "quick",
+        {"parameter_size": "2.0B"})
+    check("v25 profile best and worst shapes overall",
+          profile25["best_shape"] == "structured"
+          and profile25["worst_shape"] == "terse",
+          str((profile25["best_shape"], profile25["worst_shape"])))
+    check("v25 profile best shape per category",
+          profile25["best_shape_per_category"] == {
+              "instruction": "structured", "reasoning": "stepwise",
+              "coding": "example",
+              "structured_output": "tagged",
+              "tool_calling": "plain"},
+          str(profile25["best_shape_per_category"]))
+    check("v25 profile delta arithmetic",
+          profile25["delta_vs_plain"]["per_category"]
+          ["instruction"]["structured"] == 18.0
+          and profile25["delta_vs_plain"]["overall"]["plain"] == 0.0
+          and profile25["delta_vs_plain"]["overall"]["stepwise"]
+          == 0.8,
+          str(profile25["delta_vs_plain"]["overall"]))
+    check("v25 recommended wrapper is the winning shape with a slot",
+          "{task}" in profile25["recommended_wrapper"]
+          and profile25["recommended_wrapper"].startswith("Task:"),
+          profile25["recommended_wrapper"][:40])
+    rules25 = profile25["rules"]
+    check("v25 rules are sorted strongest first",
+          [abs(r["delta"]) for r in rules25]
+          == sorted((abs(r["delta"]) for r in rules25),
+                    reverse=True),
+          str([r["delta"] for r in rules25]))
+    check("v25 rules carry the earned effects and no unearned ones",
+          len(rules25) == 4
+          and any(r["category"] == "reasoning"
+                  and r["delta"] == 25.0 for r in rules25)
+          and any(r["category"] == "coding"
+                  and r["delta"] == -25.0 for r in rules25)
+          and any(r["category"] == "overall"
+                  and "helps one kind of job and hurts another"
+                  in r["text"] for r in rules25)
+          and any(r["category"] == "instruction"
+                  and r["delta"] == 18.0 for r in rules25)
+          and not any(r["category"] == "tool_calling"
+                      for r in rules25),
+          str([(r["category"], r["delta"]) for r in rules25]))
+    tied25 = {category: {shape: 50.0 for shape in app.DIALECT_SHAPES}
+              for category in app.DIALECT_CATEGORIES}
+    tied_profile25 = app.compute_dialect_profile(
+        "tied:1b", tied25, "full")
+    check("v25 an all-tied table earns no rules and Plain best",
+          tied_profile25["rules"] == []
+          and tied_profile25["best_shape"] == "plain",
+          str(tied_profile25["rules"]))
+    sparse25 = app.compute_dialect_profile(
+        "sparse:1b",
+        {"instruction": {shape: None for shape in app.DIALECT_SHAPES},
+         "coding": {"plain": 40.0, "structured": 90.0}},
+        "full")
+    check("v25 an unmeasured category stays unmeasured, not zero",
+          sparse25["best_shape_per_category"]["instruction"] is None
+          and sparse25["best_shape"] == "structured",
+          str(sparse25["best_shape_per_category"]))
+    profile_json25 = json.loads(json.dumps(profile25))
+    check("v25 profile json carries the contracted keys",
+          all(key in profile_json25 for key in (
+              "model", "shape_scores", "best_shape",
+              "best_shape_per_category", "delta_vs_plain",
+              "recommended_wrapper", "rules"))
+          and all(set(rule) >= {"text", "category", "delta"}
+                  for rule in profile_json25["rules"]),
+          str(sorted(profile_json25.keys())))
+    card25 = "\n".join(app.render_communication_profile(profile25))
+    check("v25 the report card section names best, worst, deltas",
+          "Communication Profile" in card25
+          and "Structured" in card25 and "Terse" in card25
+          and "+18 over Plain" in card25,
+          card25[:300])
+    skipped25 = "\n".join(app.render_communication_profile({
+        "model": "big:8b", "shape_scores": {},
+        "status": "skipped: needs ~9.6 GB RAM, 4 GB free. "
+                  "Close other apps and run again."}))
+    check("v25 an unmeasured profile says why, in plain words",
+          "Not measured - skipped: needs ~9.6 GB RAM" in skipped25,
+          skipped25[:200])
+    report25 = app.render_prompt_report(profile25)
+    check("v25 prompt report has both example sections and rules",
+          "Say it like this:" in report25
+          and "Don't say it like this:" in report25
+          and "\nRules\n" in report25
+          and report25.count(app.DIALECT_SAMPLE_REQUEST) >= 2,
+          report25[:200])
+    check("v25 prompt report is plain text, no markup, no jargon wall",
+          "**" not in report25 and "##" not in report25
+          and "—" not in report25,
+          report25[:200])
+
+    # The Dialect tab itself: present, honest, nothing picked.
+    window25 = app.MainWindow()
+    check("v25 the Dialect tab exists with its picker",
+          "Dialect" in [window25.tabs.tabText(i)
+                        for i in range(window25.tabs.count())]
+          and window25.dialect_model_list is not None,
+          str([window25.tabs.tabText(i)
+               for i in range(window25.tabs.count())]))
+    check("v25 nothing is picked on the Dialect tab by default",
+          not checked_names(window25.dialect_model_list)
+          and not any(box.isChecked() for box in
+                      window25.dialect_category_boxes.values())
+          and not window25.dialect_quick_radio.isChecked()
+          and not window25.dialect_full_radio.isChecked())
+    window25.start_dialect_run()
+    check("v25 running with nothing ticked says what is missing",
+          window25.status_label.text().startswith(
+              "Tick at least one model"),
+          window25.status_label.text())
+    window25.close()
+
+    # End to end: stubbed calls, Step-by-step rigged to win.
+    real_generate25 = app.generate_once
+    real_chat25 = app.chat_once
+
+    def _metrics25(answer, tool_calls=None):
+        return {
+            "answer": answer,
+            "decode_tok_s": 10.0,
+            "prompt_tok_s": 20.0,
+            "ttft_s": 0.1,
+            "prompt_tokens": 20,
+            "completion_tokens": 20,
+            "dropped_chunks": 0,
+            "tool_calls": tool_calls or [],
+        }
+
+    def _generate25(model, prompt, num_predict, temperature=0,
+                    should_stop=None, think=False):
+        if "step by step" in prompt.lower():
+            return _metrics25(
+                fake_ollama.answer_for("smart", prompt))
+        return _metrics25("Purple monkey dishwasher.")
+
+    def _chat25(model, messages, num_predict, temperature=0,
+                tools=None, should_stop=None, think=False):
+        last = messages[-1].get("content", "") if messages else ""
+        if "step by step" in last.lower():
+            answer, calls = fake_ollama.chat_reply(
+                "smart", "", last, 1, tools)
+            return _metrics25(
+                answer,
+                [{"name": name, "arguments": args}
+                 for name, args in calls])
+        return _metrics25("Purple monkey dishwasher.")
+
+    app.generate_once = _generate25
+    app.chat_once = _chat25
+    try:
+        results25 = {}
+        folders25 = {}
+        finished25 = {"done": False}
+        results_dir25 = os.path.join(SCRATCH, "results25")
+        os.makedirs(results_dir25, exist_ok=True)
+        worker25 = app.DialectWorker(
+            [app.ollama_target(
+                "fake-smart:2b",
+                app.capabilities_from_show(
+                    app.ollama_show("fake-smart:2b")))],
+            [by25[category] for category in app.DIALECT_CATEGORIES],
+            "sys25", machine24, results_dir25, quick=True)
+        worker25.dialect_done.connect(
+            lambda label, profile, folder: (
+                results25.__setitem__(label, profile),
+                folders25.__setitem__(label, folder)))
+        worker25.run_finished.connect(
+            lambda reason: finished25.__setitem__("done", reason))
+        worker25.start()
+        ok25 = wait_until(lambda: finished25["done"],
+                          timeout=300, app=qt_app)
+        worker25.wait()
+        check("v25 the dialect run finishes", ok25
+              and finished25["done"] == "done", str(finished25))
+        e2e25 = results25.get("fake-smart:2b", {})
+        check("v25 the rigged shape is reported best with its delta",
+              e2e25.get("best_shape") == "stepwise"
+              and e2e25.get("shape_scores", {}).get(
+                  "reasoning", {}).get("stepwise") == 100.0
+              and e2e25.get("delta_vs_plain", {}).get(
+                  "overall", {}).get("stepwise", 0) > 50,
+              str(e2e25.get("delta_vs_plain", {}).get("overall")))
+        folder25 = folders25.get("fake-smart:2b", "")
+        saved25 = {}
+        if folder25:
+            with open(os.path.join(
+                    folder25, "prompt_profile.json"),
+                    encoding="utf-8") as handle:
+                saved25 = json.load(handle)
+        check("v25 the run folder holds the profile, report, records",
+              bool(folder25)
+              and saved25.get("best_shape") == "stepwise"
+              and os.path.exists(os.path.join(
+                  folder25, "prompt_report.txt"))
+              and os.path.exists(os.path.join(
+                  folder25, "dialect_run.json")),
+              folder25)
+        report_file25 = ""
+        if folder25:
+            with open(os.path.join(
+                    folder25, "prompt_report.txt"),
+                    encoding="utf-8") as handle:
+                report_file25 = handle.read()
+        check("v25 the saved prompt report shows the winning shape",
+              "Say it like this:" in report_file25
+              and "step by step" in report_file25,
+              report_file25[:200])
+        latest25 = app.latest_dialect_profile(
+            results_dir25, "fake-smart:2b", "sys25")
+        check("v25 the newest saved profile reads back for the card",
+              latest25 is not None
+              and latest25.get("best_shape") == "stepwise")
+        card_result25 = {
+            "name": "fake-smart:2b", "status": "done",
+            "overall_score": 90.0, "templates": {},
+            "dialect_profile": latest25,
+        }
+        check("v25 the report card gains the Communication Profile",
+              "Communication Profile" in app.render_text_report(
+                  [card_result25]))
+    finally:
+        app.generate_once = real_generate25
+        app.chat_once = real_chat25
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview

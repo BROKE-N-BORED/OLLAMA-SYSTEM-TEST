@@ -3,16 +3,17 @@
 Serves the three endpoints the updater uses — the latest release,
 a commit's file list, and a tag's source archive — from small
 crafted trees: a fake v22 install and a fake v23 release for the
-updater unit tests, plus a fake v24 release so the window-level
+updater unit tests, plus fake v25/v26 trees so the window-level
 tests can run the same story one version up (the app itself is
-v23 now, so its "newer release" is v24). The blob checksums are
+v25 now, so its "newer release" is v26). The blob checksums are
 computed here with hashlib, independently of the updates module
 under test, so the verification checks prove the two agree
 rather than the module agreeing with itself.
 
 The server records every request path (server.requests), so a test
 can prove a declined update downloaded nothing. Configure it
-through start_fake_github: latest_tag ("v22", "v23" or "v24"),
+through start_fake_github: latest_tag ("v22", "v23", "v24",
+"v25" or "v26"),
 tamper (serve the latest archive with one file changed, while
 the file list still names the original bytes — verification must
 refuse it), no_commit (the release names no commit, so the pull
@@ -30,6 +31,8 @@ from urllib.parse import unquote, urlparse
 V22_COMMIT = "a" * 40
 V23_COMMIT = "b" * 40
 V24_COMMIT = "c" * 40
+V25_COMMIT = "d" * 40
+V26_COMMIT = "e" * 40
 
 FAKE_V22_FILES = {
     "ollama_system_test.py": (
@@ -59,6 +62,26 @@ FAKE_V24_FILES = {
     "templates/old.json": b'{"id": "old"}',
     "README.md": b"v24 readme\n",
     "run.sh": b"#!/bin/sh\necho v24\n",
+}
+
+FAKE_V25_FILES = {
+    "ollama_system_test.py": (
+        b'"""Fake OST v25."""\n__version__ = "25"\n'
+    ),
+    "new_file.txt": b"new in v25\n",
+    "templates/old.json": b'{"id": "old"}',
+    "README.md": b"v25 readme\n",
+    "run.sh": b"#!/bin/sh\necho v25\n",
+}
+
+FAKE_V26_FILES = {
+    "ollama_system_test.py": (
+        b'"""Fake OST v26."""\n__version__ = "26"\n'
+    ),
+    "new_file.txt": b"new in v26\n",
+    "templates/old.json": b'{"id": "old"}',
+    "README.md": b"v26 readme\n",
+    "run.sh": b"#!/bin/sh\necho v26\n",
 }
 
 # run.sh is executable in the fake trees, like a real script file.
@@ -124,7 +147,8 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
         server.requests.append(path)
         if path.endswith("/releases/latest"):
             tag = server.latest_tag
-            commit = {"v24": V24_COMMIT, "v23": V23_COMMIT}.get(
+            commit = {"v26": V26_COMMIT, "v25": V25_COMMIT,
+                      "v24": V24_COMMIT, "v23": V23_COMMIT}.get(
                 tag, V22_COMMIT)
             payload = {
                 "tag_name": tag,
@@ -139,7 +163,11 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
             return
         if "/git/trees/" in path:
             sha = path.rsplit("/git/trees/", 1)[1]
-            if sha in (V24_COMMIT, "v24"):
+            if sha in (V26_COMMIT, "v26"):
+                self._send_json(build_tree(FAKE_V26_FILES))
+            elif sha in (V25_COMMIT, "v25"):
+                self._send_json(build_tree(FAKE_V25_FILES))
+            elif sha in (V24_COMMIT, "v24"):
                 self._send_json(build_tree(FAKE_V24_FILES))
             elif sha in (V23_COMMIT, "v23"):
                 self._send_json(build_tree(FAKE_V23_FILES))
@@ -150,7 +178,17 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
             return
         if "/zipball/refs/tags/" in path:
             tag = path.rsplit("/zipball/refs/tags/", 1)[1]
-            if tag == "v24":
+            if tag == "v26":
+                files = dict(FAKE_V26_FILES)
+                if server.tamper:
+                    files["README.md"] = b"tampered readme\n"
+                self._send_bytes(build_zipball(files, V26_COMMIT))
+            elif tag == "v25":
+                files = dict(FAKE_V25_FILES)
+                if server.tamper:
+                    files["README.md"] = b"tampered readme\n"
+                self._send_bytes(build_zipball(files, V25_COMMIT))
+            elif tag == "v24":
                 files = dict(FAKE_V24_FILES)
                 if server.tamper:
                     files["README.md"] = b"tampered readme\n"

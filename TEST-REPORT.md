@@ -1,3 +1,130 @@
+# TEST-REPORT — OLLAMA SYSTEM TEST v25
+
+Verified 2026-11-20 in a Linux sandbox (x86_64, PySide6 6.12.0,
+Python 3.12.3) under the Qt test env from AGENTS.md:
+QT_QPA_PLATFORM=offscreen for the suite, Xvfb + xcb for the GUI
+drive, LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-
+linux-gnu, venv ~/workspace/forge-v2-testenv/bin/python, default
+HOME, TMPDIR on tmpfs.
+
+v25 adds the Prompt Dialect Test, on its own Dialect tab. The
+same tasks are asked six ways - Plain (the task as written),
+Structured (Task / Context / Constraints / Output format
+headings), Terse (whitespace squeezed, a leading polite phrase
+dropped), With examples (one or two short examples per kind of
+job, unrelated to the task, digit-free and checked by the suite
+to leak no expected answer), Step by step, and Tagged
+(XML-style labels) - and every answer is graded by the existing
+score_task machinery at the normal scored settings
+(temperature 0, num_predict -1, the RAM check before a load,
+the shared restart budget if Ollama dies). Kinds of job:
+Instruction, Reasoning, Coding, Structured Output, and Tool
+Calling when the model screens tool-capable. Quick mode runs
+the first 3 tasks of each kind; Full runs them all; one pass
+per shape, no repeats - the comparison is shape against shape.
+Local Ollama models only; provider models are out of scope for
+v1 and the tab says so, next to the honest-scope line: the
+test watches how a model answers through Ollama, it does not
+look inside the model's weights. Each run saves a folder beside
+the normal run files holding prompt_profile.json (shape
+scores, best shape overall and per kind, delta vs Plain, a
+recommended wrapper in the winning shape with a {task} slot,
+and the rules), prompt_report.txt (the plain-words Prompt
+Report: what the model is, how it likes to be talked to, what
+it does not like, how much better the best way is, tips per
+kind of job, a "Say it like this:" example, a "Don't say it
+like this:" example, and the rules last), and dialect_run.json
+(every task record). The rules are dynamic: a rule exists only
+where a shape beats or trails Plain in a kind of job by 10
+points or more (the threshold is named in the code), or helps
+one kind while hurting another; each rule carries its evidence
+with the actual scores, strongest first, and an all-tied table
+earns no rules. The normal report card gains a Communication
+Profile section when a dialect profile exists for the model.
+The normal benchmark is untouched: no template, grader, or
+settings change.
+
+Verification. Full suite, fresh copy of the final tree,
+offscreen Qt env: 1944 passed, 0 failed, exit 0 (run 5, log
+~/workspace/ost-v25-verify/full5.log). The dedicated v25
+section (125 checks) covers the wrappers (the task text
+survives inside every shape), the leakage scan over every
+task's expected values, the profile arithmetic on a rigged
+table, the rules (the expected four from a rigged table in
+the expected order, none from an all-tied table), the Prompt
+Report's sections and plainness, the Dialect tab (present,
+nothing picked by default, running empty-handed says what is
+missing), and an end-to-end DialectWorker run against stubbed
+calls where Step-by-step is rigged to win - it is reported
+best with the right delta, and all three output files land in
+the run folder. One real app improvement came out of this
+verification: the first GUI drive ran on a sandbox moment with
+806 MB free, the fake 2 GB model was honestly RAM-skipped -
+and the Communication Profile section printed only a bare
+"no shapes measured" line. The section now prints the reason
+("Not measured - skipped: needs ~2.4 GB RAM..."), with a suite
+check on the wording. Test-side fixes, app untouched: the
+version pins (two pairs) and the tab-count pins (two) moved
+to 25 and 8 tabs, the per-release updates every version
+makes; a preview step pin still said 6 while its own section's
+counter check said 13 - it now asserts the preview matches
+the counter, which is what its name always claimed; and the
+fake-GitHub updater story was rolled one version up, as its
+own docstring prescribes (the window-level live checks now
+run the v25 app against a fake v26 release, seeded from a
+fake v25 install) - it had been left at the v23-to-v24 story,
+so its four live checks had been failing since the v24 bump
+went in without the roll. The GUI drive (Xvfb 1366x768)
+passed end to end: the Dialect tab with its honest-scope
+line, a Quick run (Instruction and Reasoning) for
+fake-smart:2b driven through the window against the fake
+server, the Communication Profile summary in the tab, the
+finished-model entry, and the Prompt Report window opened
+and read (screenshots drive-dialect-tab.png,
+drive-dialect-done.png, drive-report.png in
+~/workspace/ost-v25-verify/). A real dialect run over HTTP
+against the fake Ollama server (DialectWorker, Quick, all
+five kinds, fake-smart:2b) saved all three outputs; the
+report reads plainly, both example sections present, rules
+last with their scores. Its numbers (best Plain 100, worst
+Structured 47, 4 rules) measure the fake harness as much as
+anything - the fake server picks canned answers by substring,
+and the Structured scaffold's own words trip some of them -
+which is stated here rather than smoothed over; the machinery
+reported what it measured, in plain words, and on a real
+model the same machinery measures the model.
+
+Run road (full suite, fresh copy each run, offscreen Qt env):
+run 1 reached the end at 1935 passed / 8 failed - all eight
+were the test-side pins and the stale updater story above,
+fixed in the tree. Run 2, from the fixed tree, passed end to
+end: 1943 / 0. The report-card status line then added one
+check (1944 total). Run 3, on the final code, reached
+1943 / 1 - the one failure was a capabilities.json a debug
+probe had written into the build tree itself and the fresh
+copy inherited; the file was removed at the source and the
+check passes on clean copies. Run 4 was killed by a runtime
+restart at 1154 / 0, the sandbox's known habit, no summary
+written. Run 5, on the final tree, passed end to end:
+1944 / 0, exit 0.
+
+Known gaps, recorded not hidden: (a) the dialect test has
+never run against a real Ollama or a real model - the first
+real run happens on Joshua's PC, and the fake server's
+numbers above are harness numbers, not model findings.
+(b) Provider models are excluded from the dialect test by
+design in v1; the tab says so plainly. (c) Dialect runs do
+not write a run manifest, so the normal run's resume does
+not apply to them; a cancelled dialect run keeps whatever
+models already finished and saved. (d) Quick mode's slice
+is the first 3 tasks in each template's authored order, not
+a random sample - the same slice every time, which keeps
+runs comparable, at the cost of covering only that slice.
+(e) Carried from v22: the updater cannot install new
+dependencies, the install is file-by-file rather than
+atomic, and the update pull has never run against the live
+GitHub API.
+
 # TEST-REPORT — OLLAMA SYSTEM TEST v24
 
 Verified 2026-11-19 in a Linux sandbox (x86_64, PySide6 6.12.0,

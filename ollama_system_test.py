@@ -118,11 +118,11 @@ except ImportError:
 try:
     from PySide6.QtCore import (
         QCoreApplication, QEvent, QPropertyAnimation, QRect, QSettings,
-        QSize, Qt, QThread, QTimer, Signal,
+        QSize, Qt, QThread, QTimer, QUrl, Signal,
     )
     from PySide6.QtGui import (
-        QAction, QFont, QIcon, QKeySequence, QPainter, QPalette, QPen,
-        QShortcut,
+        QAction, QDesktopServices, QFont, QIcon, QKeySequence, QPainter,
+        QPalette, QPen, QShortcut,
     )
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (
@@ -146,6 +146,7 @@ try:
         QMessageBox,
         QProgressBar,
         QPushButton,
+        QRadioButton,
         QScrollArea,
         QSlider,
         QSpinBox,
@@ -170,7 +171,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "24"
+__version__ = "25"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -5832,6 +5833,12 @@ def render_text_report(results):
                     f"    Run stopped early: "
                     f"{run.get('error', 'Ollama stopped responding')}"
                 )
+        dialect_profile = result.get("dialect_profile")
+        if dialect_profile:
+            # (v25): the model's Communication Profile, from its
+            # newest dialect run - attached by the window when the
+            # report is saved, never by a benchmark run itself.
+            lines.extend(render_communication_profile(dialect_profile))
         lines.append("")
     return "\n".join(lines)
 
@@ -6241,6 +6248,681 @@ def _tags_digest(model):
     for entry in (data or {}).get("models") or []:
         if isinstance(entry, dict) and entry.get("name") == model:
             return entry.get("digest")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Prompt Dialect Test (v25): the same tasks under six prompt shapes
+# ---------------------------------------------------------------------------
+# Each model has a way it likes to be talked to. This test finds it
+# the black-box way: the SAME tasks, with only the writing around
+# them changed (the shape), every answer graded by the app's own
+# graders, at the run's normal settings. It does not look inside
+# the model's weights - Ollama does not expose those - and the UI
+# and the reports say so. The outputs are a Communication Profile
+# section on the model's report card, a machine-readable
+# prompt_profile.json (Forge and Stella consume it), and a
+# plain-words prompt_report.txt a person can use directly.
+
+DIALECT_SHAPES = ["plain", "structured", "terse", "example",
+                  "stepwise", "tagged"]
+DIALECT_SHAPE_NAMES = {
+    "plain": "Plain",
+    "structured": "Structured",
+    "terse": "Terse",
+    "example": "Example-led",
+    "stepwise": "Step-by-step",
+    "tagged": "Tagged",
+}
+DIALECT_CATEGORIES = ["instruction", "reasoning", "coding",
+                      "structured_output", "tool_calling"]
+DIALECT_CATEGORY_NAMES = {
+    "instruction": "Instruction",
+    "reasoning": "Reasoning",
+    "coding": "Coding",
+    "structured_output": "Structured Output",
+    "tool_calling": "Tool Use",
+}
+# The same kinds of job in the plain words the Prompt Report uses.
+DIALECT_CATEGORY_JOBS = {
+    "instruction": "following instructions",
+    "reasoning": "thinking problems",
+    "coding": "writing code",
+    "structured_output": "tidy formatted answers",
+    "tool_calling": "using tools",
+}
+# How each shape reads in plain words, for the Prompt Report and
+# its rules.
+DIALECT_SHAPE_PHRASES = {
+    "plain": "just typing the request the normal way, with no "
+             "special layout",
+    "structured": "with clear headings - one part for the task, "
+                  "one for background, one for how the answer "
+                  "should look",
+    "terse": "with very short requests, cut down to just the point",
+    "example": "with a small example of the wanted reply shown first",
+    "stepwise": "asking it to work step by step and give the final "
+                "answer at the end",
+    "tagged": "with labels wrapped around each part of the request",
+}
+DIALECT_QUICK_TASKS = 3
+# A shape earns a rule in a category when it beats (or loses to)
+# Plain there by at least this many points. Ten points on a 0-100
+# score is a gap a user can feel, and a handful of tasks swings by
+# more than a few points on luck alone - a smaller margin would
+# mint rules out of noise. The threshold is stated here, in the
+# code, so the rule list is never a matter of taste.
+DIALECT_RULE_MARGIN = 10.0
+# The worked example the Prompt Report fills the winning and
+# losing wrappers with, so the difference is visible.
+DIALECT_SAMPLE_REQUEST = (
+    "Summarize in one sentence why the sky looks blue."
+)
+
+# The few-shot examples, one per category. Rules they live by:
+# unrelated to every task in the category, no digits anywhere
+# (digits in a prompt are numbers the graders would have to step
+# around), and never a task's expected answer or a hint of one -
+# the suite checks them against the categories' expected values.
+DIALECT_EXAMPLES = {
+    "instruction": (
+        "Example request: Name a farm animal.\n"
+        "Example reply: pig"
+    ),
+    "reasoning": (
+        "Example question: All sparrows are birds. Felix is a "
+        "sparrow. Is Felix a bird?\n"
+        "Example answer: Felix is a bird, because every sparrow "
+        "is a bird."
+    ),
+    "coding": (
+        "Example request: Write a Python function named shout(word) "
+        "that returns the word in upper case.\n"
+        "Example reply:\n"
+        "```python\n"
+        "def shout(word):\n"
+        "    return word.upper()\n"
+        "```"
+    ),
+    "structured_output": (
+        "Example request: Return a JSON object with the key item "
+        "(string) and the key wheels (string) for a bicycle, which "
+        "has two wheels.\n"
+        "Example reply: {\"item\": \"bicycle\", \"wheels\": \"two\"}"
+    ),
+    "tool_calling": (
+        "Example request: Play some jazz music.\n"
+        "Example reply: a call to play_music with the style set "
+        "to jazz."
+    ),
+}
+
+
+def _terse_prompt(prompt):
+    """The Terse shape: the task with the padding squeezed out -
+    one line, single spaces, a leading polite phrase dropped.
+    Nothing is added, so the task itself is all that is left."""
+    text = re.sub(r"\s+", " ", str(prompt)).strip()
+    lowered = text.lower()
+    for prefix in ("could you please ", "can you please ", "please "):
+        if lowered.startswith(prefix):
+            text = text[len(prefix):].lstrip()
+            break
+    return text
+
+
+def dialect_wrapper_template(shape_id, category_id):
+    """One shape as a fill-in template: the task goes where {task}
+    sits. This is the string prompt_profile.json recommends, so
+    what the report tells the user to copy is exactly what the
+    test ran. (Terse is the task itself, tightened, so its
+    template is the slot alone; Plain is the slot alone too.)"""
+    if shape_id == "structured":
+        return (
+            "Task:\n{task}\n\n"
+            "Context:\n"
+            "This is a test question. There is no extra background.\n\n"
+            "Constraints:\n"
+            "Answer the task above. Follow any format the task "
+            "itself asks for.\n\n"
+            "Output format:\n"
+            "The format the task asks for."
+        )
+    if shape_id == "example":
+        return (
+            "Here is an example of the kind of reply wanted. It is "
+            "only an example - your request below is different.\n\n"
+            + DIALECT_EXAMPLES[category_id]
+            + "\n\nNow your request:\n{task}"
+        )
+    if shape_id == "stepwise":
+        return (
+            "Work through this step by step. Think about each part "
+            "in turn, and give your final answer at the end.\n\n{task}"
+        )
+    if shape_id == "tagged":
+        return (
+            "<instruction>\n{task}\n</instruction>\n"
+            "<context>\n"
+            "This is a test question. There is no extra background.\n"
+            "</context>\n"
+            "<output>\n"
+            "Give the answer in the format the task asks for.\n"
+            "</output>"
+        )
+    return "{task}"
+
+
+def dialect_wrap(shape_id, prompt, category_id):
+    """One task prompt in one shape. The task text itself is never
+    rewritten (Terse only squeezes its whitespace and drops a
+    leading polite phrase); only the writing around it changes,
+    so any score difference is the shape's doing."""
+    if shape_id == "terse":
+        return _terse_prompt(prompt)
+    return dialect_wrapper_template(shape_id, category_id).replace(
+        "{task}", prompt)
+
+
+def _shape_overall(shape_scores, shape_id):
+    """One shape's score across the whole test: the mean of its
+    category scores, over the categories where it has one."""
+    values = []
+    for category in DIALECT_CATEGORIES:
+        score = (shape_scores.get(category) or {}).get(shape_id)
+        if score is not None:
+            values.append(score)
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _best_worst(scores_by_shape):
+    """(best, worst) shape ids from a {shape: score-or-None} map.
+    Ties go to the shape earliest in DIALECT_SHAPES, so Plain wins
+    a tie - the honest reading of a tie is that no shape beat
+    typing normally. (None, None) when nothing was measured."""
+    measured = [(shape, scores_by_shape.get(shape))
+                for shape in DIALECT_SHAPES
+                if scores_by_shape.get(shape) is not None]
+    if not measured:
+        return None, None
+    best = max(measured, key=lambda pair: pair[1])[0]
+    worst = min(measured, key=lambda pair: pair[1])[0]
+    return best, worst
+
+
+def compute_dialect_profile(model, shape_scores, mode="full",
+                            model_info=None):
+    """The Communication Profile for one model, from its
+    {category: {shape: score-or-None}} table. Pure arithmetic -
+    the same function builds the worker's profile and grades the
+    suite's rigged tables."""
+    best_per_category = {}
+    worst_per_category = {}
+    delta_per_category = {}
+    for category in DIALECT_CATEGORIES:
+        scores = shape_scores.get(category) or {}
+        best, worst = _best_worst(scores)
+        best_per_category[category] = best
+        worst_per_category[category] = worst
+        plain = scores.get("plain")
+        delta_per_category[category] = {
+            shape: (None if scores.get(shape) is None or plain is None
+                    else round(scores[shape] - plain, 1))
+            for shape in DIALECT_SHAPES
+        }
+    overall_by_shape = {shape: _shape_overall(shape_scores, shape)
+                        for shape in DIALECT_SHAPES}
+    best_shape, worst_shape = _best_worst(overall_by_shape)
+    plain_overall = overall_by_shape.get("plain")
+    delta_overall = {
+        shape: (None if score is None or plain_overall is None
+                else round(score - plain_overall, 1))
+        for shape, score in overall_by_shape.items()
+    }
+    # The recommended wrapper shows the winning shape as it ran in
+    # the category where that shape scored highest (the example
+    # shape's text is per-category; the rest read the same in any
+    # category).
+    wrapper_category = None
+    if best_shape is not None:
+        best_seen = None
+        for category in DIALECT_CATEGORIES:
+            score = (shape_scores.get(category) or {}).get(best_shape)
+            if score is not None and (best_seen is None
+                                      or score > best_seen):
+                best_seen = score
+                wrapper_category = category
+    profile = {
+        "model": model,
+        "mode": mode,
+        "shape_scores": {
+            category: {shape: (shape_scores.get(category) or {}).get(shape)
+                       for shape in DIALECT_SHAPES}
+            for category in DIALECT_CATEGORIES
+            if category in shape_scores
+        },
+        "overall_scores": overall_by_shape,
+        "best_shape": best_shape,
+        "worst_shape": worst_shape,
+        "best_shape_per_category": best_per_category,
+        "worst_shape_per_category": worst_per_category,
+        "delta_vs_plain": {
+            "overall": delta_overall,
+            "per_category": delta_per_category,
+        },
+        "wrapper_category": wrapper_category,
+        "recommended_wrapper": (
+            dialect_wrapper_template(best_shape, wrapper_category)
+            if best_shape is not None else None
+        ),
+        "model_info": model_info,
+    }
+    profile["rules"] = extract_dialect_rules(profile)
+    return profile
+
+
+def extract_dialect_rules(profile):
+    """The dynamic rule list: one rule per clear, measured effect
+    in the profile, strongest evidence first. A clear effect is a
+    shape beating or losing to Plain by DIALECT_RULE_MARGIN points
+    or more, in one category or across the whole test. Nothing is
+    invented to fill a count - a profile whose shapes all scored
+    about the same earns no rules at all."""
+    rules = []
+    scores = profile.get("shape_scores") or {}
+    deltas = ((profile.get("delta_vs_plain") or {})
+              .get("per_category") or {})
+
+    def category_delta(category, shape):
+        return (deltas.get(category) or {}).get(shape)
+
+    for category in DIALECT_CATEGORIES:
+        if category not in scores:
+            continue
+        job = DIALECT_CATEGORY_JOBS[category]
+        for shape in DIALECT_SHAPES:
+            if shape == "plain":
+                continue
+            delta = category_delta(category, shape)
+            if delta is None or abs(delta) < DIALECT_RULE_MARGIN:
+                continue
+            shape_score = scores[category].get(shape)
+            plain_score = scores[category].get("plain")
+            phrase = DIALECT_SHAPE_PHRASES[shape]
+            if delta > 0:
+                text = (
+                    f"For {job}, talk to it {phrase}. We know this "
+                    f"because it scored {shape_score:.0f} this way "
+                    f"and {plain_score:.0f} the normal way on {job}."
+                )
+            else:
+                text = (
+                    f"For {job}, do not talk to it {phrase}. We know "
+                    f"this because it scored {plain_score:.0f} the "
+                    f"normal way and only {shape_score:.0f} this way "
+                    f"on {job}."
+                )
+            rules.append({"text": text, "category": category,
+                          "delta": delta})
+    # A shape that clearly helps one kind of job and clearly hurts
+    # another is a finding of its own: the split is the point.
+    for shape in DIALECT_SHAPES:
+        if shape == "plain":
+            continue
+        helps = [(category, category_delta(category, shape))
+                 for category in DIALECT_CATEGORIES
+                 if category in scores
+                 and category_delta(category, shape) is not None
+                 and category_delta(category, shape)
+                 >= DIALECT_RULE_MARGIN]
+        hurts = [(category, category_delta(category, shape))
+                 for category in DIALECT_CATEGORIES
+                 if category in scores
+                 and category_delta(category, shape) is not None
+                 and category_delta(category, shape)
+                 <= -DIALECT_RULE_MARGIN]
+        if not helps or not hurts:
+            continue
+        help_cat, help_delta = max(helps, key=lambda pair: pair[1])
+        hurt_cat, hurt_delta = min(hurts, key=lambda pair: pair[1])
+        text = (
+            f"Talking to it {DIALECT_SHAPE_PHRASES[shape]} helps one "
+            f"kind of job and hurts another. We know this because on "
+            f"{DIALECT_CATEGORY_JOBS[help_cat]} it scored "
+            f"{scores[help_cat][shape]:.0f} this way and "
+            f"{scores[help_cat]['plain']:.0f} the normal way, but on "
+            f"{DIALECT_CATEGORY_JOBS[hurt_cat]} it scored "
+            f"{scores[hurt_cat]['plain']:.0f} the normal way and only "
+            f"{scores[hurt_cat][shape]:.0f} this way."
+        )
+        rules.append({
+            "text": text, "category": "overall",
+            "delta": (help_delta if abs(help_delta) >= abs(hurt_delta)
+                      else hurt_delta),
+        })
+    # The whole-test rules: the best and worst ways overall, when
+    # the gap to Plain is clear.
+    overall_delta = ((profile.get("delta_vs_plain") or {})
+                     .get("overall") or {})
+    overall_scores = profile.get("overall_scores") or {}
+    best = profile.get("best_shape")
+    if best and best != "plain":
+        delta = overall_delta.get(best)
+        if delta is not None and delta >= DIALECT_RULE_MARGIN:
+            rules.append({
+                "text": (
+                    f"All round, the best way to talk to it is "
+                    f"{DIALECT_SHAPE_PHRASES[best]}. We know this "
+                    f"because it scored {overall_scores[best]:.0f} "
+                    f"this way and {overall_scores['plain']:.0f} the "
+                    f"normal way across the whole test."
+                ),
+                "category": "overall", "delta": delta,
+            })
+    worst = profile.get("worst_shape")
+    if worst and worst != "plain":
+        delta = overall_delta.get(worst)
+        if delta is not None and delta <= -DIALECT_RULE_MARGIN:
+            rules.append({
+                "text": (
+                    f"All round, the worst way to talk to it is "
+                    f"{DIALECT_SHAPE_PHRASES[worst]}. We know this "
+                    f"because it scored {overall_scores['plain']:.0f} "
+                    f"the normal way and only "
+                    f"{overall_scores[worst]:.0f} this way across the "
+                    f"whole test."
+                ),
+                "category": "overall", "delta": delta,
+            })
+    rules.sort(key=lambda rule: -abs(rule["delta"]))
+    return rules
+
+
+def render_communication_profile(profile):
+    """The report card's Communication Profile section (v25), as
+    text lines: best and worst shapes overall, the best shape per
+    kind of job, and the gap to Plain beside each. The Prompt
+    Report explains the same numbers in plain words."""
+    lines = ["  Communication Profile (prompt dialect test):"]
+    best = profile.get("best_shape")
+    worst = profile.get("worst_shape")
+    overall = profile.get("overall_scores") or {}
+    if best is None:
+        status = profile.get("status") or ""
+        if status:
+            lines.append(f"    Not measured - {status}")
+        else:
+            lines.append(
+                "    No prompt shapes could be measured for this "
+                "model.")
+        return lines
+    best_line = (
+        f"    Best way to prompt it: {DIALECT_SHAPE_NAMES[best]} "
+        f"({overall[best]:.0f}% across the test)"
+    )
+    if best == "plain":
+        best_line += " - typing normally is already its best way"
+    lines.append(best_line)
+    if worst is not None and worst != best:
+        lines.append(
+            f"    Worst way: {DIALECT_SHAPE_NAMES[worst]} "
+            f"({overall[worst]:.0f}% across the test)")
+    deltas = ((profile.get("delta_vs_plain") or {})
+              .get("per_category") or {})
+    for category in DIALECT_CATEGORIES:
+        if category not in (profile.get("shape_scores") or {}):
+            continue
+        name = DIALECT_CATEGORY_NAMES[category]
+        cat_best = ((profile.get("best_shape_per_category") or {})
+                    .get(category))
+        if cat_best is None:
+            lines.append(f"    {name}: not measured")
+            continue
+        score = profile["shape_scores"][category][cat_best]
+        delta = (deltas.get(category) or {}).get(cat_best)
+        if cat_best == "plain" or not delta:
+            lines.append(
+                f"    {name}: best is Plain ({score:.0f}%), no shape "
+                "beat typing normally")
+        else:
+            lines.append(
+                f"    {name}: best is {DIALECT_SHAPE_NAMES[cat_best]} "
+                f"({score:.0f}%), {delta:+.0f} over Plain")
+    return lines
+
+
+def render_prompt_report(profile):
+    """The Prompt Report (v25): every dialect finding for one
+    model in plain words a child could follow - what the model
+    is, how it likes to be talked to, what it does not like, how
+    much better the best way is, tips per kind of job, the best
+    and worst ways shown with the same request, and the rules
+    last. Plain text only: no markup codes anywhere."""
+    model = profile.get("model") or "this model"
+    info = profile.get("model_info") or {}
+    best = profile.get("best_shape")
+    worst = profile.get("worst_shape")
+    overall = profile.get("overall_scores") or {}
+    scores = profile.get("shape_scores") or {}
+    lines = []
+    lines.append(f"Prompt Report for {model}")
+    lines.append("")
+    lines.append("What this is")
+    lines.append("--------------")
+    lines.append(
+        f"This report is about a computer program called {model}. "
+        "Programs like this one answer questions and do small jobs "
+        "in writing. This one runs on your own computer."
+    )
+    size = info.get("parameter_size")
+    if size:
+        lines.append(
+            f"Its size is {size}. That number is a measure of how "
+            "big the program's memory is. A bigger number can mean "
+            "it knows more, but it also runs slower."
+        )
+    lines.append(
+        "We asked it the same questions six different ways. The "
+        "questions never changed. Only the way they were written "
+        "changed. Then we marked every answer with the same "
+        "marking the normal tests use. This report tells you "
+        "which way of writing works best for this program."
+    )
+    lines.append(
+        "This test only watches how the program answers. It does "
+        "not look inside the program, and it does not change it."
+    )
+    lines.append("")
+    if best is None:
+        lines.append(
+            "The test could not measure this program, so there is "
+            "nothing more to report yet."
+        )
+        return "\n".join(lines) + "\n"
+    plain_overall = overall.get("plain")
+    lines.append("How it likes to be talked to")
+    lines.append("------------------------------")
+    if best == "plain":
+        lines.append(
+            "It likes plain typing best. Just write your request "
+            "the normal way, with no special layout. No other way "
+            f"of writing scored higher. Typing normally scored "
+            f"{plain_overall:.0f} out of 100."
+        )
+    else:
+        lines.append(
+            f"It likes being talked to "
+            f"{DIALECT_SHAPE_PHRASES[best]}. That way of writing "
+            f"scored {overall[best]:.0f} out of 100 across the "
+            "whole test."
+        )
+    lines.append("")
+    lines.append("What it does not like")
+    lines.append("---------------------")
+    if worst is None or worst == best:
+        lines.append(
+            "Every other way of writing scored about the same, so "
+            "there is no way it clearly dislikes."
+        )
+    else:
+        lines.append(
+            f"It does worst when you talk to it "
+            f"{DIALECT_SHAPE_PHRASES[worst]}. That way of writing "
+            f"scored {overall[worst]:.0f} out of 100 across the "
+            "whole test."
+        )
+    lines.append("")
+    lines.append("How much better the best way is")
+    lines.append("-------------------------------")
+    if best == "plain":
+        lines.append(
+            "Typing normally is already the best way, so there is "
+            "nothing to gain by writing in a special way."
+        )
+    elif plain_overall is not None:
+        gap = overall[best] - plain_overall
+        lines.append(
+            f"The best way scored {overall[best]:.0f} out of 100. "
+            f"Typing normally scored {plain_overall:.0f} out of "
+            f"100. So the best way is {gap:.0f} points better. "
+            "Points are just the marks from the test - more "
+            "points means more answers marked right."
+        )
+    lines.append("")
+    lines.append("Tips for each kind of job")
+    lines.append("-------------------------")
+    for category in DIALECT_CATEGORIES:
+        if category not in scores:
+            continue
+        job = DIALECT_CATEGORY_JOBS[category]
+        cat_best = ((profile.get("best_shape_per_category") or {})
+                    .get(category))
+        if cat_best is None:
+            lines.append(
+                f"For {job}, this test could not measure the "
+                "program, so there is no tip.")
+            continue
+        cat_score = scores[category][cat_best]
+        cat_plain = scores[category].get("plain")
+        if cat_best == "plain":
+            lines.append(
+                f"For {job}, just type normally. That scored "
+                f"{cat_plain:.0f} out of 100, and no other way "
+                "scored better.")
+        else:
+            lines.append(
+                f"For {job}, talk to it "
+                f"{DIALECT_SHAPE_PHRASES[cat_best]}. That scored "
+                f"{cat_score:.0f} out of 100. Typing normally "
+                f"scored {cat_plain:.0f}.")
+    lines.append("")
+    category = profile.get("wrapper_category") or "instruction"
+    lines.append("Say it like this:")
+    lines.append("-----------------")
+    lines.append(
+        "Here is the best way, filled in with a real request, so "
+        "you can copy the shape of it:")
+    lines.append("")
+    lines.append(dialect_wrap(best, DIALECT_SAMPLE_REQUEST, category))
+    lines.append("")
+    lines.append("Don't say it like this:")
+    lines.append("-----------------------")
+    if worst is None or worst == best:
+        lines.append(
+            "There is no clear worst way for this program, so "
+            "there is nothing to warn against here."
+        )
+    else:
+        lines.append(
+            "Here is the same request in the way this program "
+            "likes least:")
+        lines.append("")
+        lines.append(
+            dialect_wrap(worst, DIALECT_SAMPLE_REQUEST, category))
+    lines.append("")
+    lines.append("Rules")
+    lines.append("-----")
+    rules = profile.get("rules") or []
+    if not rules:
+        lines.append(
+            "This test found no strong rules for this program. "
+            "Every way of writing scored about the same, so there "
+            "is nothing special to remember."
+        )
+    else:
+        lines.append(
+            "These are the rules this test earned. Each one is "
+            "here because the marks say so, and each one tells "
+            "you its marks. The strongest rules come first."
+        )
+        lines.append("")
+        for index, rule in enumerate(rules, 1):
+            lines.append(f"{index}. {rule['text']}")
+    return "\n".join(lines) + "\n"
+
+
+def dialect_folder_path(results_dir, model, sys_id, stamp):
+    """The folder one dialect run writes into:
+    results/<model>/<system>/dialect-<timestamp>. Never an
+    existing folder: -2, -3 is appended, the rule the run files
+    use, so an earlier run is never overwritten."""
+    folder = os.path.join(
+        results_dir, slugify_model(model), sys_id,
+        f"dialect-{stamp.strftime('%Y-%m-%d-%H%M%S')}")
+    base = folder
+    suffix = 2
+    while os.path.exists(folder):
+        folder = f"{base}-{suffix}"
+        suffix += 1
+    return folder
+
+
+def save_dialect_run(results_dir, model, sys_id, profile,
+                     report_text, detail):
+    """Write one dialect run's files into their own folder under
+    results/<model>/<system>, beside the normal run files:
+    prompt_profile.json (the machine-readable profile),
+    prompt_report.txt (the plain-words copy), and
+    dialect_run.json (every task record, so any score in the
+    other two can be checked against what the model actually
+    answered). Returns the folder written."""
+    stamp = datetime.now()
+    folder = dialect_folder_path(results_dir, model, sys_id, stamp)
+    os.makedirs(folder, exist_ok=True)
+    saved = dict(profile)
+    saved["timestamp"] = stamp.isoformat(timespec="seconds")
+    with open(os.path.join(folder, "prompt_profile.json"), "w",
+              encoding="utf-8") as handle:
+        json.dump(saved, handle, indent=2)
+    with open(os.path.join(folder, "prompt_report.txt"), "w",
+              encoding="utf-8") as handle:
+        handle.write(report_text)
+    with open(os.path.join(folder, "dialect_run.json"), "w",
+              encoding="utf-8") as handle:
+        json.dump(detail, handle, indent=2)
+    return folder
+
+
+def latest_dialect_profile(results_dir, model, sys_id):
+    """The newest saved dialect profile for one model on this
+    system, or None. The report card reads it, so a model's card
+    gains its Communication Profile once a dialect run exists."""
+    folder = os.path.join(results_dir, slugify_model(model), sys_id)
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    for name in reversed(names):
+        if not name.startswith("dialect-"):
+            continue
+        path = os.path.join(folder, name, "prompt_profile.json")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, ValueError):
+            continue
     return None
 
 
@@ -7735,6 +8417,196 @@ class BenchWorker(QThread):
 # ---------------------------------------------------------------------------
 # Ollama starter (runs `ollama serve` detached, then waits for it)
 # ---------------------------------------------------------------------------
+
+class DialectWorker(BenchWorker):
+    """(v25) The Prompt Dialect Test as a worker. For each model,
+    the chosen categories' tasks run under all six prompt shapes,
+    graded by the same machinery a normal run uses: same warmup,
+    same RAM check before a model loads, same temperature, no
+    answer cap, thinking on for Reasoning exactly as a normal run
+    decides it, and the same restart-and-retry honesty when
+    Ollama dies (restart once, retry the whole shape once, then
+    the rest of the model is not measured - never a fake score).
+    Single pass per shape: the comparison is shape against shape,
+    so the v24 repeats do not apply. Ollama targets only - the
+    dialect question is about the local model's own chat
+    template, so a provider target is refused up front."""
+
+    dialect_done = Signal(str, dict, str)  # model, profile, folder
+
+    def __init__(self, targets, templates, sys_id, machine,
+                 results_dir, quick=True):
+        for target in targets:
+            if target.get("kind") != "ollama":
+                raise ValueError(
+                    "the dialect test runs Ollama models only")
+        super().__init__(targets, templates, sys_id, machine,
+                         results_dir)
+        self.quick = quick
+        self.dialect_profiles = {}
+
+    def _dialect_tasks(self, template):
+        """The tasks this run uses from one category: the first
+        DIALECT_QUICK_TASKS in Quick mode, all of them in Full."""
+        tasks = template["tasks"]
+        if self.quick:
+            return tasks[:DIALECT_QUICK_TASKS]
+        return list(tasks)
+
+    def _steps_for(self, target):
+        """Progress steps for one model: its warmup plus one step
+        per task call it will actually make."""
+        steps = 1
+        for template in self.templates:
+            if template_eligible(template, target):
+                steps += (len(DIALECT_SHAPES)
+                          * len(self._dialect_tasks(template)))
+        return steps
+
+    def _run_shape(self, target, template, shape_id, tasks):
+        """One category in one shape: every task with its prompt
+        wrapped in the shape, run and graded by _run_scored_task
+        exactly as a normal run runs it. Returns the records."""
+        records = []
+        think = (
+            template["id"] in ("reasoning", "math")
+            and "thinking" in (target.get("capabilities") or [])
+        )
+        for task in tasks:
+            if self._stop:
+                raise Cancelled()
+            wrapped = dict(task)
+            wrapped["prompt"] = dialect_wrap(
+                shape_id, task.get("prompt", ""), template["id"])
+            record, _media = self._run_scored_task(
+                target, template, wrapped, think)
+            record["shape"] = shape_id
+            records.append(record)
+        return records
+
+    def run(self):
+        self._model_sizes = list_model_sizes()
+        self._total_steps = sum(
+            self._steps_for(target) for target in self.targets)
+        self._done_steps = 0
+        self.run_started.emit(self._total_steps)
+        for target in self.targets:
+            label = target["label"]
+            if self._stop:
+                self._end_run("cancelled")
+                return
+            self.model_started.emit(label)
+            skip_reason = self._ram_skip_reason(target)
+            if skip_reason is not None:
+                log_event(f"{label}: {skip_reason}")
+                self._done_steps += self._steps_for(target)
+                self.step_progress.emit(
+                    self._done_steps, self._total_steps)
+                profile = {
+                    "model": label,
+                    "mode": "quick" if self.quick else "full",
+                    "status": skip_reason,
+                    "shape_scores": {},
+                }
+                self.dialect_profiles[label] = profile
+                self.dialect_done.emit(label, profile, "")
+                continue
+            try:
+                percent = (int(100 * self._done_steps
+                               / self._total_steps)
+                           if self._total_steps else 0)
+                self.progress.emit(f"{label}: warming up", percent)
+                self._generate(target, WARMUP_PROMPT, WARMUP_PREDICT)
+                self._done_steps += 1
+                self.step_progress.emit(
+                    self._done_steps, self._total_steps)
+            except Cancelled:
+                self._end_run("cancelled")
+                return
+            except OllamaError as exc:
+                if is_unreachable(exc):
+                    # The warmup's own retry and restart already
+                    # failed: Ollama is gone, the run ends.
+                    self._end_run("ollama_down")
+                    return
+                profile = {
+                    "model": label,
+                    "mode": "quick" if self.quick else "full",
+                    "status": f"failed: {describe_error(exc)}",
+                    "shape_scores": {},
+                }
+                self.dialect_profiles[label] = profile
+                self.dialect_done.emit(label, profile, "")
+                continue
+            model_info = self._model_info(target)
+            shape_scores = {}
+            detail = {
+                "model": label,
+                "mode": "quick" if self.quick else "full",
+                "categories": {},
+            }
+            died = False
+            for template in self.templates:
+                category = template["id"]
+                if not template_eligible(template, target):
+                    shape_scores[category] = {
+                        shape: None for shape in DIALECT_SHAPES}
+                    detail["categories"][category] = {
+                        "not_eligible": True, "shapes": {}}
+                    continue
+                tasks = self._dialect_tasks(template)
+                shape_scores[category] = {}
+                detail["categories"][category] = {"shapes": {}}
+                for shape_id in DIALECT_SHAPES:
+                    if self._stop:
+                        self._end_run("cancelled")
+                        return
+                    try:
+                        records = self._run_shape(
+                            target, template, shape_id, tasks)
+                    except Cancelled:
+                        self._end_run("cancelled")
+                        return
+                    except OllamaUnreachable:
+                        # Ollama died mid-shape: restart it and
+                        # retry the whole shape once, as a normal
+                        # run retries a template. If it stays down,
+                        # the rest of this model is not measured
+                        # and the run ends - stated, never scored.
+                        if not self._try_restart_ollama(target):
+                            died = True
+                            break
+                        try:
+                            records = self._run_shape(
+                                target, template, shape_id, tasks)
+                        except Cancelled:
+                            self._end_run("cancelled")
+                            return
+                        except OllamaUnreachable:
+                            died = True
+                            break
+                    score, _passed, _total = _score_records(records)
+                    shape_scores[category][shape_id] = score
+                    detail["categories"][category]["shapes"][
+                        shape_id] = records
+                if died:
+                    break
+            profile = compute_dialect_profile(
+                label, shape_scores,
+                "quick" if self.quick else "full", model_info)
+            if died:
+                profile["incomplete"] = True
+            report_text = render_prompt_report(profile)
+            folder = save_dialect_run(
+                self.results_dir, target["model"], self.sys_id,
+                profile, report_text, detail)
+            self.dialect_profiles[label] = profile
+            self.dialect_done.emit(label, profile, folder)
+            if died:
+                self._end_run("ollama_down")
+                return
+        self._end_run("done")
+
 
 def start_ollama_process(models_folder=None):
     """Start `ollama serve` detached and wait for it to answer.
@@ -9274,6 +10146,7 @@ class MainWindow(QMainWindow):
     TAB_PROFILES = 4
     TAB_COMPARE = 5
     TAB_PROVIDERS = 6
+    TAB_DIALECT = 7
 
     def __init__(self, instance_server=None):
         super().__init__()
@@ -9807,6 +10680,7 @@ class MainWindow(QMainWindow):
         self.provider_stack.addWidget(detail_page)
         provider_columns.addWidget(self.provider_stack, 1)
         providers_layout.addLayout(provider_columns)
+        self._build_dialect_tab(tabs)
         tabs.currentChanged.connect(self.on_tab_changed)
 
         # R22: Tab in visual order on every tab, and focus that comes
@@ -10785,6 +11659,7 @@ class MainWindow(QMainWindow):
             if (ollama_error is not None and self.starter is None
                     and ollama_address_is_local()):
                 self.start_ollama()
+            self.refresh_dialect_models()
             return
         for target in targets:
             item = QListWidgetItem(
@@ -10806,6 +11681,7 @@ class MainWindow(QMainWindow):
             self.update_template_availability()
             self.refresh_checklist()
             self.refresh_resume_button()
+            self.refresh_dialect_models()
             return
         self.run_button.setEnabled(True)
         if ollama_error is not None:
@@ -10836,6 +11712,7 @@ class MainWindow(QMainWindow):
         self.update_template_availability()
         self.refresh_checklist()
         self.refresh_resume_button()
+        self.refresh_dialect_models()
 
     def screen_models(self):
         """Re-screen every Ollama model from scratch: drop the cached
@@ -12044,6 +12921,8 @@ class MainWindow(QMainWindow):
             # changed — otherwise an edit in progress would be wiped.
             if self._providers_file_bytes() != self._providers_snapshot:
                 self.refresh_providers()
+        elif self.tabs.tabText(index) == "Dialect":
+            self.refresh_dialect_models()
         # R22: focus comes back where it was on this tab — after the
         # refreshes above, which rebuild lists and could move it.
         self._restore_tab_focus(index)
@@ -12088,6 +12967,13 @@ class MainWindow(QMainWindow):
              self.advanced_price_out_input]
             + [self.advanced_cap_boxes[c] for c in CAPABILITIES]
             + [self.provider_save_button],
+            [self.dialect_model_list]
+            + [self.dialect_category_boxes[c]
+               for c in DIALECT_CATEGORIES]
+            + [self.dialect_quick_radio, self.dialect_full_radio,
+               self.dialect_run_button, self.dialect_cancel_button,
+               self.dialect_summary, self.dialect_report_combo,
+               self.dialect_report_button, self.dialect_folder_button],
         ]
         for chain in chains:
             for first, second in zip(chain, chain[1:]):
@@ -12139,6 +13025,8 @@ class MainWindow(QMainWindow):
             return self.compare_model_a
         if index == self.TAB_PROVIDERS:
             return self.provider_list
+        if index == self.TAB_DIALECT:
+            return self.dialect_model_list
         return None
 
     def refresh_history(self):
@@ -12894,6 +13782,286 @@ class MainWindow(QMainWindow):
                 f"Removed {removed['id']}. Press Save to keep it."
             )
 
+    # -- dialect test (v25) ----------------------------------------------
+
+    def _build_dialect_tab(self, tabs):
+        """The Dialect tab: the Prompt Dialect Test in its own
+        workspace - pick models and kinds of job, run, read the
+        Communication Profile, open the plain-words Prompt
+        Report. Nothing is ticked or picked by default."""
+        dialect_tab = QWidget()
+        tabs.addTab(dialect_tab, "Dialect")
+        layout = QVBoxLayout(dialect_tab)
+        intro = QLabel(
+            "The Prompt Dialect Test asks a model the same test "
+            "questions six different ways - plain, with headings, "
+            "cut short, with an example first, step by step, and "
+            "with labels - and marks every answer with the normal "
+            "graders. The result is a Communication Profile: the "
+            "way of writing this model answers best, per kind of "
+            "job and overall, plus a plain-words Prompt Report "
+            "you can read and copy from."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        scope = QLabel(
+            "Local Ollama models only - provider models are not "
+            "part of this test. The test watches how a model "
+            "answers through Ollama; it does not look inside the "
+            "model's weights."
+        )
+        scope.setWordWrap(True)
+        layout.addWidget(scope)
+        layout.addWidget(QLabel("Models to test:"))
+        self.dialect_model_list = QListWidget()
+        layout.addWidget(self.dialect_model_list)
+        layout.addWidget(QLabel("Kinds of job to test:"))
+        cats_row = QHBoxLayout()
+        self.dialect_category_boxes = {}
+        for category in DIALECT_CATEGORIES:
+            box = QCheckBox(DIALECT_CATEGORY_NAMES[category])
+            self.dialect_category_boxes[category] = box
+            cats_row.addWidget(box)
+        cats_row.addStretch()
+        layout.addLayout(cats_row)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("How much to run:"))
+        self.dialect_quick_radio = QRadioButton(
+            "Quick (first 3 questions of each kind)")
+        self.dialect_full_radio = QRadioButton(
+            "Full (every question)")
+        mode_row.addWidget(self.dialect_quick_radio)
+        mode_row.addWidget(self.dialect_full_radio)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+        run_row = QHBoxLayout()
+        self.dialect_run_button = QPushButton("Run dialect test")
+        self.dialect_run_button.clicked.connect(self.start_dialect_run)
+        self.dialect_cancel_button = QPushButton("Cancel")
+        self.dialect_cancel_button.clicked.connect(
+            self.cancel_dialect_run)
+        self.dialect_cancel_button.setEnabled(False)
+        run_row.addWidget(self.dialect_run_button)
+        run_row.addWidget(self.dialect_cancel_button)
+        run_row.addStretch()
+        layout.addLayout(run_row)
+        self.dialect_progress_label = QLabel("")
+        self.dialect_progress_label.setWordWrap(True)
+        layout.addWidget(self.dialect_progress_label)
+        self.dialect_bar = QProgressBar()
+        self.dialect_bar.setRange(0, 100)
+        self.dialect_bar.setValue(0)
+        # No % text while idle, the same rule as the pull bar.
+        self.dialect_bar.setFormat("")
+        layout.addWidget(self.dialect_bar)
+        layout.addWidget(QLabel("Communication Profile:"))
+        self.dialect_summary = QTextEdit()
+        self.dialect_summary.setReadOnly(True)
+        self.dialect_summary.setPlainText(
+            "No dialect run yet. Tick a model and the kinds of "
+            "job, pick Quick or Full, then run the test."
+        )
+        layout.addWidget(self.dialect_summary)
+        report_row = QHBoxLayout()
+        report_row.addWidget(QLabel("Finished models:"))
+        self.dialect_report_combo = QComboBox()
+        self.dialect_report_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToContents)
+        report_row.addWidget(self.dialect_report_combo)
+        self.dialect_report_button = QPushButton(
+            "Read the Prompt Report")
+        self.dialect_report_button.clicked.connect(
+            self.show_dialect_report)
+        self.dialect_report_button.setEnabled(False)
+        self.dialect_folder_button = QPushButton("Open run folder")
+        self.dialect_folder_button.clicked.connect(
+            self.open_dialect_folder)
+        self.dialect_folder_button.setEnabled(False)
+        report_row.addWidget(self.dialect_report_button)
+        report_row.addWidget(self.dialect_folder_button)
+        report_row.addStretch()
+        layout.addLayout(report_row)
+        self.dialect_worker = None
+        self._dialect_folders = {}
+
+    def refresh_dialect_models(self):
+        """The Dialect tab's picker mirrors the Run setup list's
+        Ollama targets (provider models are not part of this
+        test). Ticks are kept by label across a refresh; a model
+        nobody ticked stays unticked."""
+        if not hasattr(self, "dialect_model_list"):
+            return
+        checked = set()
+        for row in range(self.dialect_model_list.count()):
+            item = self.dialect_model_list.item(row)
+            target = item.data(Qt.UserRole)
+            if item.checkState() == Qt.Checked and target is not None:
+                checked.add(target["label"])
+        self.dialect_model_list.clear()
+        for row in range(self.model_list.count()):
+            item = self.model_list.item(row)
+            target = item.data(Qt.UserRole)
+            if (not isinstance(target, dict)
+                    or target.get("kind") != "ollama"):
+                continue
+            entry = QListWidgetItem(
+                target["label"]
+                + format_capabilities(target["capabilities"]))
+            entry.setFlags(entry.flags() | Qt.ItemIsUserCheckable)
+            entry.setCheckState(
+                Qt.Checked if target["label"] in checked
+                else Qt.Unchecked)
+            entry.setData(Qt.UserRole, target)
+            self.dialect_model_list.addItem(entry)
+
+    def start_dialect_run(self):
+        if self.dialect_worker is not None:
+            return
+        if self.worker is not None:
+            self.status_label.setText(
+                "A benchmark run is going. The dialect test waits "
+                "until it finishes.")
+            return
+        targets = []
+        for row in range(self.dialect_model_list.count()):
+            item = self.dialect_model_list.item(row)
+            if item.checkState() == Qt.Checked:
+                target = item.data(Qt.UserRole)
+                if target is not None:
+                    targets.append(target)
+        if not targets:
+            self.status_label.setText(
+                "Tick at least one model for the dialect test first.")
+            return
+        by_id = {t["id"]: t for t in self.templates}
+        templates = [
+            by_id[category] for category in DIALECT_CATEGORIES
+            if self.dialect_category_boxes[category].isChecked()
+            and category in by_id
+        ]
+        if not templates:
+            self.status_label.setText(
+                "Tick at least one kind of job for the dialect "
+                "test first.")
+            return
+        if not (self.dialect_quick_radio.isChecked()
+                or self.dialect_full_radio.isChecked()):
+            self.status_label.setText(
+                "Pick Quick or Full for the dialect test first.")
+            return
+        quick = self.dialect_quick_radio.isChecked()
+        self._dialect_folders = {}
+        self.dialect_report_combo.clear()
+        self.dialect_report_button.setEnabled(False)
+        self.dialect_folder_button.setEnabled(False)
+        self.dialect_summary.setPlainText("Running...")
+        worker = DialectWorker(
+            targets, templates, self.sys_id, self.machine,
+            get_results_dir(), quick)
+        self.dialect_worker = worker
+        worker.progress.connect(self.on_dialect_progress)
+        worker.step_progress.connect(self.on_dialect_steps)
+        worker.dialect_done.connect(self.on_dialect_model_done)
+        worker.run_finished.connect(self.on_dialect_finished)
+        self.dialect_run_button.setEnabled(False)
+        self.dialect_cancel_button.setEnabled(True)
+        self.dialect_bar.setFormat("%p%")
+        worker.start()
+
+    def cancel_dialect_run(self):
+        if self.dialect_worker is not None:
+            self.dialect_worker.request_cancel()
+            self.dialect_progress_label.setText("Cancelling...")
+
+    def on_dialect_progress(self, text, percent):
+        self.dialect_progress_label.setText(text)
+        self.dialect_bar.setValue(percent)
+
+    def on_dialect_steps(self, done, total):
+        if total:
+            self.dialect_bar.setValue(int(100 * done / total))
+
+    def on_dialect_model_done(self, label, profile, folder):
+        if folder:
+            self._dialect_folders[label] = folder
+            self.dialect_report_combo.addItem(label)
+            self.dialect_report_button.setEnabled(True)
+            self.dialect_folder_button.setEnabled(True)
+        block = "\n".join(render_communication_profile(profile))
+        current = self.dialect_summary.toPlainText()
+        if current == "Running...":
+            current = ""
+        self.dialect_summary.setPlainText(
+            (current + "\n\n" + block).strip() if current else block)
+        self.status_label.setText(
+            f"Dialect test: {label} done. Its Prompt Report is "
+            "saved with the run.")
+
+    def on_dialect_finished(self, reason):
+        self.dialect_worker = None
+        self.dialect_run_button.setEnabled(True)
+        self.dialect_cancel_button.setEnabled(False)
+        self.dialect_bar.setFormat("")
+        if reason == "done":
+            self.dialect_progress_label.setText("Dialect test done.")
+        elif reason == "cancelled":
+            self.dialect_progress_label.setText(
+                "Dialect test cancelled.")
+        elif reason == "ollama_down":
+            self.dialect_progress_label.setText(
+                "Ollama stopped and could not be restarted. The "
+                "models that finished keep their profiles; the "
+                "rest was not measured.")
+        self.refresh_resume_button()
+
+    def _dialect_folder_for_combo(self):
+        label = self.dialect_report_combo.currentText()
+        return self._dialect_folders.get(label)
+
+    def show_dialect_report(self):
+        folder = self._dialect_folder_for_combo()
+        if not folder:
+            return
+        path = os.path.join(folder, "prompt_report.txt")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError:
+            self.status_label.setText(
+                f"Could not read the Prompt Report at {path}.")
+            return
+        label = self.dialect_report_combo.currentText()
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Prompt Report - {label}")
+        dialog.resize(640, 560)
+        layout = QVBoxLayout(dialog)
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(text)
+        layout.addWidget(view)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+        dialog.exec()
+
+    def open_dialect_folder(self):
+        folder = self._dialect_folder_for_combo()
+        if folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _with_dialect_profile(self, result):
+        """A copy of one benchmark result with its newest saved
+        dialect profile attached, when one exists - the saved
+        report card gains the Communication Profile section
+        without the live result changing."""
+        profile = latest_dialect_profile(
+            get_results_dir(), result.get("name", ""), self.sys_id)
+        if profile is None:
+            return result
+        merged = dict(result)
+        merged["dialect_profile"] = profile
+        return merged
+
     # -- report ----------------------------------------------------------
 
     def save_report(self):
@@ -12914,7 +14082,9 @@ class MainWindow(QMainWindow):
             suffix += 1
         results = [self.results[name] for name in self.result_order]
         with open(txt_path, "w", encoding="utf-8") as handle:
-            handle.write(render_text_report(results))
+            handle.write(render_text_report(
+                [self._with_dialect_profile(result)
+                 for result in results]))
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(build_report_data(results), handle, indent=2)
         self.status_label.setText(f"Report saved: {txt_path}")

@@ -1,5 +1,55 @@
 # Changelog
 
+## v25 (2026-11-20)
+
+The Prompt Dialect Test: the same tasks, asked six different
+ways, graded by the same marking as the normal tests - so the
+app can say how a model likes to be talked to.
+
+- A new Dialect tab: pick local Ollama models (provider
+  models are not part of this test), pick the kinds of job
+  (following instructions, thinking problems, writing code,
+  exact-format answers, and using tools when the model can),
+  pick Quick (the first 3 tasks of each kind) or Full, and
+  run. Nothing is picked by default. Progress and Cancel work
+  like the normal run.
+- Six ways of asking: Plain (the task as written),
+  Structured (clear headings), Terse (as short as it can
+  be), With examples (one or two short examples that have
+  nothing to do with the task), Step by step, and Tagged
+  (the parts wrapped in labels). The task itself never
+  changes - only the shape around it. One pass per shape,
+  same settings as the normal tests (temperature 0, no
+  answer-length cap, the RAM check before a model loads, and
+  the same restart-and-retry honesty if Ollama dies).
+- Every dialect run saves a folder next to the normal run
+  files holding prompt_profile.json (the scores, the best
+  shape overall and per kind of job, how much each shape
+  beats or trails Plain, a ready-to-use wrapper in the
+  winning shape, and the rules), prompt_report.txt (the
+  plain-words Prompt Report: what the model is, how it likes
+  to be talked to, what it does not like, tips per kind of
+  job, a "Say it like this" and a "Don't say it like this"
+  example, and the rules last), and dialect_run.json (every
+  task record).
+- The rules are dynamic: there is no set number of them. A
+  rule is only written when the scores show a clear effect -
+  a shape winning or losing a kind of job by 10 points or
+  more, or helping one kind of job while hurting another.
+  Each rule carries its evidence with the actual scores, and
+  the strongest evidence comes first. A model whose shapes
+  all score the same earns no rules, and the report says so
+  plainly.
+- The normal report card gains a Communication Profile
+  section when a dialect profile exists for a model: the
+  best shape overall, the best per kind of job, the worst
+  shape, and how far each shape sits from Plain.
+- Honest scope, stated in the tab: the test watches how a
+  model answers through Ollama. It does not look inside the
+  model's weights and it does not change the model.
+- The normal benchmark is untouched: same templates, same
+  graders, same no-cap settings.
+
 ## v24 (2026-11-19)
 
 The accuracy release: the merged 12-item accuracy list from
