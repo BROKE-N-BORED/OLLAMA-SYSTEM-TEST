@@ -75,21 +75,40 @@ FIRST_CHUNK_DELAY = 0.5
 # context length in model_info. Pulled models (not listed here) report
 # completion-only with a 4096 context, i.e. text-only.
 MODEL_CAPS = {
+    # (v24): fake-smart reports thinking support, like a real
+    # thinking model does in /api/show — the app must run
+    # Reasoning and Math with think on for it, and only for it.
     "fake-smart:2b": {
-        "capabilities": ["completion", "vision", "tools"],
+        "capabilities": ["completion", "vision", "tools", "thinking"],
         "context_length": 131072,
+        "details": {"parameter_size": "2.0B",
+                    "quantization_level": "Q4_K_M"},
+        "digest": "sha256:abcdef0123456789abcdef0123456789"
+                  "abcdef0123456789abcdef0123456789",
     },
     "fake-partial:3b": {
         "capabilities": ["completion", "vision"],
         "context_length": 32768,
+        "details": {"parameter_size": "3.0B",
+                    "quantization_level": "Q4_K_M"},
+        "digest": "sha256:1234567890abcdef1234567890abcdef"
+                  "1234567890abcdef1234567890abcdef",
     },
     "fake-dumb:1b": {
         "capabilities": ["completion"],
         "context_length": 4096,
+        "details": {"parameter_size": "1.0B",
+                    "quantization_level": "Q8_0"},
+        "digest": "sha256:fedcba9876543210fedcba9876543210"
+                  "fedcba9876543210fedcba9876543210",
     },
     "fake-broken:1b": {
         "capabilities": ["completion"],
         "context_length": 8192,
+        "details": {"parameter_size": "1.0B",
+                    "quantization_level": "Q4_K_M"},
+        "digest": "sha256:00000000000000000000000000000000"
+                  "00000000000000000000000000deadbeef",
     },
 }
 
@@ -97,7 +116,11 @@ DUMB_SHORT = "Purple monkey dishwasher."
 # 12 words: fails max_words tasks (10 and 1) while failing everything else too.
 DUMB_LONG = "Purple monkey dishwasher eats many bananas every single day without stopping ever."
 # Tasks where the dumb answer must be the long one (word-count rules).
-LONG_TASKS = ("moon", "sky on a clear day", "garden passage", "river passage")
+# v24: the two new summarization passages join the list — their
+# prompts carry these markers, so the dumb brain's 12-word answer
+# breaks their ten-word limit like the older ones.
+LONG_TASKS = ("moon", "sky on a clear day", "garden passage", "river passage",
+              "forest passage", "harbour passage")
 # Prompts where the dumb answer is a refusal: the refusal template's
 # five BENIGN prompts. The dumb model refuses them all, so it scores
 # 0% there like everywhere else; the partial model refuses tasks 2
@@ -176,8 +199,97 @@ def sort_numbers(nums):
     return sorted(nums)
 ```'''
 
+# v24: code for the grown coding / code-repair tasks.
+COUNT_VOWELS_CODE = '''```python
+def count_vowels(s):
+    return sum(1 for c in s.lower() if c in "aeiou")
+```'''
+
+MAX_NUMBER_CODE = '''```python
+def max_number(nums):
+    best = nums[0]
+    for n in nums:
+        if n > best:
+            best = n
+    return best
+```'''
+
+PRIME_COUNTER_CODE = '''```python
+def is_prime(n):
+    if n < 2:
+        return False
+    for i in range(2, int(n ** 0.5) + 1):
+        if n % i == 0:
+            return False
+    return True
+
+
+def count_primes(n):
+    return sum(1 for i in range(1, n + 1) if is_prime(i))
+```'''
+
+WORD_COUNT_CODE = '''```python
+def word_count(s):
+    return len(s.split())
+```'''
+
+CELSIUS_CODE = '''```python
+def celsius_to_fahrenheit(c):
+    return c * 9 / 5 + 32
+```'''
+
+COUNT_WORDS_CODE = '''```python
+def count_words(s):
+    return len(s.split())
+```'''
+
+IS_EVEN_CODE = '''```python
+def is_even(n):
+    return n % 2 == 0
+```'''
+
+FACTORIAL_CODE = '''```python
+def factorial(n):
+    result = 1
+    for i in range(1, n + 1):
+        result *= i
+    return result
+```'''
+
+LAST_ITEM_CODE = '''```python
+def last_item(items):
+    return items[-1]
+```'''
+
+DOUBLE_CODE = '''```python
+def double(x):
+    return 2 * x
+```'''
+
+QUADRUPLE_CODE = '''```python
+def double(x):
+    return 2 * x
+
+
+def quadruple(x):
+    return double(double(x))
+```'''
+
 # (prompt substring, correct answer) — checked in order, lowercase match.
 SMART_ANSWERS = [
+    # v24: math variant keys come FIRST — a variant prompt also
+    # contains its base task's key ("apples", "percent"...), and
+    # the first match wins, so the more specific key must lead.
+    ("23 apples", "He has 20 apples."),
+    ("45 miles per hour", "The train travels 135 miles."),
+    ("20 percent of 150", "20 percent of 150 is 30."),
+    ("96 stickers", "Each friend gets 12 stickers."),
+    ("14 muffins on each tray",
+     "She makes 42 muffins and sells 20, so 22 are left."),
+    ("5x + 3", "5x is 25, so x is 5."),
+    # v24: the prime-counter prompt names is_prime too — its own
+    # key must win, or the answer defines only half the task.
+    ("count_primes", PRIME_COUNTER_CODE),
     ("fibonacci", FIB_CODE),
     ("fizzbuzz", FIZZBUZZ_CODE),
     ("reverse_string", REVERSE_CODE),
@@ -196,6 +308,9 @@ SMART_ANSWERS = [
     ("milliliter", "2.5 liters is 2500 milliliters."),
     ("solve for x", "3x is 15, so x is 5."),
     ("roses", "No."),
+    # v24: this vision key must precede "wednesday" — the chart
+    # prompt names the day, and the first match wins.
+    ("visitors were there on wednesday", "5."),
     ("wednesday", "Saturday."),
     ("tom is taller", "Harry is the shortest."),
     ("bat and a ball", "The ball costs 5 cents."),
@@ -262,6 +377,108 @@ SMART_ANSWERS = [
     ("array of three numbers", "[4, 8, 15]"),
     ("jupiter", '{"planet": "Jupiter", "satellites": 95}'),
     ("mango", '{"fruit": "Mango", "colour": "orange"}'),
+    # v24: the grown templates. None of these keys appears in an
+    # earlier prompt, and no earlier key appears in these prompts
+    # (the brain-consistency check in the suite proves both).
+    ("largest ocean", "The Pacific Ocean."),
+    ("symbol o short", "O is short for oxygen."),
+    ("capital of japan", "Tokyo."),
+    ("lunar landing", "1969."),
+    ("longest river", "The Nile."),
+    ("all dogs are mammals", "Yes."),
+    ("next number in the sequence", "17."),
+    ("anna is taller", "Cara is the shortest."),
+    ("whiskers is a cat", "Yes."),
+    ("maria has 5 coins", "3."),
+    ("grace", '{"name": "Grace", "age": 85}'),
+    ("fruits, one per line", "- apple\n- pear"),
+    ("describe the ocean", "Endlessly blue."),
+    ("single word: the capital", "Tokyo"),
+    ("country is france", '{"country": "France", "capital": "Paris"}'),
+    ("cheese sandwich",
+     "Butter the bread, add the cheese, add the lettuce, then close "
+     "the sandwich with the second slice on top."),
+    ("wash a car",
+     "Fill a bucket with soapy water. Rinse the car, wash with a "
+     "sponge, then dry the car with a towel."),
+    ("pack a suitcase",
+     "Choose your clothes, fold the clothes neatly, pack the "
+     "toiletries, and zip the suitcase."),
+    ("cup of coffee",
+     "Boil the water, add the coffee grounds, let it brew for four "
+     "minutes, then pour the coffee into a cup."),
+    ("bicycle ride",
+     "Check the tyres, put on a helmet, plan the route, and lock "
+     "the bike when you arrive."),
+    ("summarize the harbour passage in ten words",
+     "Harbour lights guided the fishing fleet home."),
+    ("summarize the harbour passage", "The harbour sheltered fishing boats."),
+    ("summarize the forest passage", "A path wound between pines and stones."),
+    ("summarize the farmer passage", "The farmer took his wheat to the mill."),
+    ("summarize the teacher passage",
+     "The teacher explained algebra to her students."),
+    ("where does priya grow", "Priya grows tomatoes in Porto."),
+    ("how old is priya", "Not stated in the passage."),
+    ("how many passengers does the ferry", "The ferry carries forty passengers."),
+    ("ferry ticket cost", "Not stated in the passage."),
+    ("how often does the ferry", "The ferry crosses twice a day."),
+    ("emma", '{"name": "Emma", "age": 29}'),
+    ("array of three colour", '["red", "green", "blue"]'),
+    ("everest", '{"mountain": "Everest", "height": 8848}'),
+    ("tomato soup", '{"dish": "tomato soup", "servings": 4, "vegetarian": true}'),
+    ("rovers", '{"team": "Rovers", "players": ["Ana", "Ben"]}'),
+    ("count_vowels", COUNT_VOWELS_CODE),
+    ("max_number", MAX_NUMBER_CODE),
+    ("word_count", WORD_COUNT_CODE),
+    ("celsius", CELSIUS_CODE),
+    ("count_words", COUNT_WORDS_CODE),
+    ("is_even", IS_EVEN_CODE),
+    ("factorial", FACTORIAL_CODE),
+    ("last_item", LAST_ITEM_CODE),
+    # The two-step coding task: turn 2's prompt mentions double
+    # too, so quadruple is checked first.
+    ("quadruple", QUADRUPLE_CODE),
+    ("double", DOUBLE_CODE),
+    ("what is my name", "Your name is Elena."),
+    ("add 5 to that number", "The result is 15."),
+    ("where do i live", "You live in Madrid."),
+    ("names of my brother and sister",
+     "Your brother is Tom and your sister is Ana."),
+    ("days are in a week", "There are 7 days in a week."),
+    ("shapes are in this image in total", "5."),
+    ("tallest bar", "Tue."),
+    ("cleo's score", "15."),
+    ("title of this app window", "Settings."),
+    ("shelf code", "The shelf code is PINE-3310."),
+    ("gate code", "The gate code is BRASS-8842."),
+    ("archive box number", "The archive box number is 6174."),
+    ("two access codes",
+     "The two access codes are NORTH-1100 and SOUTH-2290."),
+    ("harbor light color", "The harbor light color is AMBER-7."),
+    # v24: the anchor template (item 11).
+    ("produces insulin", "Pancreas."),
+    ("absorb from the air", "Carbon dioxide."),
+    ("which of these is a prime number", "29."),
+    ("world war ii end", "1945."),
+    ("table salt", "NaCl."),
+    ("largest ring system", "Saturn."),
+    ("eats only plants", "Herbivore."),
+    ("most native speakers", "Mandarin Chinese."),
+    ("powerhouse of the cell", "Mitochondrion."),
+    ("measures air pressure", "Barometer."),
+    ("3 baskets with 8 oranges",
+     "She has 24 oranges and eats 5, so 19 are left."),
+    ("pays with a $100 bill",
+     "The books cost 48 dollars, so he gets 52 dollars change."),
+    ("6 shelves with 15 books", "There are 90 books in total."),
+    ("8 liters of fuel", "It uses 28 liters."),
+    ("12 pages every day", "She needs 17 days."),
+    ("27 cupcakes in the morning",
+     "He sells 45 cupcakes, so he makes 135 dollars."),
+    ("4 times as old", "Tom is 36 years old."),
+    ("filled at 25 liters", "It takes 20 minutes."),
+    ("14 classes with 26 students", "There are 364 students in total."),
+    ("saves $15 per week", "She has saved 120 dollars."),
 ]
 
 # Prompt substrings the partial model answers correctly: the 1st, 3rd and
@@ -291,6 +508,33 @@ PARTIAL_CORRECT = {
     "array of three numbers", "mango",
     # Role markers for the 1st, 3rd, 5th role tasks (pirate, chef, robot).
     "pirate", "chef", "robot",
+    # v24: the grown templates — 3 of each template's 5 new tasks,
+    # so the partial brain stays at 60% (50% for math, whose new
+    # keys are the variants of already-partial tasks; 12 of 20 for
+    # the anchor template).
+    "23 apples", "20 percent of 150", "14 muffins on each tray",
+    "largest ocean", "lunar landing", "longest river",
+    "all dogs are mammals", "anna is taller", "maria has 5 coins",
+    "grace", "describe the ocean", "country is france",
+    "cheese sandwich", "pack a suitcase", "bicycle ride",
+    "summarize the harbour passage", "summarize the farmer passage",
+    "summarize the teacher passage",
+    "where does priya grow", "how many passengers does the ferry",
+    "ferry ticket cost",
+    "emma", "everest", "rovers",
+    "count_vowels", "count_primes", "celsius",
+    "count_words", "factorial",
+    "weather in london", "translate 'thank you'", "set an alarm",
+    "what is my name", "where do i live", "days are in a week",
+    "cowboy", "grandmother", "surfer",
+    "shapes are in this image in total", "tallest bar", "cleo's score",
+    "shelf code", "archive box number", "two access codes",
+    "produces insulin", "absorb from the air",
+    "which of these is a prime number", "table salt",
+    "eats only plants", "powerhouse of the cell",
+    "3 baskets with 8 oranges", "pays with a $100 bill",
+    "6 shelves with 15 books", "12 pages every day",
+    "4 times as old", "14 classes with 26 students",
 }
 
 # (prompt substring, tool name, arguments) — the tool-calling
@@ -300,6 +544,12 @@ TOOL_CALLS = [
     ("15 plus 27", "calculate", {"expression": "15 + 27"}),
     ("jane austen", "search_books", {"author": "Jane Austen"}),
     ("add 12 and 30", "add_numbers", {"a": 12, "b": 30}),
+    # v24: the grown tool-calling tasks.
+    ("weather in london", "get_weather", {"city": "London"}),
+    ("price of acme stock", "get_stock_price", {"symbol": "ACME"}),
+    ("translate 'thank you'", "translate_text",
+     {"text": "thank you", "target_language": "French"}),
+    ("set an alarm", "set_alarm", {"time": "7:30 AM"}),
 ]
 
 # System-prompt role marker -> (turn 1 answer, turn 2 answer). The
@@ -316,6 +566,18 @@ ROLE_ANSWERS = {
     "poet": ("Hello, hello, the day is bright,\nI greet you now with pure delight.",
              "The night is dark, the stars shine bright,\nThe moon above glows silver light."),
     "robot": ("BEEP. Hello, human.", "BEEP. I am a robot."),
+    # v24: the grown role tasks.
+    "cowboy": ("Howdy, partner! Good to see ya.",
+               "I work the ranch, ridin' the trail every day, partner."),
+    "doctor": ("Hello, how can I help you today? Stay healthy.",
+               "The capital of France is Paris. Stay healthy."),
+    "grandmother": ("Hello, dear! I just baked cookies in the oven.",
+                    "My favourite thing is baking cookies for my "
+                    "grandchildren, dear."),
+    "knight": ("Hark! I greet thee, traveller.",
+               "Hark! I am a knight of the realm."),
+    "surfer": ("Hey dude! The waves are gnarly today.",
+               "I surf the waves at the beach, dude."),
 }
 
 # Transcription by audio filename (the fake cannot hear; it keys on
@@ -328,14 +590,26 @@ AUDIO_TRANSCRIPTS = {
 }
 PARTIAL_AUDIO_FILES = {"clip-hello.wav", "clip-weather.wav"}
 # Speech prompts the partial brain speaks correctly (task 3).
-PARTIAL_SPEECH = {"friendly voice"}
+# v24: three of the five new speech prompts join it, so the
+# partial brain speaks 4 of 8 speech tasks (6 of 10 audio tasks
+# overall, with the two transcriptions it already had).
+PARTIAL_SPEECH = {"friendly voice", "weather report", "thank you", "goodbye"}
 # Image prompts the partial brain renders correctly (tasks 1, 3, 5).
 PARTIAL_IMAGE_PROMPTS = {"bicycle", "mountain lake", "lighthouse"}
+
+
+# (v24): a runaway loop on request — the right JSON answer,
+# repeated instead of stopping (the failure FARA showed). The
+# smart brain loops only when a prompt asks for "looping json";
+# the app's loop guard must cut it and grade the first copy.
+LOOPING_JSON_ANSWER = '{"city": "Paris", "population": 2140526}\n' * 40
 
 
 def answer_for(brain, prompt):
     """Canned answer for a brain type and prompt."""
     lowered = prompt.lower()
+    if brain == "smart" and "looping json" in lowered:
+        return LOOPING_JSON_ANSWER
     key = None
     smart = None
     for substring, answer in SMART_ANSWERS:
@@ -429,16 +703,23 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/tags":
+            # (v24, item 9): real /api/tags entries carry the
+            # model's digest; the app records it on the run card.
             models = [
-                {"name": name, "size": spec["size"], "modified_at": "2026-11-12T00:00:00Z"}
+                {"name": name, "size": spec["size"],
+                 "digest": MODEL_CAPS[name]["digest"],
+                 "modified_at": "2026-11-12T00:00:00Z"}
                 for name, spec in MODELS.items()
             ]
             models.append(
-                {"name": BROKEN_MODEL, "size": 500_000_000, "modified_at": "2026-11-12T00:00:00Z"}
+                {"name": BROKEN_MODEL, "size": 500_000_000,
+                 "digest": MODEL_CAPS[BROKEN_MODEL]["digest"],
+                 "modified_at": "2026-11-12T00:00:00Z"}
             )
             for name in sorted(self.server.pulled):
                 models.append(
                     {"name": name, "size": 1_000_000_000,
+                     "digest": "sha256:" + "ab" * 32,
                      "modified_at": "2026-11-12T00:00:00Z"}
                 )
             self._send_json(200, {"models": models})
@@ -474,6 +755,11 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "bad json"})
             return
         self.server.generate_count += 1
+        # (v23 tests): record the options each call carried, so a
+        # check can prove num_predict -1 reaches the server
+        # untouched (no cap added on the way).
+        self.server.generate_options.append(payload.get("options") or {})
+        self.server.think_seen.append(payload.get("think"))
         if self.server.dead:
             self._close_without_answer()
             return
@@ -566,12 +852,22 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
             if model in self.server.pulled:
                 # A pulled model reports completion-only with a short
                 # context: text-only, like a model with no extras.
-                caps = {"capabilities": ["completion"], "context_length": 4096}
+                caps = {
+                    "capabilities": ["completion"],
+                    "context_length": 4096,
+                    "details": {"parameter_size": "1.0B",
+                                "quantization_level": "Q4_K_M"},
+                    "digest": "sha256:" + "ab" * 32,
+                }
             else:
                 self._send_json(404, {"error": f"model '{model}' not found"})
                 return
         self._send_json(200, {
             "model": model,
+            # (v24, item 9): real Ollama reports details + digest
+            # here; the app records them on the run card.
+            "details": caps.get("details"),
+            "digest": caps.get("digest"),
             "capabilities": caps["capabilities"],
             "model_info": {
                 "general.architecture": "fake",
@@ -587,6 +883,7 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "bad json"})
             return
         self.server.chat_count += 1
+        self.server.think_seen.append(payload.get("think"))
         if self.server.dead:
             self._close_without_answer()
             return
@@ -606,6 +903,7 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
         # Record the full history: the multi-turn tests prove the
         # client sent every earlier turn, not just the latest prompt.
         self.server.chat_history.append(messages)
+        self.server.chat_options.append(payload.get("options") or {})
         self.server.chat_images_seen += sum(
             len(m.get("images") or []) for m in messages
         )
@@ -765,12 +1063,19 @@ class FakeOllamaServer(ThreadingHTTPServer):
         self.dead = False
         self.generate_count = 0
         self.generate_done = 0
+        self.generate_options = []
         self.show_count = 0
         self.chat_count = 0
         self.chat_done = 0
         self.chat_history = []
+        self.chat_options = []
         self.chat_images_seen = 0
         self.chat_tools_seen = 0
+        # (v24, item 6): the think flag each generate/chat call
+        # carried (True/False/None), so a check can prove thinking
+        # was switched on for the thinking templates and models —
+        # and nowhere else.
+        self.think_seen = []
         # v18: seconds to wait before answering a generate/chat call
         # at all (headers included) — a slow first token, like a
         # cold model load on a slow box.
@@ -903,6 +1208,9 @@ class FakeProviderHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "bad json"}})
             return
         self.server.chat_count += 1
+        # (v23 tests): record the whole payload, so a check can
+        # prove an uncapped call omits max_tokens entirely.
+        self.server.chat_payloads.append(payload)
         if self.server.dead:
             self._close_without_answer()
             return
@@ -1113,6 +1421,7 @@ class FakeProviderServer(ThreadingHTTPServer):
         self.chat_count = 0
         self.chat_done = 0
         self.chat_history = []
+        self.chat_payloads = []
         self.chat_images_seen = 0
         self.image_count = 0
         self.transcribe_count = 0

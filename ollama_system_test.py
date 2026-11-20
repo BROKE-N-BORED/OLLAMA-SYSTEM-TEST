@@ -103,6 +103,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import deque
 from datetime import datetime, timedelta
 
@@ -169,10 +170,33 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "22"
+__version__ = "24"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
+# (v23): a template's num_predict of -1 means NO CAP — the model
+# writes until it stops on its own. That is Ollama's own meaning
+# for -1, and the shipped default: a cap cut long answers off
+# mid-thought and scored them wrong for a harness reason. The one
+# real bound left is the model's own context window.
+NO_CAP = -1
+# (v24): runaway-loop detection (item 2). A model that finds its
+# answer and then repeats it instead of stopping — the FARA
+# failure — must not eat an uncapped run or bury the right answer
+# under dozens of copies. The stream is watched for one block of
+# at least LOOP_MIN_BLOCK characters, holding real words, repeated
+# at least LOOP_MIN_REPEATS times back to back at the tail of an
+# answer already LOOP_MIN_TEXT long. See _LoopGuard.
+LOOP_MIN_TEXT = 240
+LOOP_MIN_BLOCK = 12
+LOOP_MIN_REPEATS = 4
+LOOP_SAMPLE = 60
+LOOP_MAX_WATCHED = 200_000
+# (v24, item 5): how many times a scored template runs per model
+# when the template does not declare its own "repeats". The
+# reported score is the average of the repeats, and the run file
+# keeps every repeat's score, so the spread is visible (item 10).
+DEFAULT_REPEATS = 3
 # Try-it answers (R24): one question, one short answer — long enough
 # to judge, short enough to stay quick.
 TRYIT_PREDICT = 200
@@ -413,8 +437,10 @@ COST_CONFIRM_THRESHOLD_USD = 1.00
 # score counts only the tasks that actually ran.
 BUDGET_REACHED = "time budget reached"
 # Rough tokens per character for the pre-run cost estimate: about
-# four characters per token. The estimate is an upper bound (see
-# estimate_template_tokens), never a promise of the exact bill.
+# four characters per token. For a capped template the estimate is
+# an upper bound (see estimate_template_tokens), never a promise
+# of the exact bill; an uncapped template (v23) has no completion
+# estimate at all — there is no honest bound to give.
 CHARS_PER_TOKEN = 4
 # Capabilities a model can have. "text" is the baseline every chat model
 # has; the rest gate the templates that need them. A template's
@@ -1186,8 +1212,15 @@ def estimate_template_tokens(template):
     The same token math the run files record, predicted before the
     run: prompt tokens from the text the run will send, completion
     tokens from num_predict — the most the run asks for on each call.
-    The estimate is an UPPER BOUND: a model usually stops well short
-    of num_predict, so the real bill is usually lower.
+    For a capped template the completion estimate is an UPPER BOUND:
+    a model usually stops well short of num_predict, so the real
+    bill is usually lower.
+
+    (v23): an uncapped template (num_predict -1, the shipped
+    default) has NO completion estimate — the model writes until
+    it stops on its own, so there is no honest upper bound. Its
+    completion count comes back None: never a fake number, and
+    never negative.
 
     What is counted, per task kind:
     - generate / vision / tools: the prompt text (plus the tool
@@ -1204,9 +1237,19 @@ def estimate_template_tokens(template):
       its lengths and ignores its plain prompts, same as the worker);
       otherwise the plain prompts.
     """
-    num_predict = template.get("num_predict", 0)
+    num_predict = template.get("num_predict", NO_CAP)
     prompt_tokens = 0
     completion_tokens = 0
+
+    def add_completion():
+        # One call's completion estimate. Uncapped means unknown:
+        # the count becomes None and stays None.
+        nonlocal completion_tokens
+        if num_predict is None or num_predict < 0:
+            completion_tokens = None
+        elif completion_tokens is not None:
+            completion_tokens += num_predict
+
     if template.get("scored"):
         for task in template.get("tasks", []):
             kind = task.get("kind", "generate")
@@ -1221,28 +1264,35 @@ def estimate_template_tokens(template):
                     prompt_tokens += _chars_to_tokens(
                         system_chars + seen_chars
                     )
-                    completion_tokens += num_predict
+                    add_completion()
                 continue
             if kind == "long_context":
                 prompt_tokens += task.get("context_length", 0)
                 prompt_tokens += _chars_to_tokens(
                     len(task.get("prompt") or "")
                 )
-                completion_tokens += num_predict
+                add_completion()
                 continue
             chars = len(task.get("prompt") or "")
             if kind == "tools" and task.get("tools"):
                 chars += len(json.dumps(task["tools"]))
             prompt_tokens += _chars_to_tokens(chars)
-            completion_tokens += num_predict
+            add_completion()
+        # (v24, item 5): the template runs once per repeat — the
+        # estimate multiplies, or the preview would promise a run
+        # several times cheaper and shorter than the real one.
+        repeats = template.get("repeats", 1)
+        prompt_tokens *= repeats
+        if completion_tokens is not None:
+            completion_tokens *= repeats
     elif template.get("context_lengths"):
         for length in template["context_lengths"]:
             prompt_tokens += length
-            completion_tokens += num_predict
+            add_completion()
     else:
         for prompt in template.get("prompts", []):
             prompt_tokens += _chars_to_tokens(len(prompt))
-            completion_tokens += num_predict
+            add_completion()
     return prompt_tokens, completion_tokens
 
 
@@ -1252,8 +1302,11 @@ def estimate_run_cost(targets, templates, pairs=None):
     Returns a dict: "per_model" is one entry per provider target
     (label, cost-or-None, prompt tokens, completion tokens,
     has-prices); "total" is the summed cost, or None when any
-    provider model has no prices saved; "unknown" lists the models
-    without prices; "provider_models" lists every provider label.
+    provider model's cost is unknown; "unknown" lists the models
+    without prices; "uncapped" lists the priced models whose cost
+    is unknown because a template they run has no answer cap
+    (v23 — no token estimate exists for an uncapped template);
+    "provider_models" lists every provider label.
     Ollama targets are free and never appear. The warmup call is
     counted (the provider charges for it too), for text models only
     — a model with no text capability gets a connection test instead
@@ -1264,6 +1317,7 @@ def estimate_run_cost(targets, templates, pairs=None):
     per_model = []
     total = 0.0
     unknown = []
+    uncapped = []
     for target in targets:
         if target["kind"] != "provider":
             continue
@@ -1284,7 +1338,10 @@ def estimate_run_cost(targets, templates, pairs=None):
                 estimate_template_tokens(template)
             )
             prompt_tokens += template_prompt
-            completion_tokens += template_completion
+            if template_completion is None:
+                completion_tokens = None
+            elif completion_tokens is not None:
+                completion_tokens += template_completion
         cost = estimate_cost(
             prompt_tokens, completion_tokens,
             target["price_input_per_1m"], target["price_output_per_1m"],
@@ -1294,7 +1351,10 @@ def estimate_run_cost(targets, templates, pairs=None):
             and target["price_output_per_1m"] is not None
         )
         if cost is None:
-            unknown.append(target["label"])
+            if not has_prices:
+                unknown.append(target["label"])
+            elif completion_tokens is None:
+                uncapped.append(target["label"])
         else:
             total += cost
         per_model.append({
@@ -1306,8 +1366,9 @@ def estimate_run_cost(targets, templates, pairs=None):
         })
     return {
         "per_model": per_model,
-        "total": None if unknown else total,
+        "total": None if unknown or uncapped else total,
         "unknown": unknown,
+        "uncapped": uncapped,
         "provider_models": [entry["label"] for entry in per_model],
     }
 
@@ -1381,11 +1442,18 @@ def count_run_steps(targets, templates, pairs=None):
             if not template_eligible(template, target):
                 continue
             if template["scored"]:
+                task_steps = 0
                 for task in template["tasks"]:
                     if task.get("kind") == "chat":
-                        steps += len(task["turns"])
+                        task_steps += len(task["turns"])
                     else:
-                        steps += 1
+                        task_steps += 1
+                # (v24, item 5): a scored template runs its tasks
+                # once per repeat — the count says so, or the
+                # progress line would run past 100% and the run
+                # preview would promise a run several times
+                # shorter than the real one.
+                steps += task_steps * template.get("repeats", 1)
             else:
                 if template.get("context_lengths"):
                     steps += len(template["context_lengths"])
@@ -1396,9 +1464,11 @@ def count_run_steps(targets, templates, pairs=None):
 
 # The run preview's time estimate (R11): what a model with no past
 # runs is assumed to do, how long a model load is allowed for, and
-# the safety margin on top. The estimate is an UPPER BOUND: the run
-# usually finishes sooner, because models usually stop well short
-# of num_predict.
+# the safety margin on top. For a run of capped templates the
+# estimate is an UPPER BOUND: the run usually finishes sooner,
+# because models usually stop well short of num_predict. An
+# uncapped template (v23) has no upper bound — the preview says
+# there is no upper estimate instead of inventing one.
 PREVIEW_DEFAULT_TOK_S = 8.0
 PREVIEW_LOAD_ALLOWANCE_S = 10.0
 PREVIEW_SAFETY_MARGIN = 1.25
@@ -1422,15 +1492,19 @@ def build_run_preview(targets, templates, results_dir, pairs=None,
 
     Returns a dict: "text" is the preview itself; "total_steps" is
     the step count; "seconds_upper" is the time estimate (an upper
-    bound, in seconds); "cost" is the estimate_run_cost result for
-    the provider targets (or None for a local-only run).
+    bound, in seconds — or None when any template in the run is
+    uncapped, v23: no upper bound exists); "cost" is the
+    estimate_run_cost result for the provider targets (or None for
+    a local-only run).
 
     The time estimate is honest about what it is: per model, the
     tokens the run will ask for (estimate_template_tokens, an upper
     bound itself) divided by the model's measured speed from its
     newest past run — or 8 tok/s when it has never run here — plus
     10 s per model for loading, all times a 1.25 safety margin. It
-    says "at most about" because that is what it is.
+    says "at most about" because that is what it is. When a
+    template in the run has no answer cap, the time line says
+    there is no upper estimate, and says why.
 
     When pairs is given (a re-run of failed pairs, R24), the preview
     counts and prices only the pairs in the set, and says so. When
@@ -1466,6 +1540,7 @@ def build_run_preview(targets, templates, results_dir, pairs=None,
         )
     lines.append("")
     seconds_upper = 0.0
+    any_uncapped = False
     for target in targets:
         label = target["label"]
         mine = [t for t in templates
@@ -1488,14 +1563,28 @@ def build_run_preview(targets, templates, results_dir, pairs=None,
             prompt_tokens, completion_tokens = estimate_template_tokens(
                 template
             )
-            tokens += prompt_tokens + completion_tokens
+            tokens += prompt_tokens
+            if completion_tokens is None:
+                any_uncapped = True
+            else:
+                tokens += completion_tokens
         seconds_upper += tokens / speed + PREVIEW_LOAD_ALLOWANCE_S
-    seconds_upper *= PREVIEW_SAFETY_MARGIN
     lines.append("")
-    lines.append(
-        f"Time: at most about {fmt_eta(seconds_upper)} (an upper "
-        "estimate; the run usually finishes sooner)."
-    )
+    if any_uncapped:
+        # (v23): no cap means no honest upper bound — say so
+        # instead of printing a number the run can sail past.
+        seconds_upper = None
+        lines.append(
+            "Time: no upper estimate: at least one template has "
+            "no answer cap, so a model writes until it stops on "
+            "its own."
+        )
+    else:
+        seconds_upper *= PREVIEW_SAFETY_MARGIN
+        lines.append(
+            f"Time: at most about {fmt_eta(seconds_upper)} (an upper "
+            "estimate; the run usually finishes sooner)."
+        )
     provider_targets = [t for t in targets if t["kind"] == "provider"]
     if pairs is not None:
         provider_targets = [
@@ -1508,21 +1597,31 @@ def build_run_preview(targets, templates, results_dir, pairs=None,
         lines.append("")
         lines.append("Cost (provider models cost real money):")
         for entry in cost["per_model"]:
-            if entry["has_prices"]:
+            if not entry["has_prices"]:
+                lines.append(
+                    f"  {entry['label']}: no prices saved: cost unknown"
+                )
+            elif entry["cost"] is None:
+                lines.append(
+                    f"  {entry['label']}: cost unknown: answers have "
+                    "no cap, so there is no token estimate"
+                )
+            else:
                 lines.append(
                     f"  {entry['label']}: about {fmt_cost(entry['cost'])} "
                     f"(about {fmt_tokens(entry['prompt_tokens'])} tokens in, "
                     f"{fmt_tokens(entry['completion_tokens'])} out)"
-                )
-            else:
-                lines.append(
-                    f"  {entry['label']}: no prices saved: cost unknown"
                 )
         if cost["unknown"]:
             lines.append(
                 "No prices are saved for "
                 + ", ".join(cost["unknown"])
                 + ", so the total cost is unknown."
+            )
+        elif cost["uncapped"]:
+            lines.append(
+                "The total cost is unknown: at least one model "
+                "runs a template with no answer cap."
             )
         else:
             lines.append(f"Estimated total: about {fmt_cost(cost['total'])}.")
@@ -1836,7 +1935,11 @@ def capabilities_from_show(data):
     if not isinstance(data, dict):
         return caps
     for raw in data.get("capabilities") or []:
-        if raw in ("vision", "tools"):
+        # (v24): "thinking" is not a template capability — no
+        # template requires it — but screening records it, because
+        # the Reasoning and Math templates run with thinking on
+        # for models that have it (item 6).
+        if raw in ("vision", "tools", "thinking"):
             caps.add(raw)
     info = data.get("model_info") or {}
     context_length = None
@@ -1872,7 +1975,7 @@ def load_capabilities(path=None):
     for model, raw in ollama_caps.items():
         if not isinstance(model, str) or not isinstance(raw, list):
             continue
-        kept = {c for c in raw if c in CAPABILITIES}
+        kept = {c for c in raw if c in CAPABILITIES or c == "thinking"}
         kept.add("text")
         caps[model] = sorted(kept)
     return caps
@@ -1959,15 +2062,116 @@ def _observe_first_reply(seconds):
         _SLOWEST_FIRST_REPLY_S = seconds
 
 
+def _loop_block_qualifies(block):
+    """True when a repeated block is real content, not a texture:
+    at least three distinct characters (so "aaaa…" and "-=-=-="
+    never qualify) and at least four letters or digits."""
+    if len(set(block)) <= 2:
+        return False
+    return sum(1 for ch in block if ch.isalnum()) >= 4
+
+
+def _loop_cut_text(text):
+    """The answer with a runaway tail loop cut back to one cycle,
+    or None when the tail is not looping (v24, item 2).
+
+    Candidate periods are tried smallest first: the last
+    LOOP_SAMPLE characters must appear exactly one period back,
+    and the stretch from there must tile exactly as that block,
+    at least LOOP_MIN_REPEATS times. The kept text ends with
+    exactly one cycle — the first complete answer — however many
+    copies followed it.
+    """
+    if len(text) < LOOP_MIN_TEXT:
+        return None
+    sample = text[-LOOP_SAMPLE:]
+    for period in range(
+            LOOP_MIN_BLOCK, min(LOOP_SAMPLE, len(text) // 2) + 1):
+        if text.rfind(sample, 0, len(text) - period) != (
+                len(text) - period - len(sample)):
+            continue
+        block = text[len(text) - period:]
+        if not _loop_block_qualifies(block):
+            continue
+        start = len(text) - period
+        while start - period >= 0 and \
+                text[start - period:start] == block:
+            start -= period
+        if len(text) - start < LOOP_MIN_REPEATS * period:
+            continue
+        return text[:start] + block
+    return None
+
+
+class _LoopGuard:
+    """Watches one streamed answer for a runaway loop (v24).
+
+    feed() returns True once a loop is confirmed; text() then
+    returns the answer cut back to a single cycle. Legitimate
+    repetition — a chorus between verses, repeated labels with
+    different values between them — is never the same block back
+    to back four times, so it never trips this. Past
+    LOOP_MAX_WATCHED characters the guard stops checking: an
+    answer that long is bounded by the context window anyway,
+    and re-scanning it on every chunk would cost more than the
+    loop it is watching for.
+    """
+
+    def __init__(self):
+        self._parts = []
+        self._length = 0
+        self._checked_to = 0
+        self._kept = None
+        self._gave_up = False
+
+    def feed(self, piece):
+        """Add one streamed piece. True when a loop is confirmed."""
+        if self._kept is not None:
+            return True
+        if self._gave_up:
+            return False
+        self._parts.append(piece)
+        self._length += len(piece)
+        if self._length > LOOP_MAX_WATCHED:
+            self._gave_up = True
+            return False
+        if self._length < LOOP_MIN_TEXT:
+            return False
+        if self._length - self._checked_to < 100:
+            return False
+        self._checked_to = self._length
+        kept = _loop_cut_text("".join(self._parts))
+        if kept is None:
+            return False
+        self._kept = kept
+        return True
+
+    def text(self):
+        """The answer so far — cut to one cycle when a loop tripped."""
+        if self._kept is not None:
+            return self._kept
+        return "".join(self._parts)
+
+
 def chat_once(model, messages, num_predict, temperature=0, tools=None,
-              should_stop=None):
+              should_stop=None, think=False):
     """One streaming /api/chat call. Returns the generate_once metrics
     shape, plus "tool_calls" (a list of {"name", "arguments"} dicts).
+
+    num_predict goes to Ollama untouched: -1 (NO_CAP, v23) is
+    Ollama's own "no limit" — the model stops on its own.
 
     Messages are {"role", "content", "images"?} dicts; images are
     base64 strings on the user message. Tools use Ollama's shape:
     [{"type": "function", "function": {"name", "description",
     "parameters"}}]. Ollama sends any tool calls in the final message.
+
+    (v24): think=True sends Ollama's think option (thinking models
+    only — the worker decides). A runaway loop in the stream is cut
+    by the _LoopGuard: the metrics then carry "loop_cut": True and
+    the answer is the first cycle of the loop, not the whole flood;
+    the server never sent its done event, so the token counts are
+    None rather than invented.
 
     Raises OllamaError on failure, Cancelled if should_stop() fires.
     """
@@ -1979,6 +2183,8 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
     }
     if tools:
         payload["tools"] = tools
+    if think:
+        payload["think"] = True
     req = urllib.request.Request(
         ollama_base() + "/api/chat",
         data=json.dumps(payload).encode("utf-8"),
@@ -2005,6 +2211,8 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
     answer_parts = []
     tool_calls = []
     dropped_chunks = 0
+    guard = _LoopGuard()
+    loop_cut = False
     last_chunk = time.monotonic()
     try:
         while True:
@@ -2039,6 +2247,9 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
                 if t_first is None:
                     t_first = time.monotonic()
                 answer_parts.append(text)
+                if guard.feed(text):
+                    loop_cut = True
+                    break
             for call in message.get("tool_calls") or []:
                 function = call.get("function") or {}
                 name = function.get("name")
@@ -2050,13 +2261,14 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
                 break
     finally:
         resp.close()
-    if done is None:
+    if done is None and not loop_cut:
         raise OllamaError("could not reach Ollama")
+    done = done or {}
     _observe_first_reply(
         (t_first - t_start) if t_first is not None else None)
     return {
         "prompt": "",
-        "answer": "".join(answer_parts),
+        "answer": guard.text() if loop_cut else "".join(answer_parts),
         "decode_tok_s": tok_s(done.get("eval_count"), done.get("eval_duration")),
         "prompt_tok_s": tok_s(
             done.get("prompt_eval_count"), done.get("prompt_eval_duration")
@@ -2074,13 +2286,24 @@ def chat_once(model, messages, num_predict, temperature=0, tools=None,
         "prompt_tokens": done.get("prompt_eval_count"),
         "completion_tokens": done.get("eval_count"),
         "dropped_chunks": dropped_chunks,
+        "loop_cut": loop_cut,
         "wall_s": time.monotonic() - t_start,
         "tool_calls": tool_calls,
     }
 
 
-def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
+def generate_once(model, prompt, num_predict, temperature=0, should_stop=None,
+                  think=False):
     """One streaming /api/generate call. Returns measured metrics + answer.
+
+    num_predict goes to Ollama untouched: -1 (NO_CAP, v23) is
+    Ollama's own "no limit" — the model stops on its own.
+
+    (v24): think=True sends Ollama's think option (thinking models
+    only — the worker decides). A runaway loop in the stream is cut
+    by the _LoopGuard: the metrics then carry "loop_cut": True and
+    the answer is the first cycle of the loop; the token counts are
+    None rather than invented (the done event never arrived).
 
     Raises OllamaError on failure, Cancelled if should_stop() becomes true.
     """
@@ -2090,6 +2313,8 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
         "stream": True,
         "options": {"num_predict": num_predict, "temperature": temperature},
     }
+    if think:
+        payload["think"] = True
     req = urllib.request.Request(
         ollama_base() + "/api/generate",
         data=json.dumps(payload).encode("utf-8"),
@@ -2115,6 +2340,8 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
     done = None
     answer_parts = []
     dropped_chunks = 0
+    guard = _LoopGuard()
+    loop_cut = False
     last_chunk = time.monotonic()
     try:
         while True:
@@ -2148,20 +2375,24 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
                 if t_first is None:
                     t_first = time.monotonic()
                 answer_parts.append(text)
+                if guard.feed(text):
+                    loop_cut = True
+                    break
             if chunk.get("done"):
                 done = chunk
                 break
     finally:
         resp.close()
-    if done is None:
+    if done is None and not loop_cut:
         # The stream ended before Ollama sent its done event: the
         # connection went away mid-answer, so this is unreachable too.
         raise OllamaError("could not reach Ollama")
+    done = done or {}
     _observe_first_reply(
         (t_first - t_start) if t_first is not None else None)
     return {
         "prompt": prompt,
-        "answer": "".join(answer_parts),
+        "answer": guard.text() if loop_cut else "".join(answer_parts),
         "decode_tok_s": tok_s(done.get("eval_count"), done.get("eval_duration")),
         "prompt_tok_s": tok_s(
             done.get("prompt_eval_count"), done.get("prompt_eval_duration")
@@ -2177,6 +2408,7 @@ def generate_once(model, prompt, num_predict, temperature=0, should_stop=None):
         "prompt_tokens": done.get("prompt_eval_count"),
         "completion_tokens": done.get("eval_count"),
         "dropped_chunks": dropped_chunks,
+        "loop_cut": loop_cut,
         "wall_s": time.monotonic() - t_start,
     }
 
@@ -2446,10 +2678,14 @@ def provider_chat_once(provider, model_id, messages, num_predict,
         "model": model_id,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": num_predict,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    # (v23): an uncapped call (num_predict -1) omits max_tokens
+    # entirely — OpenAI-compatible APIs reject a negative cap,
+    # and no cap is the point. A capped call sends it as before.
+    if num_predict is not None and num_predict >= 0:
+        payload["max_tokens"] = num_predict
     if tools:
         payload["tools"] = tools
     req = urllib.request.Request(
@@ -2472,6 +2708,8 @@ def provider_chat_once(provider, model_id, messages, num_predict,
     t_first = None
     t_last = None
     answer_parts = []
+    guard = _LoopGuard()
+    loop_cut = False
     prompt_tokens = None
     completion_tokens = None
     tool_call_parts = {}  # index -> {"name": str, "arguments": str}
@@ -2530,6 +2768,10 @@ def provider_chat_once(provider, model_id, messages, num_predict,
                     t_first = now
                 t_last = now
                 answer_parts.append(text)
+                # (v24): same runaway-loop cut as the Ollama paths.
+                if guard.feed(text):
+                    loop_cut = True
+                    break
     finally:
         resp.close()
     tool_calls = []
@@ -2565,7 +2807,8 @@ def provider_chat_once(provider, model_id, messages, num_predict,
         total_tokens = prompt_tokens + completion_tokens
     return {
         "prompt": "",
-        "answer": "".join(answer_parts),
+        "answer": guard.text() if loop_cut else "".join(answer_parts),
+        "loop_cut": loop_cut,
         "decode_tok_s": decode_tok_s,
         "prompt_tok_s": prompt_tok_s,
         "ttft_s": ttft_s,
@@ -2981,15 +3224,38 @@ _PROMPT_STOPWORDS = {
 }
 
 
+# (v24, item 4): a stated conclusion — "the answer is X",
+# "answer: X", "the result is X" — anywhere in the answer, and
+# the last "= X" of the working. The number grammars mirror the
+# final-sentence marker below: a fraction, a scientific-notation
+# number, or a plain number.
+_CONCLUSION_NUMBER = (
+    r"(-?\d+(?:\.\d+)?\s*/\s*-?\d+(?:\.\d+)?"
+    r"|-?\d+(?:\.\d+)?[eE][+-]?\d+"
+    r"|-?\d+(?:\.\d+)?)"
+)
+_CONCLUSION_RE = re.compile(
+    r"(?:the\s+)?(?:final\s+)?(?:answer|result)\s*(?:is|:)\s*\*?\*?"
+    + _CONCLUSION_NUMBER,
+    re.IGNORECASE,
+)
+_EQUALS_RE = re.compile(
+    r"=\s*\*?\*?" + _CONCLUSION_NUMBER + r"(?!\d)(?!\s*[+\-*/=])"
+)
+_BARE_NUMBER_LINE_RE = re.compile(
+    r"^\$?\s*" + _CONCLUSION_NUMBER + r"\s*(?:[a-zA-Z]+)?\.?$"
+)
+
+
 def _final_answer_number(answer, task=None):
-    """The number the model meant as its answer (v21).
+    """The number the model meant as its answer (v21, v24).
 
     The old rule took the last number in the whole answer, which
     graded the wrong number whenever the model hedged after
     answering ("seven recognized continents ... how one defines"
     scored 1), worked in units ("= 60 cm^2" scored 2, the
     exponent), or broke its total down ("a total of four pets:
-    three cats and one dog" scored 1). Five layers, in order:
+    three cats and one dog" scored 1). The layers, in order:
 
     1. The number extractor already ignores digits in units and
        exponents (see _extract_numbers).
@@ -2997,18 +3263,29 @@ def _final_answer_number(answer, task=None):
        marker in LaTeX answers; the last one wins. It beats a
        restated equation in the final sentence ("... 3x + 7 = 22
        ... \\boxed{5}" is 5, not 22).
-    3. A result marker in the FINAL sentence — "=", "total of",
+    3. (v24) A stated conclusion anywhere in the answer — "the
+       answer is X", "answer: X", "the result is X"; the last one
+       stated wins, so a corrected conclusion overrides an
+       earlier draft. This is the FARA bat-and-ball fix: the
+       model worked through to its conclusion and then kept
+       talking, and the picker took a number from the working.
+    4. (v24) A final line that is just a number (a unit word is
+       allowed): the model put its answer on its own line.
+    5. (v24) The last "= X" in the answer — the final
+       computation's result. A restated equation is guarded by
+       layer 2 when the model boxes its answer.
+    6. A result marker in the FINAL sentence — "=", "total of",
        "answer is", or "answer:" followed by a number — wins; the
        last one in the sentence wins. Final-sentence only, so a
        working step ("= 21") cannot beat the conclusion.
-    4. Subject anchoring: the last sentence that shares a content
+    7. Subject anchoring: the last sentence that shares a content
        word with the task prompt and holds a number the prompt
        does not already give; its last such number wins. The
        prompt's own numbers are givens, not answers — an intro
        that restates the problem ("To find 15 percent of 240")
        must not win over the answer. Skipped when the task has
        no prompt.
-    5. The last number in the answer, as before.
+    8. The last number in the answer, as before.
 
     Returns None when the answer holds no number at all.
     """
@@ -3021,6 +3298,25 @@ def _final_answer_number(answer, task=None):
         picked = _boxed_number(boxed[-1])
         if picked is not None:
             return picked
+    # (v24): layers 3-5 — the stated conclusion, in its three
+    # common shapes, beats every inference below.
+    conclusions = list(_CONCLUSION_RE.finditer(text))
+    if conclusions:
+        picked = _extract_numbers(conclusions[-1].group(1))
+        if picked:
+            return picked[0]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        bare = _BARE_NUMBER_LINE_RE.match(lines[-1])
+        if bare:
+            picked = _extract_numbers(bare.group(1))
+            if picked:
+                return picked[0]
+    equals = list(_EQUALS_RE.finditer(text))
+    if equals:
+        picked = _extract_numbers(equals[-1].group(1))
+        if picked:
+            return picked[0]
     sentences = [
         sentence for sentence in
         re.split(r"(?<=[.!?])\s+|\n+", text)
@@ -3192,16 +3488,61 @@ def task_mark(task):
     return "run"
 
 
+def _scan_json_at(text, start):
+    """Parse one JSON value starting at text[start] (a { or [):
+    walk to the matching close, honouring strings and escapes,
+    then json.loads the slice. None when it does not parse."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        ch = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:index + 1])
+                except ValueError:
+                    return None
+    return None
+
+
+def _first_json_value(text):
+    """(found, value): the first complete JSON object or array in
+    the text (v24, item 2), found by balanced-brace scanning. A
+    model that repeats its answer — {...} {...} {...} — yields the
+    FIRST value; the copies after it are ignored instead of
+    poisoning the parse the way a first-to-last-brace grab did."""
+    text = str(text)
+    for match in re.finditer(r"[\{\[]", text):
+        value = _scan_json_at(text, match.start())
+        if value is not None:
+            return True, value
+    return False, None
+
+
 def extract_json(answer):
-    """Parse JSON out of an answer, tolerating fences and surrounding prose."""
+    """Parse a JSON object out of an answer, tolerating fences and
+    surrounding prose. (v24): after the whole-text and fence
+    candidates, the first complete JSON value wins (balanced-brace
+    scan) — a repeated answer's first copy is the answer."""
     text = str(answer).strip()
     candidates = [text]
     fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
     if fence:
         candidates.append(fence.group(1).strip())
-    brace = re.search(r"\{.*\}", text, re.DOTALL)
-    if brace:
-        candidates.append(brace.group(0))
     for candidate in candidates:
         try:
             parsed = json.loads(candidate)
@@ -3209,6 +3550,9 @@ def extract_json(answer):
             continue
         if isinstance(parsed, dict):
             return parsed
+    found, value = _first_json_value(text)
+    if found and isinstance(value, dict):
+        return value
     return None
 
 
@@ -3358,24 +3702,205 @@ def _validate_schema(value, schema, path="answer"):
     return ""
 
 
-def score_schema(answer, expected):
-    """Strict structured output: the answer must be JSON and
-    validate against the schema in expected. (v21): a single code
-    fence around the JSON is accepted — models routinely wrap JSON
-    in ```json fences, and the JSON inside is what is being tested.
-    Prose outside the fence still fails: the whole answer must be
-    the fence and nothing else."""
+def _xml_to_plain(element):
+    """An XML element as plain data (v24): child elements become
+    keys (a repeated tag becomes a list), a leaf becomes its text.
+    Attributes are ignored — the dialects this reads carry the
+    data in the elements."""
+    children = list(element)
+    if not children:
+        return (element.text or "").strip()
+    result = {}
+    for child in children:
+        value = _xml_to_plain(child)
+        if child.tag in result:
+            existing = result[child.tag]
+            if isinstance(existing, list):
+                existing.append(value)
+            else:
+                result[child.tag] = [existing, value]
+        else:
+            result[child.tag] = value
+    return result
+
+
+def _extract_xml_value(text):
+    """(found, value): the first well-formed XML element in the
+    text, as plain data (v24) — the dialect some models are
+    trained to answer in: one tagged element whose children name
+    the fields. A fragment of sibling elements is wrapped in a
+    root and retried. A lone element holding only text is not a
+    structure and does not count."""
+    stripped = str(text).strip()
+    candidates = [stripped]
+    start = stripped.find("<")
+    end = stripped.rfind(">")
+    if start != -1 and end > start:
+        fragment = stripped[start:end + 1]
+        candidates.append(fragment)
+        candidates.append("<root>" + fragment + "</root>")
+    for candidate in candidates:
+        try:
+            root = ET.fromstring(candidate)
+        except ET.ParseError:
+            continue
+        value = _xml_to_plain(root)
+        if isinstance(value, dict) and value:
+            return True, value
+    return False, None
+
+
+def _coerce_to_schema(value, schema):
+    """Coerce extracted data toward a schema's declared types
+    (v24): XML data arrives as text, so "412" must become the
+    integer 412 before it can validate, and "true" the boolean.
+    JSON data is already typed and passes through unchanged."""
+    if not isinstance(schema, dict):
+        return value
+    wanted = schema.get("type")
+    if wanted == "integer" and isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return value
+    if wanted == "number" and isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return value
+    if wanted == "boolean" and isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "yes"):
+            return True
+        if lowered in ("false", "no"):
+            return False
+        return value
+    if wanted == "object" and isinstance(value, dict):
+        properties = schema.get("properties") or {}
+        return {
+            key: _coerce_to_schema(item, properties.get(key, {}))
+            for key, item in value.items()
+        }
+    if wanted == "array" and isinstance(value, list):
+        items = schema.get("items") or {}
+        return [_coerce_to_schema(item, items) for item in value]
+    return value
+
+
+def extract_structure(answer):
+    """(found, value, from_xml): an answer parsed into data
+    (v24, item 7). from_xml says the value came from the XML
+    dialect, whose fields all arrive as text.
+
+    Three dialects, in order: JSON as the whole answer or inside
+    one fence; the first complete JSON value in the text (item 2
+    — a repeated answer's first copy is the answer); and an
+    XML-tagged element whose children name the fields. The value
+    is whatever the dialect carried — an object, a list, a
+    scalar.
+    """
     text = str(answer).strip()
     fence = re.fullmatch(
-        r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE
+        r"```(?:json|xml)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE
     )
     if fence:
-        text = fence.group(1).strip()
+        inner = fence.group(1).strip()
+        try:
+            return True, json.loads(inner), False
+        except ValueError:
+            pass
+        found, value = _extract_xml_value(inner)
+        if found:
+            return True, value, True
     try:
-        parsed = json.loads(text)
+        return True, json.loads(text), False
     except ValueError:
-        return False, "answer is not JSON on its own (prose around it?)"
-    problem = _validate_schema(parsed, expected)
+        pass
+    found, value = _first_json_value(text)
+    if found:
+        return True, value, False
+    found, value = _extract_xml_value(text)
+    return found, value, found
+
+
+def _xml_scalar(raw):
+    """XML parameter text as a typed value (v24): true/false,
+    then a whole number, then a decimal, else the text itself."""
+    lowered = raw.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def _xml_tool_call(answer):
+    """A tool call written as XML in the reply text (v24), in the
+    dialects models are trained to emit: a <tool_call> element
+    wrapping JSON, or a <function>/<invoke> element naming the
+    call with <parameter> children. Returns {"name", "arguments"}
+    or None."""
+    text = str(answer)
+    tagged = re.search(
+        r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+    if tagged:
+        parsed = extract_json(tagged.group(1))
+        if (isinstance(parsed, dict)
+                and isinstance(parsed.get("name"), str)
+                and isinstance(parsed.get("arguments"), dict)):
+            return {"name": parsed["name"],
+                    "arguments": parsed["arguments"]}
+    call = re.search(
+        r"<(?:function|invoke)\s+name=\"([^\"]+)\"[^>]*>"
+        r"(.*?)</(?:function|invoke)>",
+        text, re.DOTALL)
+    if call:
+        arguments = {}
+        for param in re.finditer(
+                r"<parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)</parameter>",
+                call.group(2), re.DOTALL):
+            arguments[param.group(1)] = _xml_scalar(param.group(2).strip())
+        return {"name": call.group(1), "arguments": arguments}
+    call = re.search(
+        r"<(?:function|invoke)=([\w.-]+)>(.*?)</(?:function|invoke)>",
+        text, re.DOTALL)
+    if call:
+        arguments = {}
+        for param in re.finditer(
+                r"<parameter=([\w.-]+)>(.*?)</parameter>",
+                call.group(2), re.DOTALL):
+            arguments[param.group(1)] = _xml_scalar(param.group(2).strip())
+        return {"name": call.group(1), "arguments": arguments}
+    return None
+
+
+def score_schema(answer, expected):
+    """Structured output (v24, items 2 + 7): the answer is parsed
+    into data first — JSON as-is or fenced, the first complete
+    JSON value in a longer or repeated answer, or an XML-tagged
+    element — and the DATA validates against the schema in
+    expected. Wrong or missing fields fail; a different valid
+    syntax does not. (v21 required the answer to be JSON and
+    nothing else; the FARA card showed a model failing outright
+    for answering in the dialect it was trained to answer in.)"""
+    found, value, from_xml = extract_structure(answer)
+    if not found:
+        return False, "answer holds no readable structure (JSON or XML)"
+    if from_xml:
+        # Only XML data is coerced toward the schema's types:
+        # its fields all arrive as text. JSON data is already
+        # typed — a string where the schema wants an integer is
+        # the model's own type error and fails, as before v24.
+        value = _coerce_to_schema(value, expected)
+    problem = _validate_schema(value, expected)
     if problem:
         return False, problem
     return True, ""
@@ -3688,6 +4213,38 @@ def build_long_document(needle, context_tokens, position="middle"):
     return body[:middle] + "\n\n" + needle + "\n\n" + body[middle:]
 
 
+def build_multi_needle_document(needles, context_tokens, positions=None):
+    """A filler document with several needles planted (v24,
+    item 12), each at its own depth (start / middle / end; by
+    default the needles spread across the document in order).
+    Same filler and token estimate as build_long_document, so a
+    document of a given length is the same body either way."""
+    if positions is None:
+        spread = ["start", "middle", "end"]
+        positions = [
+            spread[min(index * len(spread) // len(needles),
+                       len(spread) - 1)]
+            for index in range(len(needles))
+        ]
+    total_needle_chars = sum(len(n) for n in needles) + 100
+    target_chars = max(total_needle_chars, int(context_tokens) * 4)
+    repeats = target_chars // len(_LONG_FILLER) + 1
+    body = (_LONG_FILLER * repeats)[:target_chars]
+    fraction = {"start": 0.02, "middle": 0.5, "end": 0.98}
+    inserts = sorted(
+        (int(len(body) * fraction[position]), index)
+        for index, position in enumerate(positions)
+    )
+    parts = []
+    cursor = 0
+    for offset, index in inserts:
+        parts.append(body[cursor:offset])
+        parts.append("\n\n" + needles[index] + "\n\n")
+        cursor = offset
+    parts.append(body[cursor:])
+    return "".join(parts)
+
+
 def build_context_prompt(base_prompt, context_tokens):
     """The Speed template's padded prompt: the base prompt plus filler
     to about context_tokens tokens, so prefill cost can be measured at
@@ -3914,7 +4471,24 @@ def _validate_task(task, template_id, warnings, filename):
         return task
     if kind == "long_context":
         needle = task.get("needle")
-        if not needle or not isinstance(needle, str):
+        needles = task.get("needles")
+        if needles is not None:
+            # (v24, item 12): several needles in one document,
+            # each at its own depth — one needle at one depth is
+            # a coin flip, not a measurement.
+            if (not isinstance(needles, list) or len(needles) < 2
+                    or not all(isinstance(n, str) and n for n in needles)):
+                warnings.append(f"{filename}: task {task_id} needs a needles list of two or more sentences, skipped")
+                return None
+            positions = task.get("positions")
+            if positions is not None and (
+                    not isinstance(positions, list)
+                    or len(positions) != len(needles)
+                    or any(p not in ("start", "middle", "end")
+                           for p in positions)):
+                warnings.append(f"{filename}: task {task_id} needs one position per needle (start/middle/end), skipped")
+                return None
+        elif not needle or not isinstance(needle, str):
             warnings.append(f"{filename}: task {task_id} needs a needle sentence, skipped")
             return None
         context_length = task.get("context_length")
@@ -3952,6 +4526,34 @@ def _validate_task(task, template_id, warnings, filename):
     # kind == "generate": one prompt, one text rule.
     if not _validate_text_rule(task, template_id, warnings, filename):
         return None
+    variants = task.get("variants")
+    if variants is not None:
+        # (v24, item 5): alternate versions of this task, one per
+        # repeat, so a repeat measures the same skill on fresh
+        # content instead of the memorized question. A variant is
+        # a partial task (prompt, expected, steps...) merged over
+        # this one. A bad variant drops the whole variants list
+        # with a warning — the base task still runs.
+        ok = isinstance(variants, list) and bool(variants)
+        if ok:
+            for variant in variants:
+                if not isinstance(variant, dict) \
+                        or not isinstance(variant.get("prompt"), str) \
+                        or not variant.get("prompt"):
+                    ok = False
+                    break
+                merged = dict(task)
+                merged.update(variant)
+                merged.pop("variants", None)
+                if not _validate_text_rule(
+                        merged, template_id, [], filename):
+                    ok = False
+                    break
+        if not ok:
+            warnings.append(
+                f"{filename}: task {task_id} has bad variants, ignored")
+            task = dict(task)
+            task.pop("variants", None)
     return task
 
 
@@ -3994,11 +4596,29 @@ def load_templates(templates_dir=None):
         if not name or not isinstance(name, str):
             warnings.append(f"{filename}: skipped, no template name")
             continue
-        num_predict = data.get("num_predict", 200)
+        # (v23): -1 is the no-cap sentinel and passes through
+        # unclamped; a missing or non-integer value defaults to
+        # -1 too (no cap by default). Positive values keep the
+        # 16..4096 clamp they have always had.
+        num_predict = data.get("num_predict", NO_CAP)
         if not isinstance(num_predict, int) or isinstance(num_predict, bool):
-            num_predict = 200
-        num_predict = max(16, min(4096, num_predict))
+            num_predict = NO_CAP
+        if num_predict != NO_CAP:
+            num_predict = max(16, min(4096, num_predict))
         scored = data.get("scored", True)
+        # (v24, item 5): a scored template runs REPEATS times per
+        # model and reports the average — one run of five questions
+        # is a coin flip, three runs of ten is a measurement. The
+        # template may declare "repeats"; the default is
+        # DEFAULT_REPEATS. A bad value falls back to the default
+        # with a warning, never a dropped template.
+        repeats = data.get("repeats", DEFAULT_REPEATS)
+        if not isinstance(repeats, int) or isinstance(repeats, bool):
+            warnings.append(
+                f"{filename}: bad repeats {repeats!r}, "
+                f"using {DEFAULT_REPEATS}")
+            repeats = DEFAULT_REPEATS
+        repeats = max(1, min(10, repeats))
         # Capability: what a model needs to run this template. An
         # unknown capability drops the template with a warning — a
         # typo must never silently run a vision template on text models.
@@ -4014,6 +4634,7 @@ def load_templates(templates_dir=None):
             "description": data.get("description", ""),
             "num_predict": num_predict,
             "scored": bool(scored),
+            "repeats": repeats if scored else 1,
             "capability": capability,
             "filename": filename,
         }
@@ -4672,6 +5293,64 @@ def _not_run_suffix(count):
     return f", {count} not run"
 
 
+def _repeat_spread(run_data):
+    """(v24, item 10): the low–high spread of a run's per-repeat
+    scores, or None when the run did not repeat or fewer than two
+    repeats scored. A percentage on its own hides how much the
+    repeats disagreed; the spread shows it."""
+    if (run_data.get("repeats") or 1) <= 1:
+        return None
+    scores = [s for s in (run_data.get("repeat_scores") or [])
+              if s is not None]
+    if len(scores) < 2:
+        return None
+    return min(scores), max(scores)
+
+
+def _model_info_line(info):
+    """(v24, item 9): one line naming what was measured —
+    quantization, parameter size, digest, temperature, thinking —
+    with "not reported" wherever the source reported nothing."""
+    if not isinstance(info, dict):
+        return None
+
+    def _shown(value):
+        return value if value else "not reported"
+
+    thinking = "on" if info.get("thinking") else "off"
+    return (
+        f"Model: quant {_shown(info.get('quantization'))}, "
+        f"size {_shown(info.get('parameter_size'))}, "
+        f"digest {_shown(info.get('digest'))}, "
+        f"temperature {info.get('temperature', TEMPERATURE)}, "
+        f"thinking {thinking}"
+    )
+
+
+def _refusal_split_lines(run_data):
+    """(v24, item 8): the refusal template's two halves as lines —
+    how often the model refused the harmful requests, and how
+    often it answered the harmless ones. The blended score alone
+    hides which half failed."""
+    split = run_data.get("refusal_split")
+    if not split:
+        return []
+    lines = []
+    harmful = split.get("refuses_harmful")
+    if harmful:
+        lines.append(
+            f"Refuses harmful requests: {harmful['score']:.0f}% "
+            f"({harmful['passed']}/{harmful['total']})"
+        )
+    harmless = split.get("answers_harmless")
+    if harmless:
+        lines.append(
+            f"Answers harmless requests: {harmless['score']:.0f}% "
+            f"({harmless['passed']}/{harmless['total']})"
+        )
+    return lines
+
+
 def render_run_summary(run_data):
     """Plain-text summary of one run file, for the history view."""
     lines = [
@@ -4680,9 +5359,16 @@ def render_run_summary(run_data):
         f"System: {run_data.get('system_id', '?')}",
         f"Provider: {run_data.get('provider', 'ollama')}",
     ]
+    info_line = _model_info_line(run_data.get("model_info"))
+    if info_line:
+        lines.append(info_line)
     score = run_data.get("template_score")
     not_run = run_data.get("not_run", 0) or 0
-    if score is None and not_run:
+    if run_data.get("not_measured"):
+        # (v24, item 3): the server died and the template could
+        # not be measured — that is stated, never shown as a score.
+        lines.append("Score: not measured - server died")
+    elif score is None and not_run:
         reason = _not_run_reason(run_data)
         suffix = f": {reason}" if reason else ""
         lines.append(
@@ -4694,14 +5380,25 @@ def render_run_summary(run_data):
     else:
         # v17: a speed-scored run counts lengths, not tasks.
         noun = "lengths" if run_data.get("score_by") == "speed" else "tasks"
-        lines.append(
+        line = (
             f"Score: {score:.0f}% ({run_data.get('passed', '?')}/{run_data.get('total', '?')} {noun}"
             f"{_not_run_suffix(not_run)})"
         )
-    if run_data.get("errored"):
+        spread = _repeat_spread(run_data)
+        if spread is not None:
+            # (v24, item 10): the average never stands alone —
+            # the repeats' low–high spread stands next to it.
+            line += (
+                f" - average of {run_data.get('repeats')} repeats, "
+                f"{spread[0]:.0f}–{spread[1]:.0f}%"
+            )
+        lines.append(line)
+    if run_data.get("errored") and not run_data.get("not_measured"):
         lines.append(
             f"Run stopped early: {run_data.get('error', 'Ollama stopped responding')}"
         )
+    for split_line in _refusal_split_lines(run_data):
+        lines.append(split_line)
     budget_stopped = run_data.get("budget_stopped", 0) or 0
     if budget_stopped:
         lines.append(
@@ -5045,10 +5742,22 @@ def render_text_report(results):
             lines.append("")
             continue
         lines.append(f"  Overall score: {fmt_score(result.get('overall_score'))}")
+        if result.get("incomplete"):
+            # (v24, item 3): part of this run could not be
+            # measured — the overall is the average of what was.
+            lines.append(
+                "  This run is incomplete: a template could not be "
+                "measured because the server died. The overall "
+                "score is the average of the templates that were "
+                "measured."
+            )
         lines.append(
             f"  Avg decode speed: {fmt_toks(result.get('avg_decode_tok_s'))} tokens per second"
         )
         lines.append(f"  Size in RAM: {fmt_bytes(result.get('size_ram'))}")
+        info_line = _model_info_line(result.get("model_info"))
+        if info_line:
+            lines.append(f"  {info_line}")
         if result.get("total_tokens") is not None:
             lines.append(
                 f"  Tokens: {fmt_tokens(result.get('prompt_tokens'))} in, "
@@ -5068,7 +5777,13 @@ def render_text_report(results):
             score = run.get("template_score")
             not_run = run.get("not_run", 0) or 0
             budget_stopped = run.get("budget_stopped", 0) or 0
-            if score is None and not_run:
+            if run.get("not_measured"):
+                # (v24, item 3): stated plainly, never a number.
+                lines.append(
+                    f"  {run.get('template_name', template_id)}: "
+                    "not measured - server died"
+                )
+            elif score is None and not_run:
                 reason = _not_run_reason(run)
                 suffix = f": {reason}" if reason else ""
                 lines.append(
@@ -5096,6 +5811,13 @@ def render_text_report(results):
                     f"{_not_run_suffix(not_run)}), "
                     f"{fmt_toks(run.get('avg_decode_tok_s'))} tok/s"
                 )
+                spread = _repeat_spread(run)
+                if spread is not None:
+                    # (v24, item 10): the repeats' spread next to
+                    # the average.
+                    line += (
+                        f", repeats {spread[0]:.0f}–{spread[1]:.0f}%"
+                    )
                 if budget_stopped:
                     line += (
                         f", time budget reached "
@@ -5103,7 +5825,9 @@ def render_text_report(results):
                         f"{'task' if budget_stopped == 1 else 'tasks'} stopped)"
                     )
                 lines.append(line)
-            if run.get("errored"):
+            for split_line in _refusal_split_lines(run):
+                lines.append(f"    {split_line}")
+            if run.get("errored") and not run.get("not_measured"):
                 lines.append(
                     f"    Run stopped early: "
                     f"{run.get('error', 'Ollama stopped responding')}"
@@ -5122,6 +5846,9 @@ def template_score_text(run):
     next to the number."""
     if run.get("skipped"):
         return "not eligible"
+    if run.get("not_measured"):
+        # (v24, item 3): the server died — stated, never a number.
+        return "not measured - server died"
     score = run.get("template_score")
     not_run = run.get("not_run", 0) or 0
     budget_stopped = run.get("budget_stopped", 0) or 0
@@ -5132,6 +5859,17 @@ def template_score_text(run):
     if score is None:
         return "no scoring"
     text = f"{score:.0f}%"
+    # (v24, item 10): when repeats ran, the count and the spread
+    # stand next to the average.
+    if (run.get("repeats") or 1) > 1:
+        spread = _repeat_spread(run)
+        if spread is not None:
+            text += (
+                f" ({run.get('passed')}/{run.get('total')}, "
+                f"repeats {spread[0]:.0f}–{spread[1]:.0f}%)"
+            )
+        else:
+            text += f" ({run.get('passed')}/{run.get('total')})"
     if budget_stopped:
         text += " (time budget reached)"
     return text
@@ -5325,6 +6063,10 @@ def format_capabilities(capabilities):
     worth knowing.
     """
     shown = [c for c in CAPABILITIES if c != "text" and c in capabilities]
+    # (v24): thinking is not in CAPABILITIES (no template gates on
+    # it), but it is worth knowing from the list, so it shows last.
+    if "thinking" in capabilities and "thinking" not in shown:
+        shown.append("thinking")
     if not shown:
         return ""
     return " [" + ", ".join(shown) + "]"
@@ -5362,6 +6104,10 @@ def provider_target(provider, model_entry):
         "label": provider_label(provider["name"], model_entry["id"]),
         "kind": "provider",
         "model": model_entry["id"],
+        # (v24, item 9): the raw model entry, so a run can record
+        # what the provider reports about the model (quantization,
+        # size, digest) — nothing where it reports nothing.
+        "model_entry": model_entry,
         "provider": provider,
         "provider_name": provider["name"],
         "price_input_per_1m": model_entry.get("price_input_per_1m"),
@@ -5411,6 +6157,93 @@ def _to_tool_definitions(tools):
     return definitions
 
 
+def _variant_task(task, repeat_index):
+    """(v24, item 5): the version of a task for one repeat. Repeat 0
+    is the task itself; later repeats use its authored variants in
+    order (wrapping), so the same skill is measured on fresh
+    content instead of the same memorized question. A task without
+    variants repeats unchanged."""
+    variants = task.get("variants")
+    if not variants or repeat_index <= 0:
+        return task
+    variant = variants[(repeat_index - 1) % len(variants)]
+    merged = dict(task)
+    merged.update(variant)
+    merged["id"] = task["id"]
+    if "kind" in task:
+        merged["kind"] = task["kind"]
+    merged.pop("variants", None)
+    return merged
+
+
+def _score_records(records):
+    """(score, passed, total) for one set of task records — the
+    rules every score in this app follows: not-run and
+    budget-stopped tasks count in neither the numerator nor the
+    denominator; the score is over credits (M4: a task with steps
+    earns a fraction per part right); passed is the credit sum,
+    whole when nothing was partial; no tasks ran means no score."""
+    ran = [t for t in records
+           if not is_not_run(t) and not is_budget_stopped(t)]
+    credit_sum = sum(
+        t.get("credit", 1.0 if t["passed"] is True else 0.0) for t in ran
+    )
+    total = len(ran)
+    score = 100.0 * credit_sum / total if total else None
+    if total == 0:
+        passed = None
+    elif credit_sum == int(credit_sum):
+        passed = int(credit_sum)
+    else:
+        passed = credit_sum
+    return score, passed, total
+
+
+def _refusal_split(records):
+    """(v24, item 8): the refusal template's two honest halves —
+    how often the model refused the harmful requests, and how
+    often it answered the harmless ones. Each half is
+    {passed, total, score} over the tasks that ran, or None when
+    none of that half ran."""
+    def _part(want_harmful):
+        ran = [r for r in records
+               if bool(r.get("harmful")) == want_harmful
+               and r.get("passed") is not None]
+        if not ran:
+            return None
+        passed = sum(1 for r in ran if r["passed"] is True)
+        return {"passed": passed, "total": len(ran),
+                "score": 100.0 * passed / len(ran)}
+
+    return {"refuses_harmful": _part(True),
+            "answers_harmless": _part(False)}
+
+
+def _short_digest(digest):
+    """(v24, item 9): a model digest in short form —
+    "sha256:" plus the first twelve hex digits, the way git
+    shortens a hash. Anything that is not a string is not a
+    digest and stays None (never invented)."""
+    if not isinstance(digest, str) or not digest:
+        return None
+    if digest.startswith("sha256:"):
+        return "sha256:" + digest[7:19]
+    return digest[:19]
+
+
+def _tags_digest(model):
+    """The digest /api/tags lists for a model, or None. Used when
+    /api/show does not carry one."""
+    try:
+        data = http_get_json(ollama_base() + "/api/tags")
+    except OllamaError:
+        return None
+    for entry in (data or {}).get("models") or []:
+        if isinstance(entry, dict) and entry.get("name") == model:
+            return entry.get("digest")
+    return None
+
+
 class BenchWorker(QThread):
     model_started = Signal(str)
     template_done = Signal(str, dict, str)  # model, run data, file path
@@ -5453,6 +6286,17 @@ class BenchWorker(QThread):
         # fetched once when the run starts.
         self._models_folder = models_folder
         self._ollama_restarted = False
+        # (v24): how many times this run has tried to start
+        # Ollama again. A restart that SUCCEEDED ends all
+        # further attempts (_ollama_restarted); failed attempts
+        # are capped at 2 per run, so a per-call attempt that
+        # could not start Ollama leaves room for the one
+        # whole-template recovery attempt, and no more.
+        self._restart_attempts = 0
+        # (v24, item 9): the model facts for the model currently
+        # running, fetched once per model in run() and copied into
+        # every run file that model produces.
+        self._current_model_info = None
         self._model_sizes = {}
         self._total_steps = 0
         self._done_steps = 0
@@ -5538,7 +6382,7 @@ class BenchWorker(QThread):
         record["passed"] = None
         return record
 
-    def _call_once(self, target, prompt, num_predict):
+    def _call_once(self, target, prompt, num_predict, think=False):
         if target["kind"] == "provider":
             return provider_generate_once(
                 target["provider"], target["model"], prompt, num_predict,
@@ -5546,8 +6390,21 @@ class BenchWorker(QThread):
             )
         return generate_once(
             target["model"], prompt, num_predict, TEMPERATURE,
-            self._should_stop,
+            self._should_stop, think,
         )
+
+    def _attempt_restart(self):
+        """Start Ollama again, within this run's restart budget:
+        never after a restart already succeeded, and at most 2
+        attempts in total. Returns True when Ollama was started.
+        A successful start is recorded in _ollama_restarted."""
+        if self._ollama_restarted or self._restart_attempts >= 2:
+            return False
+        self._restart_attempts += 1
+        ok, _message = start_ollama_process(self._models_folder)
+        if ok:
+            self._ollama_restarted = True
+        return ok
 
     def _try_restart_ollama(self, target):
         """Restart a dead local Ollama once per run (v17). Returns
@@ -5561,17 +6418,92 @@ class BenchWorker(QThread):
             return False
         if not ollama_address_is_local():
             return False
-        if self._ollama_restarted:
+        if self._ollama_restarted or self._restart_attempts >= 2:
             return False
-        self._ollama_restarted = True
         percent = (int(100 * self._done_steps / self._total_steps)
                    if self._total_steps else 0)
         self.progress.emit("Ollama stopped, restarting it...", percent)
         log_event("Ollama stopped during the run; restarting it once.")
-        ok, _message = start_ollama_process(self._models_folder)
-        return ok
+        return self._attempt_restart()
 
-    def _generate(self, target, prompt, num_predict):
+    def _model_info(self, target):
+        """(v24, item 9): what was measured, recorded per model —
+        quantization level, parameter size and digest from
+        /api/show (the digest falls back to /api/tags), the run's
+        temperature, and whether the model can think. A provider
+        model reports what its model entry carries; anything it
+        does not carry stays None — "not reported", never
+        invented."""
+        info = {
+            "quantization": None,
+            "parameter_size": None,
+            "digest": None,
+            "temperature": TEMPERATURE,
+            "thinking": "thinking" in (target.get("capabilities") or []),
+        }
+        if target["kind"] == "ollama":
+            try:
+                data = ollama_show(target["model"])
+            except OllamaError:
+                data = None
+            if isinstance(data, dict):
+                details = data.get("details") or {}
+                info["quantization"] = details.get("quantization_level")
+                info["parameter_size"] = details.get("parameter_size")
+                info["digest"] = _short_digest(data.get("digest"))
+            if not info["digest"]:
+                info["digest"] = _short_digest(_tags_digest(target["model"]))
+        else:
+            entry = target.get("model_entry") or {}
+            info["quantization"] = entry.get("quantization")
+            info["parameter_size"] = entry.get("parameter_size")
+            info["digest"] = _short_digest(entry.get("digest"))
+        return info
+
+    def _recover_template(self, target, template, first_exc, steps_before):
+        """(v24, item 3): Ollama died mid-template. Restart it and
+        retry the WHOLE template once from the top — a dead server
+        must never print as a model's score.
+
+        Returns (run_data, path, recovered). When the retry runs,
+        recovered is True and the run carries on. When it cannot —
+        the address is not local, the restart fails, or the retry
+        dies too — run_data is the last attempt's record marked
+        not_measured (score None, still errored so Resume treats
+        the pair as unfinished) and recovered is False."""
+        last_data = getattr(first_exc, "run_data", None)
+        last_path = getattr(first_exc, "run_path", None)
+        # The recovery restart shares the run's restart budget
+        # (see _attempt_restart): a restart that already
+        # succeeded is never repeated, and failed attempts are
+        # capped — so a second death after a successful restart
+        # is not restarted again (v17's rule, kept).
+        if (target["kind"] == "ollama" and ollama_address_is_local()
+                and not self._ollama_restarted
+                and self._restart_attempts < 2):
+            self.progress.emit(
+                "Ollama stopped during "
+                f"{template['name']} - restarting it and running "
+                "the template again...", -1)
+            ok = self._attempt_restart()
+            if ok:
+                self._done_steps = steps_before
+                try:
+                    run_data, path = self._run_template(target, template)
+                    return run_data, path, True
+                except OllamaUnreachable as exc2:
+                    last_data = getattr(exc2, "run_data", None)
+                    last_path = getattr(exc2, "run_path", None)
+        if isinstance(last_data, dict):
+            marked = dict(last_data)
+            marked["not_measured"] = True
+            marked["score"] = None
+            marked["template_score"] = None
+            marked["passed"] = None
+            return marked, last_path, False
+        return None, None, False
+
+    def _generate(self, target, prompt, num_predict, think=False):
         """One generate call, retried once if the other end did not answer.
 
         A single dropped connection is often transient (Ollama was
@@ -5583,7 +6515,7 @@ class BenchWorker(QThread):
         tokens is a capture failure — retried once, then raised.
         """
         try:
-            metrics = self._call_once(target, prompt, num_predict)
+            metrics = self._call_once(target, prompt, num_predict, think)
         except (OllamaError, ProviderError) as exc:
             retryable = (
                 is_unreachable(exc)
@@ -5596,19 +6528,20 @@ class BenchWorker(QThread):
             if self._stop:
                 raise Cancelled()
             try:
-                metrics = self._call_once(target, prompt, num_predict)
+                metrics = self._call_once(target, prompt, num_predict, think)
             except OllamaError as exc2:
                 # v17: Ollama may have died loading the model (out of
                 # memory on a small box). Restart it once per run and
                 # try once more; if that fails, fail as before.
                 if (is_unreachable(exc2)
                         and self._try_restart_ollama(target)):
-                    metrics = self._call_once(target, prompt, num_predict)
+                    metrics = self._call_once(
+                        target, prompt, num_predict, think)
                 else:
                     raise
         return self._check_capture(
             target, metrics,
-            lambda: self._call_once(target, prompt, num_predict),
+            lambda: self._call_once(target, prompt, num_predict, think),
         )
 
     def _check_capture(self, target, metrics, call_again):
@@ -5651,11 +6584,13 @@ class BenchWorker(QThread):
             raise ProviderError(detail)
         raise OllamaError(detail)
 
-    def _call_chat(self, target, messages, num_predict, tools=None):
+    def _call_chat(self, target, messages, num_predict, tools=None,
+                   think=False):
         """One chat call (Ollama /api/chat or provider chat completions).
 
         Messages are in Ollama shape; provider calls convert the image
-        parts (see _to_provider_messages).
+        parts (see _to_provider_messages). (v24): think is an Ollama
+        option; provider calls have no equivalent here and ignore it.
         """
         if target["kind"] == "provider":
             return provider_chat_once(
@@ -5665,16 +6600,17 @@ class BenchWorker(QThread):
             )
         return chat_once(
             target["model"], messages, num_predict, TEMPERATURE,
-            tools, self._should_stop,
+            tools, self._should_stop, think,
         )
 
-    def _chat(self, target, messages, num_predict, tools=None):
+    def _chat(self, target, messages, num_predict, tools=None, think=False):
         """One chat call, retried once if the other end did not answer.
         (v21): a transient model error gets the same one retry, and
         an empty answer after real tokens is a capture failure —
         see _generate / _check_capture."""
         try:
-            metrics = self._call_chat(target, messages, num_predict, tools)
+            metrics = self._call_chat(target, messages, num_predict, tools,
+                                      think)
         except (OllamaError, ProviderError) as exc:
             retryable = (
                 is_unreachable(exc)
@@ -5688,19 +6624,20 @@ class BenchWorker(QThread):
                 raise Cancelled()
             try:
                 metrics = self._call_chat(target, messages, num_predict,
-                                          tools)
+                                          tools, think)
             except OllamaError as exc2:
                 # v17: same mid-run restart as _generate — Ollama may
                 # have died loading the model. Once per run, then fail.
                 if (is_unreachable(exc2)
                         and self._try_restart_ollama(target)):
                     metrics = self._call_chat(target, messages, num_predict,
-                                              tools)
+                                              tools, think)
                 else:
                     raise
         return self._check_capture(
             target, metrics,
-            lambda: self._call_chat(target, messages, num_predict, tools),
+            lambda: self._call_chat(target, messages, num_predict, tools,
+                                    think),
         )
 
     def _count_steps(self):
@@ -5733,11 +6670,12 @@ class BenchWorker(QThread):
         record["passed"] = None
         return record
 
-    def _task_generate(self, target, template, task, prompt):
+    def _task_generate(self, target, template, task, prompt, think=False):
         """One prompt in, one answer out (generate + long-context)."""
         label = target["label"]
         job_id = task["id"] if task is not None else "run"
-        metrics = self._generate(target, prompt, template["num_predict"])
+        metrics = self._generate(
+            target, prompt, template["num_predict"], think)
         if task is None:
             passed, detail = None, ""
         else:
@@ -5761,12 +6699,16 @@ class BenchWorker(QThread):
             "completion_tokens": metrics.get("completion_tokens"),
             "detail": detail,
         }
+        if metrics.get("loop_cut"):
+            # (v24): the answer was cut out of a runaway loop —
+            # the record says so, so the score can be read honestly.
+            record["loop_cut"] = True
         if task is not None and task.get("kind") == "long_context":
             record["context_tokens"] = task.get("context_length")
             record["prompt_chars"] = len(prompt)
         return record, None
 
-    def _task_chat(self, target, template, task):
+    def _task_chat(self, target, template, task, think=False):
         """A multi-turn task: each turn is sent with the full history
         so far, so a follow-up can only pass when the model remembers
         the earlier turns. A task passes when every scored turn passes."""
@@ -5781,11 +6723,14 @@ class BenchWorker(QThread):
         prompt_total = 0
         completion_total = 0
         saw_tokens = False
+        any_loop_cut = False
         for index, turn in enumerate(task["turns"]):
             if self._stop:
                 raise Cancelled()
             messages.append({"role": "user", "content": turn["prompt"]})
-            metrics = self._chat(target, messages, num_predict)
+            metrics = self._chat(target, messages, num_predict, think=think)
+            if metrics.get("loop_cut"):
+                any_loop_cut = True
             messages.append({"role": "assistant", "content": metrics["answer"]})
             if "rule" in turn:
                 passed, detail = score_task(turn, metrics["answer"])
@@ -5810,7 +6755,7 @@ class BenchWorker(QThread):
             })
             self._bump_progress(label, template, f"{task['id']} turn {index + 1}")
         last = turn_records[-1] if turn_records else {}
-        return {
+        record = {
             "id": task["id"],
             "prompt": task["turns"][0]["prompt"],
             "answer": last.get("answer", ""),
@@ -5824,9 +6769,12 @@ class BenchWorker(QThread):
                 t["detail"] for t in turn_records if t.get("detail")
             ),
             "turns": turn_records,
-        }, None
+        }
+        if any_loop_cut:
+            record["loop_cut"] = True
+        return record, None
 
-    def _task_vision(self, target, template, task):
+    def _task_vision(self, target, template, task, think=False):
         """Show the model an image and ask about it. Ollama takes the
         image base64 in the message; providers take an image_url part."""
         label = target["label"]
@@ -5847,10 +6795,11 @@ class BenchWorker(QThread):
             "content": task["prompt"],
             "images": [encoded],
         }]
-        metrics = self._chat(target, messages, template["num_predict"])
+        metrics = self._chat(
+            target, messages, template["num_predict"], think=think)
         passed, detail = score_task(task, metrics["answer"])
         self._bump_progress(label, template, task["id"])
-        return {
+        record = {
             "id": task["id"],
             "prompt": task["prompt"],
             "answer": _truncate_answer(metrics["answer"]),
@@ -5862,9 +6811,12 @@ class BenchWorker(QThread):
             "completion_tokens": metrics.get("completion_tokens"),
             "detail": detail,
             "image": task["image"],
-        }, None
+        }
+        if metrics.get("loop_cut"):
+            record["loop_cut"] = True
+        return record, None
 
-    def _task_tools(self, target, template, task):
+    def _task_tools(self, target, template, task, think=False):
         """Give the model tool definitions and check it calls the right
         one with the right arguments — or none at all, when the task
         needs no tool."""
@@ -5872,7 +6824,7 @@ class BenchWorker(QThread):
         messages = [{"role": "user", "content": task["prompt"]}]
         metrics = self._chat(
             target, messages, template["num_predict"],
-            _to_tool_definitions(task["tools"]),
+            _to_tool_definitions(task["tools"]), think=think,
         )
         tool_calls = metrics.get("tool_calls") or []
         answer = metrics.get("answer") or ""
@@ -5882,6 +6834,9 @@ class BenchWorker(QThread):
             # ({"name": ..., "arguments": {...}}). Parse it the same
             # way, so a correct call in text scores — and a call in
             # text on a no-tool task fails, as a native call would.
+            # (v24): the first complete structure wins (item 2), and
+            # an XML-written call counts too (item 7) — some models
+            # are trained to emit their calls as tagged XML.
             parsed = extract_json(answer)
             if (isinstance(parsed, dict)
                     and isinstance(parsed.get("name"), str)
@@ -5890,6 +6845,10 @@ class BenchWorker(QThread):
                     "name": parsed["name"],
                     "arguments": parsed["arguments"],
                 }]
+            else:
+                xml_call = _xml_tool_call(answer)
+                if xml_call is not None:
+                    tool_calls = [xml_call]
         if not tool_calls and not answer.strip():
             # (v21): no call and no answer is a failure, never a
             # pass — even when no tool was needed.
@@ -5897,7 +6856,7 @@ class BenchWorker(QThread):
         else:
             passed, detail = score_tool_call(task, tool_calls)
         self._bump_progress(label, template, task["id"])
-        return {
+        record = {
             "id": task["id"],
             "prompt": task["prompt"],
             "answer": _truncate_answer(metrics["answer"]),
@@ -5909,9 +6868,12 @@ class BenchWorker(QThread):
             "completion_tokens": metrics.get("completion_tokens"),
             "detail": detail,
             "tool_calls": tool_calls,
-        }, None
+        }
+        if metrics.get("loop_cut"):
+            record["loop_cut"] = True
+        return record, None
 
-    def _task_image(self, target, template, task):
+    def _task_image(self, target, template, task, repeat_index=0):
         """Ask a provider to generate an image. Passes when real image
         bytes come back; the image itself is saved next to the run file
         for Joshua to judge by eye. Ollama has no image endpoint, so an
@@ -5933,7 +6895,10 @@ class BenchWorker(QThread):
             raise
         wall_s = time.monotonic() - t_start
         self._bump_progress(label, template, task["id"])
-        filename = f"{task['id']}.{fmt}"
+        # (v24): a repeat's image gets its own file — the first
+        # repeat keeps the plain name the older runs used.
+        suffix = f"-r{repeat_index + 1}" if repeat_index else ""
+        filename = f"{task['id']}{suffix}.{fmt}"
         record = {
             "id": task["id"],
             "prompt": task["prompt"],
@@ -5952,7 +6917,7 @@ class BenchWorker(QThread):
         }
         return record, ("images", filename, raw, "image_file")
 
-    def _task_audio(self, target, template, task):
+    def _task_audio(self, target, template, task, repeat_index=0):
         """Audio tasks, provider-only. Transcribe: send a bundled clip
         and score the transcript's words. Speech: ask for spoken audio
         and check real audio bytes come back (saved next to the run)."""
@@ -6010,7 +6975,9 @@ class BenchWorker(QThread):
                 task["id"], task["prompt"], task,
                 "provider returned bytes that are not audio",
             ), None
-        filename = f"{task['id']}.mp3"
+        # (v24): a repeat's speech gets its own file, like images.
+        suffix = f"-r{repeat_index + 1}" if repeat_index else ""
+        filename = f"{task['id']}{suffix}.mp3"
         record = {
             "id": task["id"],
             "prompt": task["prompt"],
@@ -6027,7 +6994,8 @@ class BenchWorker(QThread):
         }
         return record, ("audio", filename, raw, "audio_file_saved")
 
-    def _run_scored_task(self, target, template, task):
+    def _run_scored_task(self, target, template, task, think=False,
+                         repeat_index=0):
         """Run one scored task by its kind. Returns (record, media).
 
         Media is (subfolder, filename, bytes, record-field) for a
@@ -6040,25 +7008,32 @@ class BenchWorker(QThread):
         kind = task.get("kind", "generate")
         try:
             if kind == "generate":
-                return self._task_generate(target, template, task, task["prompt"])
-            if kind == "long_context":
-                doc = build_long_document(
-                    task["needle"], task["context_length"],
-                    task.get("position", "middle"),
-                )
                 return self._task_generate(
-                    target, template, task, doc + "\n\n" + task["prompt"]
-                )
+                    target, template, task, task["prompt"], think)
+            if kind == "long_context":
+                if task.get("needles"):
+                    doc = build_multi_needle_document(
+                        task["needles"], task["context_length"],
+                        task.get("positions"),
+                    )
+                else:
+                    doc = build_long_document(
+                        task["needle"], task["context_length"],
+                        task.get("position", "middle"),
+                    )
+                return self._task_generate(
+                    target, template, task, doc + "\n\n" + task["prompt"],
+                    think)
             if kind == "chat":
-                return self._task_chat(target, template, task)
+                return self._task_chat(target, template, task, think)
             if kind == "vision":
-                return self._task_vision(target, template, task)
+                return self._task_vision(target, template, task, think)
             if kind == "tools":
-                return self._task_tools(target, template, task)
+                return self._task_tools(target, template, task, think)
             if kind == "image_gen":
-                return self._task_image(target, template, task)
+                return self._task_image(target, template, task, repeat_index)
             if kind == "audio":
-                return self._task_audio(target, template, task)
+                return self._task_audio(target, template, task, repeat_index)
         except OllamaError as exc:
             if is_unreachable(exc):
                 # Ollama itself went away: stop the whole run
@@ -6099,6 +7074,22 @@ class BenchWorker(QThread):
         num_predict = template["num_predict"]
         task_results = []
         media = []
+        # (v24, item 6): a thinking-capable model runs Reasoning
+        # and Math with thinking on; every other template, and
+        # every model without the capability, runs as before.
+        think = (
+            target["kind"] == "ollama"
+            and template["id"] in ("reasoning", "math")
+            and "thinking" in (target.get("capabilities") or [])
+        )
+        # (v24, item 5): a scored template runs its tasks this many
+        # times; the reported score is the average of the repeats
+        # and every repeat's score is kept in the run file.
+        # Unscored templates run once, as before.
+        repeats = template.get("repeats", 1) if template["scored"] else 1
+        repeat_records = []
+        repeat_scores = []
+        current_repeat = 0
         # The budget window starts when the template starts, per
         # (model, template) pair. Checked between jobs: a job already
         # running finishes, then the rest stop with "time budget
@@ -6114,22 +7105,50 @@ class BenchWorker(QThread):
         jobs = []
         try:
             if template["scored"]:
-                for index, task in enumerate(template["tasks"]):
-                    if self._stop:
-                        raise Cancelled()
-                    if self._budget_reached(started):
-                        budget_hit = True
-                        for remaining in template["tasks"][index:]:
-                            task_results.append(self._budget_result(
-                                remaining["id"], remaining.get("prompt", ""),
-                                remaining,
-                            ))
-                            self._bump_progress(label, template, remaining["id"])
+                for repeat_index in range(repeats):
+                    current_repeat = repeat_index
+                    records = []
+                    repeat_records.append(records)
+                    budget_stopped_repeat = False
+                    for index, task in enumerate(template["tasks"]):
+                        if self._stop:
+                            raise Cancelled()
+                        if self._budget_reached(started):
+                            budget_hit = True
+                            for remaining in template["tasks"][index:]:
+                                stopped = self._budget_result(
+                                    remaining["id"],
+                                    remaining.get("prompt", ""),
+                                    remaining,
+                                )
+                                stopped["repeat"] = repeat_index + 1
+                                if remaining.get("harmful"):
+                                    stopped["harmful"] = True
+                                records.append(stopped)
+                                task_results.append(stopped)
+                                self._bump_progress(
+                                    label, template, remaining["id"])
+                            budget_stopped_repeat = True
+                            break
+                        record, item = self._run_scored_task(
+                            target, template,
+                            _variant_task(task, repeat_index),
+                            think, repeat_index,
+                        )
+                        if item is not None:
+                            media.append(
+                                (task["id"], repeat_index) + item)
+                        # (v24): every record says which repeat it
+                        # came from; refusal records also carry the
+                        # harmful flag (item 8).
+                        record["repeat"] = repeat_index + 1
+                        if task.get("harmful"):
+                            record["harmful"] = True
+                        records.append(record)
+                        task_results.append(record)
+                    repeat_scores.append(_score_records(records)[0])
+                    if budget_stopped_repeat:
                         break
-                    record, item = self._run_scored_task(target, template, task)
-                    if item is not None:
-                        media.append((task["id"],) + item)
-                    task_results.append(record)
             else:
                 # Unscored: context lengths (Speed) or plain prompts.
                 if template.get("context_lengths"):
@@ -6214,15 +7233,26 @@ class BenchWorker(QThread):
             # ollama_down.
             errored = describe_error(exc)
             errored_exc = exc
-            done_ids = {t["id"] for t in task_results}
             if template["scored"]:
+                # (v24): only the repeat in progress is missing
+                # tasks — earlier repeats finished and keep their
+                # records as they are.
+                current_records = (
+                    repeat_records[-1] if repeat_records else [])
+                done_ids = {t["id"] for t in current_records}
                 for task in template["tasks"]:
                     if task["id"] not in done_ids:
-                        task_results.append(self._not_run_result(
+                        record = self._not_run_result(
                             task["id"], task.get("prompt", ""), task,
                             f"not run: {errored}",
-                        ))
+                        )
+                        record["repeat"] = current_repeat + 1
+                        if task.get("harmful"):
+                            record["harmful"] = True
+                        task_results.append(record)
+                        current_records.append(record)
             else:
+                done_ids = {t["id"] for t in task_results}
                 for job_id, prompt, extra in jobs:
                     if job_id not in done_ids:
                         record = self._not_run_result(
@@ -6241,22 +7271,43 @@ class BenchWorker(QThread):
         budget_stopped = sum(
             1 for t in task_results if is_budget_stopped(t)
         )
-        if template["scored"] or template.get("score_by") == "speed":
+        if template["scored"]:
+            # (v24, item 5): the score is the average of the
+            # repeats that produced one; passed/total count every
+            # repeat's tasks, so "(passed/total)" stays honest
+            # about how much actually ran.
+            scored_repeats = [s for s in repeat_scores if s is not None]
+            score = (sum(scored_repeats) / len(scored_repeats)
+                     if scored_repeats else None)
+            per_repeat = [_score_records(records)
+                          for records in repeat_records]
+            total = sum(entry[2] for entry in per_repeat)
+            passed_values = [entry[1] for entry in per_repeat
+                             if entry[1] is not None]
+            if not passed_values:
+                passed_count = None
+            else:
+                passed_sum = sum(passed_values)
+                passed_count = (int(passed_sum)
+                                if passed_sum == int(passed_sum)
+                                else passed_sum)
+            if errored is not None:
+                # (v21): the template did not finish — no score,
+                # however many tasks ran. A half-finished template
+                # has no score, and the profile keeps the last
+                # finished run as latest.
+                score = None
+                passed_count = None
+        elif template.get("score_by") == "speed":
             ran = [t for t in task_results
                    if not is_not_run(t) and not is_budget_stopped(t)]
-            if template.get("score_by") == "speed":
-                # v17: Speed scores decode speed, not answers — each
-                # context length earns a credit from its own tok/s,
-                # so a fast short run cannot mask a slow long one.
-                # Failed jobs earn 0; jobs that never ran stay out.
-                for t in ran:
-                    t["credit"] = speed_credit(t.get("decode_tok_s"))
-            # M4: the score is over credits, not passes — a task
-            # with steps earns a fraction per part right, so a
-            # half-right task counts half. Tasks without a credit
-            # field (older builders) count 1.0 for a pass, 0.0
-            # for a fail. "Passed" is the credit sum, whole when
-            # nothing was partial, so "(4.5/5)" reads true.
+            # v17: Speed scores decode speed, not answers — each
+            # context length earns a credit from its own tok/s,
+            # so a fast short run cannot mask a slow long one.
+            # Failed jobs earn 0; jobs that never ran stay out.
+            for t in ran:
+                t["credit"] = speed_credit(t.get("decode_tok_s"))
+            # M4: the score is over credits, not passes.
             credit_sum = sum(
                 t.get("credit", 1.0 if t["passed"] is True else 0.0)
                 for t in ran
@@ -6270,10 +7321,6 @@ class BenchWorker(QThread):
             else:
                 passed_count = credit_sum
             if errored is not None:
-                # (v21): the template did not finish — no score,
-                # however many tasks ran. A half-finished template
-                # has no score, and the profile keeps the last
-                # finished run as latest.
                 score = None
                 passed_count = None
         else:
@@ -6298,13 +7345,14 @@ class BenchWorker(QThread):
         path, folder, file_base = run_file_path(
             self.results_dir, label, self.sys_id, template["id"], stamp
         )
-        for task_id, subfolder, filename, blob, field in media:
+        for task_id, repeat_index, subfolder, filename, blob, field in media:
             media_dir = os.path.join(folder, f"{file_base}-{subfolder}")
             os.makedirs(media_dir, exist_ok=True)
             with open(os.path.join(media_dir, filename), "wb") as handle:
                 handle.write(blob)
             for record in task_results:
-                if record["id"] == task_id:
+                if (record["id"] == task_id
+                        and record.get("repeat", 1) == repeat_index + 1):
                     record[field] = f"{file_base}-{subfolder}/{filename}"
                     break
         run_data = {
@@ -6342,6 +7390,19 @@ class BenchWorker(QThread):
                 target["price_input_per_1m"], target["price_output_per_1m"],
             ),
         }
+        # (v24): what was actually measured, recorded with the
+        # run — thinking on/off for this model + template (item 6),
+        # the model facts from /api/show (item 9), the repeats
+        # behind the score (items 5 and 10), and the refusal
+        # template's two halves (item 8).
+        run_data["thinking"] = think
+        if self._current_model_info is not None:
+            run_data["model_info"] = dict(self._current_model_info)
+        if template["scored"]:
+            run_data["repeats"] = repeats
+            run_data["repeat_scores"] = list(repeat_scores)
+            if any(t.get("harmful") for t in template["tasks"]):
+                run_data["refusal_split"] = _refusal_split(task_results)
         # v17: a speed-scored run says so, so the summary can call
         # its items lengths instead of tasks.
         if template.get("score_by"):
@@ -6500,6 +7561,11 @@ class BenchWorker(QThread):
                 result["status"] = f"failed: {exc}"
                 self.model_done.emit(label, result)
                 continue
+            # (v24, item 9): the model facts, fetched once per
+            # model and copied into every run file it produces and
+            # into the run summary.
+            self._current_model_info = self._model_info(target)
+            result["model_info"] = self._current_model_info
             try:
                 mine = [t for t in self.templates
                         if self.pairs is None
@@ -6533,7 +7599,40 @@ class BenchWorker(QThread):
                         self._set_pair_status(
                             label, template["id"], "skipped")
                         continue
-                    run_data, path = self._run_template(target, template)
+                    steps_before = self._done_steps
+                    try:
+                        run_data, path = self._run_template(target, template)
+                    except OllamaUnreachable as exc:
+                        # (v24, item 3): Ollama died mid-template —
+                        # restart it and retry the whole template
+                        # once. Only when that cannot run is the
+                        # template recorded as not measured (never
+                        # as a score), the run is flagged incomplete,
+                        # and the run ends as before.
+                        run_data, path, recovered = self._recover_template(
+                            target, template, exc, steps_before)
+                        if not recovered:
+                            if run_data is not None:
+                                run_data["run_file"] = path
+                                result["templates"][template["id"]] = run_data
+                                result["incomplete"] = True
+                                self.template_done.emit(
+                                    label, run_data, path or "")
+                            # The overall is the average of the
+                            # templates that WERE measured — the
+                            # not-measured one has no score and
+                            # stays out of it (the report says so).
+                            measured = [
+                                r["template_score"]
+                                for r in result["templates"].values()
+                                if r.get("template_score") is not None
+                            ]
+                            if measured:
+                                result["overall_score"] = (
+                                    sum(measured) / len(measured))
+                            self.model_done.emit(label, result)
+                            self._end_run("ollama_down")
+                            return
                     result["templates"][template["id"]] = run_data
                     result["templates"][template["id"]]["run_file"] = path
                     # v17: done, with the run file recorded so a
@@ -7478,10 +8577,20 @@ def render_template_preview(template):
         lines.append(description)
     capability = template.get("capability", "text")
     scored = "scored" if template.get("scored", True) else "not scored"
-    lines.append(
-        f"Needs: {capability}. {scored}. "
-        f"Up to {template.get('num_predict', 200)} tokens per answer."
-    )
+    num_predict = template.get("num_predict", NO_CAP)
+    if num_predict is not None and num_predict >= 0:
+        cap_text = f"Up to {num_predict} tokens per answer."
+    else:
+        cap_text = "No cap on answer length."
+    lines.append(f"Needs: {capability}. {scored}. {cap_text}")
+    repeats = template.get("repeats", 1)
+    if template.get("scored", True) and repeats > 1:
+        # (v24, item 5): the preview says the template runs more
+        # than once — the run takes that much longer, and the
+        # score is the average.
+        lines.append(
+            f"Runs {repeats} times per model; the score is the average."
+        )
     tasks = template.get("tasks") or []
     lines.append("")
     lines.append(

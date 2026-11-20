@@ -1,19 +1,23 @@
 """A fake GitHub server for the v22 update tests.
 
 Serves the three endpoints the updater uses — the latest release,
-a commit's file list, and a tag's source archive — from two small
-crafted trees: a fake v22 install and a fake v23 release. The blob
-checksums are computed here with hashlib, independently of the
-updates module under test, so the verification checks prove the
-two agree rather than the module agreeing with itself.
+a commit's file list, and a tag's source archive — from small
+crafted trees: a fake v22 install and a fake v23 release for the
+updater unit tests, plus a fake v24 release so the window-level
+tests can run the same story one version up (the app itself is
+v23 now, so its "newer release" is v24). The blob checksums are
+computed here with hashlib, independently of the updates module
+under test, so the verification checks prove the two agree
+rather than the module agreeing with itself.
 
 The server records every request path (server.requests), so a test
 can prove a declined update downloaded nothing. Configure it
-through start_fake_github: latest_tag ("v22" or "v23"), tamper
-(serve a v23 archive with one file changed, while the file list
-still names the original bytes — verification must refuse it),
-no_commit (the release names no commit, so the pull must refuse
-before downloading), and latest_body (the release notes).
+through start_fake_github: latest_tag ("v22", "v23" or "v24"),
+tamper (serve the latest archive with one file changed, while
+the file list still names the original bytes — verification must
+refuse it), no_commit (the release names no commit, so the pull
+must refuse before downloading), and latest_body (the release
+notes).
 """
 
 import hashlib
@@ -25,6 +29,7 @@ from urllib.parse import unquote, urlparse
 
 V22_COMMIT = "a" * 40
 V23_COMMIT = "b" * 40
+V24_COMMIT = "c" * 40
 
 FAKE_V22_FILES = {
     "ollama_system_test.py": (
@@ -44,6 +49,16 @@ FAKE_V23_FILES = {
     "templates/old.json": b'{"id": "old"}',
     "README.md": b"v23 readme\n",
     "run.sh": b"#!/bin/sh\necho v23\n",
+}
+
+FAKE_V24_FILES = {
+    "ollama_system_test.py": (
+        b'"""Fake OST v24."""\n__version__ = "24"\n'
+    ),
+    "new_file.txt": b"new in v24\n",
+    "templates/old.json": b'{"id": "old"}',
+    "README.md": b"v24 readme\n",
+    "run.sh": b"#!/bin/sh\necho v24\n",
 }
 
 # run.sh is executable in the fake trees, like a real script file.
@@ -109,7 +124,8 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
         server.requests.append(path)
         if path.endswith("/releases/latest"):
             tag = server.latest_tag
-            commit = V23_COMMIT if tag == "v23" else V22_COMMIT
+            commit = {"v24": V24_COMMIT, "v23": V23_COMMIT}.get(
+                tag, V22_COMMIT)
             payload = {
                 "tag_name": tag,
                 "html_url": (
@@ -123,7 +139,9 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
             return
         if "/git/trees/" in path:
             sha = path.rsplit("/git/trees/", 1)[1]
-            if sha in (V23_COMMIT, "v23"):
+            if sha in (V24_COMMIT, "v24"):
+                self._send_json(build_tree(FAKE_V24_FILES))
+            elif sha in (V23_COMMIT, "v23"):
                 self._send_json(build_tree(FAKE_V23_FILES))
             elif sha in (V22_COMMIT, "v22"):
                 self._send_json(build_tree(FAKE_V22_FILES))
@@ -132,7 +150,12 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
             return
         if "/zipball/refs/tags/" in path:
             tag = path.rsplit("/zipball/refs/tags/", 1)[1]
-            if tag == "v23":
+            if tag == "v24":
+                files = dict(FAKE_V24_FILES)
+                if server.tamper:
+                    files["README.md"] = b"tampered readme\n"
+                self._send_bytes(build_zipball(files, V24_COMMIT))
+            elif tag == "v23":
                 files = dict(FAKE_V23_FILES)
                 if server.tamper:
                     files["README.md"] = b"tampered readme\n"

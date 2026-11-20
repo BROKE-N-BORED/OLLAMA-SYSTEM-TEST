@@ -1,5 +1,103 @@
 # Changelog
 
+## v24 (2026-11-19)
+
+The accuracy release: the merged 12-item accuracy list from
+the Fara-1.5-4B deep-dive (26 of its 35 v16 "failures" were
+test problems, not model problems). Item 1 of the list is a
+clean re-test on this build — an action, not code — so this
+release builds items 2–12. It also carries v23's no-cap change
+(v23 was verified and packaged but never pushed; the two ship
+together).
+
+- Item 2 — runaway loops: the runner watches the streamed
+  answer for a repeated cycle, stops that generation early,
+  and grades what arrived; the record says the answer was
+  loop-cut. Structured-output and tool-call grading take the
+  FIRST complete structure and ignore trailing repetition.
+  A long, varied answer is never cut (proven in the suite).
+- Item 3 — a dead server is not a score: when Ollama dies
+  mid-template, the app restarts it and retries the whole
+  template once. If it still cannot run, the template's score
+  is "not measured — server died", the run is flagged
+  incomplete, and the overall averages the measured templates
+  only. The pair stays pending, so Resume retries it.
+- Item 4 — math grading reads the stated conclusion first:
+  "the answer is X", a bare final result line, and the last
+  "= X" all beat the numbers inside the working. The v21
+  layers stay as fallbacks.
+- Item 5 — every scored template has at least 10 tasks and
+  runs 3 times per model by default; the score is the
+  average and the per-repeat scores are recorded. Math and
+  Anchor tasks carry authored variants (different numbers,
+  same skill) for the later repeats. Run steps and time
+  estimates count the repeats.
+- Item 6 — models whose screening shows thinking support run
+  Reasoning and Math with thinking on; the run records it.
+  Other models and templates are untouched.
+- Item 7 — Structured Output parses first, then validates:
+  JSON, a fenced block, or an XML-tagged answer (fields as
+  tags, values coerced to the schema's types) all grade the
+  same. XML tool calls parse and score too.
+- Item 8 — Refusal reports two lines everywhere: "refuses
+  harmful" and "answers harmless", recorded per run.
+- Item 9 — every run records the model's quantization,
+  parameter size, and short digest from /api/show, plus the
+  run's temperature and thinking on/off, and prints them on
+  the summary. Provider models record what the provider
+  reports; anything unreported prints "not reported".
+- Item 10 — no naked percentages: every template score shows
+  its task count, and with repeats, the low–high spread next
+  to the average, in the summary, the detail view, and the
+  exported report.
+- Item 11 — a new Anchor template: 10 MMLU-style four-choice
+  knowledge questions and 10 GSM8K-style word problems,
+  original wording in the public style.
+- Item 12 — a harder top end: Coding gains multi-step and
+  two-function tasks (11 in all), Code Repair gains five
+  symptom-first tasks (a user's report, no error message),
+  Vision and Grounded QA gain questions over three new drawn
+  images (a bar chart, a data table, an app-window mock) and
+  the existing ones, and Long Context gains needles at the
+  start, middle, and end plus a two-needle task.
+
+One deliberate behaviour change to name: v21's pin "prose
+around a JSON answer fails schema grading" is gone — item 7
+replaces it. An answer whose first complete structure matches
+the schema now passes; trailing or surrounding prose is not
+the model's fault.
+
+## v23 (2026-11-19)
+
+The no-cap release: answer-length caps are gone from every
+scored test. A cap that cuts an answer off mid-thought scores
+the cut-off as the model's fault — the same harness distortion
+v21 removed from the graders. Ordered by Joshua on 2026-11-19;
+his evidence: FYRN wrote full pages at 6–7 seconds a token
+with no cap and no issue — models stop on their own.
+
+- All 18 scored templates run uncapped: an answer now runs
+  until the model stops or its own context window fills. That
+  window is the model's limit, not one the app imposes.
+  (Planning was capped at 500 tokens, most others at 300,
+  two at 200.)
+- Speed keeps its 200 — that number defines the measured
+  workload (decode speed over a fixed generation); it is not
+  a cap on an answer. Its preview still gives the "at most
+  about" upper estimate.
+- The template loader treats -1 as "no cap" and passes it
+  through untouched; a missing or unreadable num_predict now
+  defaults to no cap instead of 200. A positive cap in a
+  custom template still works and still clamps to 16..4096.
+- Provider calls send no max_tokens at all when a template
+  is uncapped (APIs reject a negative cap); capped calls
+  send it as before.
+- Estimates stay honest: an uncapped test's completion
+  estimate is "no cap" — the run preview says there is no
+  upper estimate, and why, instead of inventing a bound,
+  and a provider cost over an uncapped run shows as unknown
+  rather than a made-up number.
+
 ## v22 (2026-11-17)
 
 The update release: the app now checks its own GitHub repo for

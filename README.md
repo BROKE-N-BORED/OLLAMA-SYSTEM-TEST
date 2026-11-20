@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v22
+# OLLAMA SYSTEM TEST v24
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -9,15 +9,36 @@ weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
 
-v22 is the update release, no new templates: on launch the app
-silently checks its GitHub repo for a newer Release — up to date
-or unreachable, nothing happens; a newer Release exists, a popup
-says so and asks, and only on your tap does the app pull it. The
-pull is verified: every downloaded file is checked against the
-release's own git tree, and a tampered or incomplete download
-installs nothing. After the install a popup asks whether to
-restart now — Yes relaunches at once with the update, No leaves
-the running copy alone and the update takes effect next launch.
+v24 is the accuracy release: the scores now measure the model,
+not the test. Every scored template grows to at least 10 tasks
+and runs 3 times per model — the score is the average, with the
+low–high spread printed next to it, and some tasks change their
+numbers or names between repeats so a memorised answer does not
+help. A model that starts repeating itself is stopped and
+graded on its first complete answer; a model that answers in
+XML instead of JSON is understood, not failed; math grading
+reads the model's stated conclusion before the numbers in its
+working; and if Ollama dies mid-template the template restarts
+once — if it still cannot run it is marked "not measured —
+server died" instead of printing a fake score, and the run is
+flagged incomplete. Reasoning and Math switch thinking on for
+models that support it. Refusal reports two numbers — refuses
+harmful, answers harmless — and every score card prints the
+model's quant, size, and digest next to the score. A new Anchor
+template adds public-benchmark-style knowledge and math
+questions, and Coding, Code Repair, Vision, and Long Context
+all gain harder tasks. One pass is 225 prompts / 201 scored
+tasks; with the repeats, a full run asks each scored question
+three times. Your results, logs, providers, and settings are
+never touched.
+
+v23 is the no-cap release, no new templates: every scored test
+now lets a model write until it stops on its own (or its context
+window fills) — a plan or a code answer is no longer cut off at
+300 or 500 tokens and scored on the cut-off. Speed still
+generates a fixed 200 tokens, because there the count is the
+measurement itself. The run preview says "no cap" where that is
+true instead of quoting an upper estimate that does not exist.
 Your results, logs, providers, and settings are never touched,
 and Help → Check for updates runs the same check by hand.
 
@@ -244,8 +265,10 @@ remembered next time.
    starts, the app switches to the Run tab and each model runs each
    template in turn, one at a time.
    A full run (all templates, all models) takes a while — each model
-   answers 113 prompts (100 scored tasks, plus the extra turns in the
-   multi-turn and role-following templates, plus 3 speed runs), and
+   answers 225 prompts in one pass (201 scored tasks, plus the extra
+   turns in the multi-turn, role-following and coding chat templates,
+   plus the speed runs and the warmup), scored templates run three
+   passes each by default, and
    the 32K speed run takes minutes on a CPU by design — so start with
    one model or one template to get a feel for the speed, then run
    the rest. While it goes, a line under the progress bar shows the

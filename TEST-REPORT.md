@@ -1,3 +1,224 @@
+# TEST-REPORT — OLLAMA SYSTEM TEST v24
+
+Verified 2026-11-19 in a Linux sandbox (x86_64, PySide6 6.12.0,
+Python 3.12.3) under the Qt test env from AGENTS.md:
+QT_QPA_PLATFORM=offscreen for the suite, Xvfb + xcb for the GUI
+drive, LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-
+linux-gnu, venv ~/workspace/forge-v2-testenv/bin/python, default
+HOME, TMPDIR on tmpfs.
+
+v24 ships two releases in one. It carries v23 whole (the
+answer-length caps are off: every scored template at
+num_predict -1, Speed keeping its 200-token workload by
+design), and it builds the merged accuracy list, items 2-12
+(item 1 is a re-test run, not a build). A stream loop guard
+now cuts a runaway repeated answer and grades the first
+complete structure. A dead server can no longer print as a
+model's score: the worker restarts Ollama and retries the
+whole template once, and if that fails the template records
+"not measured - server died", the run flags itself
+incomplete, and the overall comes from the measured
+templates only. Math grading hears a stated conclusion
+before the fallback number picker. Every scored template
+grew to 10 tasks (Coding 11) and runs 3 repeats with
+generated variants where a task is mechanically variable;
+the reported score is the average, with the low-high spread
+printed beside the task count - no naked percentages.
+Reasoning and Math run with thinking on for models that
+screen as thinking-capable, and the card says so. Structured
+Output accepts JSON, a fenced block, or XML-tagged fields:
+structure is parsed first, then fields are validated. The
+refusal score splits into two reported lines, "refuses
+harmful" and "answers harmless". Every card prints the
+model facts from /api/show (quantization, parameter size,
+digest, temperature, thinking on or off). A new scored
+Anchor template carries 20 original questions in the public
+MMLU / GSM8K style. The top end got harder: symptom-first
+and multi-step tasks in Code Repair, vision over three new
+PIL-drawn images (a chart, a table, a UI screenshot), and
+long-context needles at the start, middle, and end plus one
+two-needle task.
+
+Verification. The build coordinator ended without a final
+report; Arlo verified from the tree as left. The prove-it
+re-grade of the five stored v16 result sets lands every
+model exactly on its v21 re-grade value (lfm3 78.2,
+bonsai-uncensored 85.0, qwen-coder 80.5, qwen3-vl 87.2,
+bonsai-2:4b 75.7) with six task flips, all designed: five
+fail-to-pass (four role-following tasks the new role rule
+grades properly, one vision task) and one pass-to-fail (an
+XML-written tool call on a no-tool task, now parsed and
+correctly failed - v21's pass was the blind spot). Four
+real app bugs were found by this verification and fixed in
+place: (1) the conclusion picker shrank "42" to "4" when
+the answer ended in bold markdown - the regex guard was
+defeated by the trailing asterisks; (2) schema grading
+coerced JSON strings to numbers, passing wrong-type
+answers - coercion is now XML-only, as the function's own
+docstring always said; (3) tasks stopped by the time
+budget vanished from run files entirely - they are now
+recorded with their reason; (4) the dead-server recovery
+restarted Ollama directly, bypassing the one-restart-per-
+run rule - restarts now share one budget (a restart that
+succeeded ends further attempts; failed attempts are
+capped at two per run). Bugs (3) and (4) are proven by
+dedicated probes written for them, both green after the
+fix. Test-side fixes, app untouched: the dedicated v24
+section built its end-to-end worker from an unscreened
+target, so its thinking checks could never pass - the
+target is now screened through /api/show exactly as the
+window builds it; a family of pins was updated to the
+grown templates' measured values (provider run 3,500 in /
+35,000 out on the suite's single-pass pin; step counts;
+compare percentages); the last em-dash string literals
+were hyphenated. The GUI drive (Xvfb 1366x768) passed all
+its checks: all 20 templates listed, the Anchor preview,
+the uncapped Planning preview, a real fake-server run at
+3 repeats with thinking recorded, the summary lines with
+quant, digest, thinking and the repeat spread, and both
+refusal split lines. Direct worker probes reconciled the
+provider accounting to the token (33 coding records over
+3 repeats; a full all-template provider run, 15 templates
+producing data, totals matching the detail sums).
+
+Run road (full suite, fresh copy each run, offscreen Qt
+env): five attempts, none end to end - the sandbox, not
+the app, ended each one. Run 1 was killed by a runtime
+restart at 619 passed / 29 failed (its failures were
+adjudicated into the fixes above). Run 2 crashed at
+791/19 when a sandbox write fault (intermittent EPERM on
+content writes, a known fault of this machine) stormed
+the install-test section. Run 3 reached 1604/32 and
+crashed on a v21 test stub that did not accept the new
+think argument (fixed in the test). Run 4 was killed by
+a runtime restart at 1029/0. Run 5 reached 1367/18
+before the write fault killed worker threads mid-run -
+the traceback shows PermissionError writing a coding
+solution file, and its failures all cascade from that
+window; the same sections passed cleanly in run 3. Every
+section before the suite's final one passed cleanly in
+at least one run. The final section - the 34 dedicated
+v24 checks - is self-contained (its own fake server, its
+own results dir), so it was run standalone from the same
+tree: 34 passed, 0 failed (log
+~/workspace/ost-v24-verify/v24-tail2.log). No single
+end-to-end pass exists; the coverage is the union of the
+five runs, the standalone tail, the GUI drive, and the
+probes, stated plainly rather than smoothed over.
+
+Known gaps, recorded not hidden: (a) carried from v22 -
+the updater cannot install new dependencies (no pip step,
+by design), the install is file-by-file rather than
+atomic, and the update pull has never run against the
+live GitHub API; the first real check happens on Joshua's
+PC. (b) NEW: v24 is the first release whose tree adds
+binary files (the three vision images) since the updater
+shipped; its verification was exercised against text
+trees and the fake GitHub server, so the first live pull
+on his PC exercises the binary path - the install zip is
+the fallback. (c) Uncapped generation and thinking mode
+are verified against the fake Ollama server only; real
+models, on his PC, are the real-PC verdict. (d) Item 1
+of the accuracy list - the clean re-test of the roster,
+Instruction and Structured Output first - is a run on
+this build, and belongs to the training thread.
+
+# TEST-REPORT — OLLAMA SYSTEM TEST v23
+
+Verified 2026-11-19 in a Linux sandbox (x86_64, PySide6 6.12.0,
+Python 3.12.3) under the Qt test env from AGENTS.md:
+QT_QPA_PLATFORM=offscreen for the suite, Xvfb + xcb for the GUI
+drive, LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-
+linux-gnu, venv ~/workspace/forge-v2-testenv/bin/python, default
+HOME, TMPDIR on tmpfs.
+
+v23 is the no-cap release. Every scored template shipped with
+an answer-length cap (num_predict 200–500; Planning 500, most
+others 300) — a cap that cuts an answer off mid-thought scores
+the cut-off as the model's fault, the same harness distortion
+v21 removed from the graders. Joshua ordered the caps off on
+2026-11-19; his evidence: FYRN wrote full pages at 6–7 s/token
+with no cap and no issue — models stop on their own. All 18
+scored templates now carry num_predict -1: generation runs
+until the model stops or its own context window fills — that
+window is the model's limit, not one the app imposes. Speed
+keeps 200: that number defines the measured workload (decode
+speed over a fixed generation), it is not a cap on an answer.
+The loader passes -1 through unclamped and now defaults a
+missing or unreadable num_predict to no cap (was 200);
+positive caps in custom templates still work and still clamp
+to 16..4096. The Ollama generate and chat paths pass -1 to
+the server untouched. Provider calls omit max_tokens entirely
+when uncapped (APIs reject a negative cap) and send it as
+before when capped. Estimates follow: an uncapped template's
+completion estimate is None — the run preview says there is
+no upper estimate, and why ("no answer cap"), and a provider
+cost over an uncapped run reports unknown instead of a
+made-up bound.
+
+Verification: the suite's v23 section (25 net new checks over
+v22's 1749) covers the loader (-1 passthrough, missing and
+non-integer defaulting to no cap, huge clamping to 4096, tiny
+to 16, in-range kept), the shipped files (all 18 scored
+templates at -1; Speed at 200 and unscored), Ollama
+pass-through on both the generate and chat paths against the
+fake server (the exact options the server recorded), the
+provider payload (max_tokens absent when uncapped, present
+at 64 when capped, both calls recorded), estimates (Planning
+completion None; Speed still 3 lengths x 200; an uncapped
+run's cost unknown and never negative), and the preview
+wording ("no cap" for Planning, the workload figure for
+Speed, no upper time estimate for an uncapped run). The GUI
+drive (~/workspace/ost-v23-verify/gui-drive-v23.py, Xvfb
+1366x768) went 20/20 (log ~/workspace/ost-v23-verify/
+gui-drive-v23.log, 4 shots in drive-shots/): the title says
+v23, the window fits the screen, Planning's template preview
+says "No cap on answer length.", Speed's names its 200-token
+workload, the uncapped run preview says there is no upper
+estimate and why, the Speed run preview keeps its "at most
+about" upper estimate, and Adjust starts no run in either
+case. Two drive-side defects were caught and fixed in the
+drive, not the app: the run-preview sections first ticked no
+model (model items carry capability badges in their text, so
+a tick by text matched nothing) — the app answered "Tick at
+least one model first.", exactly right; the drive now ticks
+through the item's role data.
+
+Run road (full suite, fresh copy each run, offscreen Qt env):
+run 1 cut short at 792/0 — the suite's install.sh subprocess
+hit its 600 s timeout under heavy machine load (a live
+benchmark shares this machine) and the uncaught
+TimeoutExpired ended the run; no failure recorded. Run 2
+reached 1767/0, then aborted on an uncaught
+ProviderUnreachable in the new v23 provider-payload checks:
+they reused the suite's first fake provider server, which an
+earlier section had already shut down (every other section
+starts its own). Fixed in the test — the v23 checks now start
+their own provider server like every other section; the app
+code was not touched (raising ProviderUnreachable for a dead
+server is the designed behavior). Run 3, on the fixed tree,
+is green: 1774 passed, 0 failed, zero QThread lines
+(log ~/workspace/ost-v23-verify/v23-run3.log). Total 1774
+checks: v22's 1749 all still run, plus 25 net new v23
+checks. The build coordinator errored on a runtime transport
+failure mid-verification (the same failure that hit v22's
+first coordinator); Arlo finished the verification from the
+tree as left — the test fix, runs 2–3, the drive, and this
+report.
+
+Known gaps, recorded not hidden: (a) uncapped generation is
+verified against the fake Ollama server only — a real model
+writing until it stops, on Joshua's PC, is his real-PC
+verdict, as it is for every OST version; a model that never
+stops is bounded only by its context window and the run's
+Cancel button — that is the point of the change, stated
+plainly; (b) v22's updater gaps carry over unchanged (no
+new-dependency installs, file-by-file install, skipped-
+version leftovers). Known stale artifact, unchanged: tests/
+make_templates.py (see the v21 report).
+
+---
+
 # TEST-REPORT — OLLAMA SYSTEM TEST v22
 
 Verified 2026-11-17 in a Linux sandbox (x86_64, PySide6 6.12.0, Python 3.12.3)

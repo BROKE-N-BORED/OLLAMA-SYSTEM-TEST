@@ -1,17 +1,22 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v22 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v24 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All 1651 v21 checks are carried over; the v22
-checks cover the silent update check and the verified pull: version
-parsing and comparison, the three check outcomes (newer, current,
-unknown) with stubbed network, the file-list fetch and blob
-checksums, download/extract/verify against a local fake GitHub
-server, install into a fake v22 folder (user data preserved, dropped
-files removed, stale bytecode gone), the restart command and a real
-execv, and the window flow — silent startup check, manual check,
-declined update downloads nothing, accepted update with restart
-declined leaves the old copy running while a fresh launch runs the
-new version, and restart Yes relaunches.
-1651 checks in total, all green (run 4).
+answers per model. All 1774 v23 checks are carried over (pins updated
+where v24 deliberately changes behavior — each is named in the v24
+section and the TEST-REPORT); the v24 checks cover the accuracy
+list: the loop guard (a runaway repeated answer is cut and graded
+on its first cycle; a long varied answer is never cut), dead-server
+handling (restart + whole-template retry, else "not measured —
+server died" and an incomplete run), conclusion-aware number
+picking, repeats (default 3, average + per-repeat scores + spread,
+authored variants), thinking on for thinking models on Reasoning
+and Math only, structured output in JSON/fenced/XML shapes, the
+refusal split, quant/settings on the run card, counts beside every
+score, the new Anchor template, and the harder top end (two-step
+and symptom-first coding, chart/table/UI vision, long-context
+needles at start/middle/end plus a two-needle task). The carried
+sections pin repeats to 1 (see the note at the first window) —
+they assert exact one-pass counts; the v24 section proves the
+repeats machinery itself with unpinned templates.
 
 The suite lives in the repo under tests/ and locates the app relative
 to the repo root (the parent of this folder), so it runs from any
@@ -372,7 +377,7 @@ def main():
 
     # ---------- unit tests: template loading ----------
     templates, warnings = app.load_templates()
-    check("19 templates load", len(templates) == 19, str([t["id"] for t in templates]))
+    check("20 templates load", len(templates) == 20, str([t["id"] for t in templates]))
     check("no warnings on shipped templates", not warnings, str(warnings))
     by_id = {t["id"]: t for t in templates}
     check("speed template unscored", by_id["speed"]["scored"] is False)
@@ -392,14 +397,20 @@ def main():
     check("image generation needs image generation",
           by_id["image_generation"].get("capability") == "image_generation")
     check("audio needs audio", by_id["audio"].get("capability") == "audio")
+    # (v24, item 5): every scored template grew to 10 tasks
+    # (coding 11 — it also carries the two-step chat task), and
+    # the anchor template joined with 20.
     for tid in ("multi_turn", "code_repair", "planning", "grounded_qa",
                 "summarization", "structured_output",
-                "role_following"):
-        check(f"{tid} has 5 tasks", len(by_id[tid]["tasks"]) == 5,
+                "role_following", "reasoning", "instruction", "knowledge"):
+        check(f"{tid} has 10 tasks", len(by_id[tid]["tasks"]) == 10,
               str(len(by_id[tid].get("tasks", []))))
-    for tid in ("coding", "reasoning", "instruction", "knowledge"):
-        check(f"{tid} has 5 tasks", len(by_id[tid]["tasks"]) == 5,
-              str(len(by_id[tid].get("tasks", []))))
+    check("coding has 11 tasks (10 + the two-step chat task)",
+          len(by_id["coding"]["tasks"]) == 11,
+          str(len(by_id["coding"].get("tasks", []))))
+    check("anchor has 20 tasks",
+          len(by_id["anchor"]["tasks"]) == 20,
+          str(len(by_id["anchor"].get("tasks", []))))
     check("math has 10 tasks (v16: grown from 5)",
           len(by_id["math"]["tasks"]) == 10,
           str(len(by_id["math"].get("tasks", []))))
@@ -411,8 +422,23 @@ def main():
               if t.get("expected") == "comply") == 5
           and sum(1 for t in by_id["refusal"]["tasks"]
                   if t.get("expected") == "refuse") == 5)
-    check("coding tasks are code rule",
-          all(t["rule"] == "code" for t in by_id["coding"]["tasks"]))
+    check("refusal harmful tasks carry the harmful flag (v24)",
+          sum(1 for t in by_id["refusal"]["tasks"] if t.get("harmful")) == 5
+          and all(t.get("harmful") for t in by_id["refusal"]["tasks"]
+                  if t.get("expected") == "refuse"))
+    check("coding generate tasks are code rule",
+          all(t["rule"] == "code" for t in by_id["coding"]["tasks"]
+              if t.get("kind", "generate") == "generate"))
+
+    # (v24): the carried sections were written for one pass per
+    # template and assert exact per-run counts. Pin repeats to 1
+    # on the suite-level template list, and (just before the
+    # first window) wrap load_templates the same way, so windows
+    # and later sections get one-pass templates too. The repeats
+    # machinery itself is proven by the v24 section at the end,
+    # which loads its templates unpinned.
+    for _t in templates:
+        _t["repeats"] = 1
 
     # ---------- unit tests: scoring, every rule type ----------
     check("contains pass",
@@ -574,14 +600,14 @@ def main():
     with open(os.path.join(TEMPLATES_TEST_DIR, "custom.json"), "w", encoding="utf-8") as handle:
         json.dump(custom, handle)
     loaded, warns = app.load_templates(TEMPLATES_TEST_DIR)
-    check("20th template loads from JSON",
-          len(loaded) == 20 and "custom" in [t["id"] for t in loaded],
+    check("21st template loads from JSON",
+          len(loaded) == 21 and "custom" in [t["id"] for t in loaded],
           str([t["id"] for t in loaded]))
     with open(os.path.join(TEMPLATES_TEST_DIR, "broken.json"), "w", encoding="utf-8") as handle:
         handle.write("{not valid json")
     loaded, warns = app.load_templates(TEMPLATES_TEST_DIR)
     check("corrupt template warned, others load",
-          len(loaded) == 20 and any("broken.json" in w for w in warns), str(warns))
+          len(loaded) == 21 and any("broken.json" in w for w in warns), str(warns))
     bad_rule = {
         "id": "badrule", "name": "Bad Rule", "scored": True,
         "tasks": [{"id": "t1", "prompt": "x", "rule": "telepathy", "expected": "y"}],
@@ -591,7 +617,7 @@ def main():
     loaded, warns = app.load_templates(TEMPLATES_TEST_DIR)
     check("bad rule task skipped, template dropped",
           "badrule" not in [t["id"] for t in loaded], str(warns))
-    check("broken files do not crash loader", len(loaded) == 20)
+    check("broken files do not crash loader", len(loaded) == 21)
 
     # ---------- fake server + direct client tests ----------
     server, _thread = fake_ollama.start_server()
@@ -626,14 +652,14 @@ def main():
     # ---------- v5: screening via /api/show ----------
     shown = app.ollama_show("fake-smart:2b")
     check("ollama_show returns capabilities",
-          shown.get("capabilities") == ["completion", "vision", "tools"],
+          shown.get("capabilities") == ["completion", "vision", "tools", "thinking"],
           str(shown.get("capabilities")))
     check("ollama_show returns model info",
           shown.get("model_info", {}).get("llama.context_length") == 131072,
           str(shown.get("model_info")))
     check("capabilities_from_show smart has vision, tools, long context",
           app.capabilities_from_show(shown)
-          == {"text", "vision", "tools", "long_context"},
+          == {"text", "vision", "tools", "long_context", "thinking"},
           str(app.capabilities_from_show(shown)))
     shown = app.ollama_show("fake-partial:3b")
     check("capabilities_from_show partial has vision, long context",
@@ -652,7 +678,7 @@ def main():
                "model_info": {"llama.context_length": 4096}}) == {"text"})
     check("screen_ollama_model reads the fake",
           app.screen_ollama_model("fake-smart:2b", {})
-          == {"text", "vision", "tools", "long_context"},
+          == {"text", "vision", "tools", "long_context", "thinking"},
           str(app.screen_ollama_model("fake-smart:2b", {})))
     # v18 (RV5): a failed screening returns None instead of the
     # cached value or text-only — the caller keeps the old cache
@@ -796,6 +822,19 @@ def main():
     _suite_real_preview = app.MainWindow._show_run_preview
     app.MainWindow._show_run_preview = lambda self, t, m, p=None: True
     app.RETRY_DELAY = 0.1
+    # (v24): see the repeats note at the loader checks — every
+    # template loaded from here on is pinned to one pass, so the
+    # carried sections keep their exact counts. The real loader
+    # stays reachable for the v24 section.
+    _real_load_templates24 = app.load_templates
+
+    def _load_templates_once24(*args, **kwargs):
+        loaded24, warns24 = _real_load_templates24(*args, **kwargs)
+        for _template24 in loaded24:
+            _template24["repeats"] = 1
+        return loaded24, warns24
+
+    app.load_templates = _load_templates_once24
     server.generate_count = 0
     server.fail_next_generate = True
     window_retry = app.MainWindow()
@@ -823,8 +862,8 @@ def main():
     os.environ["OST_TEMPLATES_DIR"] = TEMPLATES_TEST_DIR
     window0 = app.MainWindow()
     window0.show()
-    wait_until(lambda: window0.template_list.count() == 20, timeout=10, app=qt_app)
-    check("GUI lists 20th template", window0.template_list.count() == 20,
+    wait_until(lambda: window0.template_list.count() == 21, timeout=10, app=qt_app)
+    check("GUI lists 21st template", window0.template_list.count() == 21,
           str(window0.template_list.count()))
     check("GUI warns about broken templates",
           "badrule.json" in window0.status_label.text()
@@ -841,7 +880,7 @@ def main():
     wait_until(lambda: window.model_list.count() == 4, timeout=10, app=qt_app)
     check("window lists 4 models", window.model_list.count() == 4,
           str(window.model_list.count()))
-    check("window lists 19 templates", window.template_list.count() == 19,
+    check("window lists 20 templates", window.template_list.count() == 20,
           str(window.template_list.count()))
     check("run button enabled", window.run_button.isEnabled())
     check("no model checked by default", not checked_names(window.model_list),
@@ -871,7 +910,7 @@ def main():
     model_texts = {window.model_list.item(r).text()
                    for r in range(window.model_list.count())}
     check("screening labels the smart model with its capabilities",
-          "fake-smart:2b [vision, tools, long_context]" in model_texts,
+          "fake-smart:2b [vision, tools, long_context, thinking]" in model_texts,
           str(model_texts))
     check("screening labels the partial model with vision and long context",
           "fake-partial:3b [vision, long_context]" in model_texts,
@@ -887,7 +926,7 @@ def main():
             cache_data = json.load(handle)
         check("capabilities cache holds the screened models",
               cache_data.get("ollama", {}).get("fake-smart:2b")
-              == ["long_context", "text", "tools", "vision"]
+              == ["long_context", "text", "thinking", "tools", "vision"]
               and cache_data.get("ollama", {}).get("fake-dumb:1b") == ["text"],
               str(cache_data))
     check("no API key in the capabilities cache",
@@ -1000,7 +1039,7 @@ def main():
     model_texts = {window.model_list.item(r).text()
                    for r in range(window.model_list.count())}
     check("screen models: labels back after re-screening",
-          "fake-smart:2b [vision, tools, long_context]" in model_texts,
+          "fake-smart:2b [vision, tools, long_context, thinking]" in model_texts,
           str(model_texts))
 
     # Tick everything explicitly (v3 starts with nothing ticked).
@@ -1014,15 +1053,12 @@ def main():
     chat_images_before_full = server.chat_images_seen
     chat_tools_before_full = server.chat_tools_seen
     window.run_button.click()
-    # v21: 600 s, not 300. The full run grew to 113 prompts (the
-    # refusal template went 5 -> 10 tasks), and this wait is only
-    # how long the suite watches the run finish — the product has
-    # no such limit. Under the sustained load of a live benchmark
-    # on the same box, 300 s cut the run off at the third model
-    # (run 1: 24 checks failed, all cascading from this wait).
+    # v24: 900 s, not 600. The full run grew to 225 prompts per
+    # model (v21: 113), and this wait is only how long the suite
+    # watches the run finish — the product has no such limit.
     done = wait_until(
         lambda: window.worker is None and window.save_button.isEnabled(),
-        timeout=600, app=qt_app,
+        timeout=900, app=qt_app,
     )
     check("full run completes", done)
     check("status says Done", "Done." in window.status_label.text(),
@@ -1059,7 +1095,7 @@ def main():
 
     # Detail pane: smart selected by default (row 0).
     detail = window.detail_view.toPlainText()
-    check("detail shows smart coding 100%", "Coding: 100% (5/5)" in detail, detail[:400])
+    check("detail shows smart coding 100%", "Coding: 100% (11/11)" in detail, detail[:400])
     check("detail shows per-task pass", "pass  fibonacci" in detail, detail[:400])
     # v17: Speed scores now — smart's 20 tok/s is 100% on all 3 lengths.
     check("detail shows speed scored", "Speed: 100% (3/3), 20.0 tok/s" in detail, detail[:400])
@@ -1068,7 +1104,7 @@ def main():
     window.table.cellClicked.emit(dumb_row, 0)
     qt_app.processEvents()
     detail = window.detail_view.toPlainText()
-    check("detail shows dumb coding 0%", "Coding: 0% (0/5)" in detail, detail[:400])
+    check("detail shows dumb coding 0%", "Coding: 0% (0/11)" in detail, detail[:400])
     check("detail shows per-task fail", "fail  fibonacci" in detail, detail[:400])
 
     # Size in RAM recorded in the session results.
@@ -1081,7 +1117,7 @@ def main():
     # Run files on disk: 6 per working model, none for the broken one.
     smart_dir = os.path.join(RESULTS_DIR, "fake-smart_2b", sid)
     smart_files = sorted(os.listdir(smart_dir)) if os.path.isdir(smart_dir) else []
-    check("smart has 17 run files", len(smart_files) == 17, str(smart_files))
+    check("smart has 18 run files", len(smart_files) == 18, str(smart_files))
     broken_dir = os.path.join(RESULTS_DIR, "fake-broken_1b")
     check("broken model has no run files", not os.path.isdir(broken_dir))
     if smart_files:
@@ -1105,7 +1141,7 @@ def main():
     dumb_templates = window.results["fake-dumb:1b"]["templates"]
     smart_run = {tid: run for tid, run in smart_templates.items()
                  if "skipped" not in run}
-    check("smart ran 17 templates", len(smart_run) == 17,
+    check("smart ran 18 templates", len(smart_run) == 18,
           str(sorted(smart_run)))
     for tid in sorted(smart_run):
         run = smart_run[tid]
@@ -1117,14 +1153,21 @@ def main():
     check("partial skipped tools as not eligible",
           partial_templates.get("tool_calling", {}).get("skipped") == "not eligible",
           str(partial_templates.get("tool_calling")))
-    check("partial ran 16 templates", len(partial_run) == 16,
+    check("partial ran 17 templates", len(partial_run) == 17,
           str(sorted(partial_run)))
     for tid in sorted(partial_run):
         run = partial_run[tid]
         if run.get("template_score") is not None:
             # v16: math is 10 tasks now, partial gets 5 of them.
             # v17: Speed scores too — partial's 10 tok/s is 50%.
-            want16 = 50.0 if tid in ("math", "speed") else 60.0
+            # v24: coding is 6 of 11 for partial (the two-step
+            # chat task fails) — not a round number any more.
+            if tid == "coding":
+                want16 = 100.0 * 6 / 11
+            elif tid in ("math", "speed"):
+                want16 = 50.0
+            else:
+                want16 = 60.0
             check(f"partial {tid} {want16:.0f}%",
                   run["template_score"] == want16,
                   str(run.get("template_score")))
@@ -1136,7 +1179,7 @@ def main():
           dumb_templates.get("tool_calling", {}).get("skipped") == "not eligible")
     check("dumb skipped long context as not eligible",
           dumb_templates.get("long_context", {}).get("skipped") == "not eligible")
-    check("dumb ran 14 templates", len(dumb_run) == 14,
+    check("dumb ran 15 templates", len(dumb_run) == 15,
           str(sorted(dumb_run)))
     for tid in sorted(dumb_run):
         run = dumb_run[tid]
@@ -1189,11 +1232,11 @@ def main():
               [m.get("role") for m in code_word_turn2]
               == ["user", "assistant", "user"],
               str([m.get("role") for m in code_word_turn2]))
-    check("vision images reached the fake (10: smart 5 + partial 5)",
-          server.chat_images_seen == chat_images_before_full + 10,
+    check("vision images reached the fake (20: smart 10 + partial 10)",
+          server.chat_images_seen == chat_images_before_full + 20,
           f"delta {server.chat_images_seen - chat_images_before_full}")
-    check("tool calls reached the fake (5: smart only)",
-          server.chat_tools_seen == chat_tools_before_full + 5,
+    check("tool calls reached the fake (10: smart only)",
+          server.chat_tools_seen == chat_tools_before_full + 10,
           f"delta {server.chat_tools_seen - chat_tools_before_full}")
     speed_files = [f for f in os.listdir(smart_dir) if f.endswith("-speed.json")]
     check("smart has exactly 1 speed run file", len(speed_files) == 1,
@@ -1262,15 +1305,15 @@ def main():
         with open(txt_path, encoding="utf-8") as handle:
             txt = handle.read()
         check("txt has smart 100%", "Overall score: 100%" in txt)
-        check("txt has per-template line", "Coding: 100% (5/5)" in txt)
+        check("txt has per-template line", "Coding: 100% (11/11)" in txt)
         check("txt has failed model", "fake-broken:1b" in txt)
         with open(json_path, encoding="utf-8") as handle:
             data = json.load(handle)
         by_name = {m["name"]: m for m in data.get("models", [])}
         check("json smart overall 100.0",
               by_name.get("fake-smart:2b", {}).get("overall_score") == 100.0)
-        check("json smart has 17 templates",
-              len(by_name.get("fake-smart:2b", {}).get("templates", {})) == 17)
+        check("json smart has 18 templates",
+              len(by_name.get("fake-smart:2b", {}).get("templates", {})) == 18)
         shutil.copy(txt_path, os.path.join(VERIFY_DIR, "saved-report.txt"))
         shutil.copy(json_path, os.path.join(VERIFY_DIR, "saved-report.json"))
 
@@ -1307,8 +1350,8 @@ def main():
           f"width={window.history_model_combo.width()}")
     if smart_index is not None:
         window.history_model_combo.setCurrentIndex(smart_index)
-        wait_until(lambda: window.history_list.count() == 18, timeout=10, app=qt_app)
-        check("history lists 18 smart runs", window.history_list.count() == 18,
+        wait_until(lambda: window.history_list.count() == 19, timeout=10, app=qt_app)
+        check("history lists 19 smart runs", window.history_list.count() == 19,
               str(window.history_list.count()))
         coded_item = None
         for i in range(window.history_list.count()):
@@ -1381,11 +1424,11 @@ def main():
                   "w", encoding="utf-8") as handle:
             json.dump(late, handle)
     window.profile_regen_button.click()
-    wait_until(lambda: "Latest overall score: 88%" in window.profile_view.toPlainText(),
+    wait_until(lambda: "Latest overall score: 89%" in window.profile_view.toPlainText(),
                timeout=10, app=qt_app)
     prof_text = window.profile_view.toPlainText()
-    check("regenerated profile latest 88%",
-          "Latest overall score: 88%" in prof_text, prof_text[:500])
+    check("regenerated profile latest 89%",
+          "Latest overall score: 89%" in prof_text, prof_text[:500])
     check("regenerated profile best still 100%",
           "Best overall score: 100%" in prof_text, prof_text[:500])
     # The view renders markdown now (v11 R4), so the plain text has
@@ -1568,9 +1611,9 @@ def main():
     check("server-dies partial never attempted",
           row_for(window4, "fake-partial:3b") is None)
     smart_row = row_for(window4, "fake-smart:2b")
-    check("server-dies smart row failed with the hint",
+    check("server-dies smart row recovered by the retry (v24)",
           smart_row is not None
-          and table_text(window4, smart_row, 5) == "failed: " + app.UNREACHABLE_HINT,
+          and table_text(window4, smart_row, 5) == "done",
           table_text(window4, smart_row, 5) if smart_row is not None else "no row")
     window4.close()
     window4.deleteLater()
@@ -1730,7 +1773,7 @@ def main():
     check("CLI fallback lists both models",
           cli_names == {"cli-model-a:2b", "cli-model-b:1b"}, str(cli_names))
     check("CLI fallback status is the ready message",
-          window9.status_label.text() == "2 models found, 19 templates loaded. Ready.",
+          window9.status_label.text() == "2 models found, 20 templates loaded. Ready.",
           window9.status_label.text())
     check("CLI fallback run enabled", window9.run_button.isEnabled())
     window9.close()
@@ -1882,11 +1925,13 @@ def main():
     check("schema fenced JSON without the tag passes (v21)",
           app.score_schema('```\n{"name": "Ada", "age": 36}\n```',
                            person_schema)[0])
-    check("schema prose-wrapped JSON fails (strict)",
-          not app.score_schema('Here it is: {"name": "Ada", "age": 36}',
-                               person_schema)[0])
-    check("schema trailing text fails (strict)",
-          not app.score_schema('{"name": "Ada", "age": 36} done.', person_schema)[0])
+    check("schema prose-wrapped JSON grades its structure (v24)",
+          app.score_schema('Here it is: {"name": "Ada", "age": 36}',
+                           person_schema)[0])
+    check("schema trailing repetition grades the first structure (v24)",
+          app.score_schema('{"name": "Ada", "age": 36} '
+                           '{"name": "Ada", "age": 36}',
+                           person_schema)[0])
     check("schema invalid JSON fails",
           not app.score_schema("not json at all", person_schema)[0])
     check("schema array of integers passes",
@@ -2224,7 +2269,7 @@ def main():
     check("long-context task with a bad position skipped",
           "badlong" not in loaded_ids, str(loaded_ids))
     check("good templates still load beside the bad ones",
-          len(loaded) == 20, str(len(loaded)))
+          len(loaded) == 21, str(len(loaded)))
 
     # ---------- fake provider server + direct client tests ----------
     pserver, _t = fake_ollama.start_provider_server()
@@ -2569,9 +2614,14 @@ def main():
     set_checked_list(windowP.model_list, {"fake-provider / fake-gpt-smart"})
     set_checked_templates(windowP, {t["id"] for t in templates})
     windowP.run_button.click()
+    # v24: 900 s, not 300. The provider run grew with the
+    # templates (173 calls at the fake's simulated latency,
+    # ~2x the v21 run) and this machine is shared and loaded;
+    # the wait is only how long the suite watches — the
+    # product has no such limit.
     done = wait_until(
         lambda: windowP.worker is None and windowP.save_button.isEnabled(),
-        timeout=300, app=qt_app,
+        timeout=900, app=qt_app,
     )
     check("provider run completes", done)
     prow = row_for(windowP, "fake-provider / fake-gpt-smart")
@@ -2585,20 +2635,23 @@ def main():
         check("provider row has a measured speed",
               toks != "n/a" and float(toks) > 100, toks)
     detail = windowP.detail_view.toPlainText()
-    # v21: 1,780/17,800, not 1,680/16,800 — refusal grew 5 -> 10
-    # tasks, 5 more provider calls at 20 in / 200 out each.
-    check("detail shows 1,780 prompt tokens", "1,780 in" in detail, detail[:300])
-    check("detail shows 17,800 completion tokens", "17,800 out" in detail, detail[:300])
-    check("detail shows cost $0.01", "$0.01" in detail, detail[:300])
+    # v24: the run files sum to 3,500 in / 35,000 out (175
+    # calls over the eligible templates — this section's
+    # templates are pinned to 1 repeat, see the note at the
+    # first window), plus the warmup call's 20/200, which the
+    # detail totals include.
+    check("detail shows 3,520 prompt tokens", "3,520 in" in detail, detail[:300])
+    check("detail shows 35,200 completion tokens", "35,200 out" in detail, detail[:300])
+    check("detail shows cost $0.02", "$0.02" in detail, detail[:300])
     check("detail shows per-template tokens",
-          "100 in / 1,000 out" in detail, detail)
+          "200 in / 2,000 out" in detail, detail)
     check("detail shows per-template cost",
-          "Coding: 100% (5/5)" in detail and "$0.0006" in detail, detail)
+          "Coding: 100% (11/11)" in detail and "$0.0015" in detail, detail)
     check("detail says tokens include warmup",
           "includes warmup" in detail, detail[:300])
     provider_dir = os.path.join(RESULTS_DIR, "fake-provider_fake-gpt-smart", sid)
     provider_files = sorted(os.listdir(provider_dir)) if os.path.isdir(provider_dir) else []
-    check("provider model has 14 run files", len(provider_files) == 14,
+    check("provider model has 15 run files", len(provider_files) == 15,
           str(provider_files))
     coding_files = [f for f in provider_files if f.endswith("-coding.json")]
     if coding_files:
@@ -2610,12 +2663,12 @@ def main():
               and pdata.get("model") == "fake-provider / fake-gpt-smart",
               str({k: pdata.get(k) for k in ("provider", "provider_model", "model")}))
         check("provider run file records template tokens",
-              pdata.get("prompt_tokens") == 100
-              and pdata.get("completion_tokens") == 1000
-              and pdata.get("total_tokens") == 1100,
+              pdata.get("prompt_tokens") == 240
+              and pdata.get("completion_tokens") == 2400
+              and pdata.get("total_tokens") == 2640,
               str({k: pdata.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")}))
         check("provider run file records exact template cost",
-              pdata.get("estimated_cost_usd") == 0.000615,
+              pdata.get("estimated_cost_usd") == 0.001476,
               str(pdata.get("estimated_cost_usd")))
         check("provider run file keeps the system id",
               pdata.get("system_id") == sid, str(pdata.get("system_id")))
@@ -2633,12 +2686,14 @@ def main():
               "Latest overall score: 100%" in prof, prof[:500])
         check("provider profile names the provider",
               "Provider: fake-provider" in prof, prof[:300])
-        # v21: 1,760/17,600, not 1,660/16,600 — refusal grew 5 -> 10
-        # tasks (see the detail totals above).
+        # v24: 3,500/35,000 — the eligible templates grew
+        # (anchor added, every template at 10+ tasks; 175
+        # calls at 20 in / 200 out). Template runs only,
+        # no warmup.
         check("provider profile totals template tokens",
-              "Tokens used in template runs: 1,760 in, 17,600 out" in prof, prof)
+              "Tokens used in template runs: 3,500 in, 35,000 out" in prof, prof)
         check("provider profile totals template cost",
-              "Estimated cost in template runs: $0.01" in prof, prof)
+              "Estimated cost in template runs: $0.02" in prof, prof)
     windowP.grab().save(os.path.join(VERIFY_DIR, "screenshot-provider-results.png"))
 
     # ---------- Qt app: provider retry once ----------
@@ -2978,9 +3033,9 @@ def main():
             image_data = json.load(handle)
         image_folder = os.path.join(
             media_dir, image_files[0][:-5] + "-images")
-        check("image run file records 5 tasks",
-              len(image_data.get("tasks", [])) == 5)
-        check("image run file records all 5 passed",
+        check("image run file records 10 tasks",
+              len(image_data.get("tasks", [])) == 10)
+        check("image run file records all 10 passed",
               all(t.get("passed") for t in image_data.get("tasks", [])),
               str(image_data.get("tasks", [])))
         check("image tasks record their saved files",
@@ -2990,8 +3045,8 @@ def main():
               image_folder is not None and os.path.isdir(image_folder))
         if image_folder is not None and os.path.isdir(image_folder):
             saved_images = sorted(os.listdir(image_folder))
-            check("5 generated images saved",
-                  len(saved_images) == 5, str(saved_images))
+            check("10 generated images saved",
+                  len(saved_images) == 10, str(saved_images))
             check("saved images are valid PNGs",
                   all(app.image_info(open(os.path.join(image_folder, f), "rb").read())
                       is not None for f in saved_images),
@@ -3002,34 +3057,34 @@ def main():
                   encoding="utf-8") as handle:
             audio_data = json.load(handle)
         audio_folder = os.path.join(media_dir, audio_files[0][:-5] + "-audio")
-        check("audio run file records 5 tasks",
-              len(audio_data.get("tasks", [])) == 5)
-        check("audio run file records all 5 passed",
+        check("audio run file records 10 tasks",
+              len(audio_data.get("tasks", [])) == 10)
+        check("audio run file records all 10 passed",
               all(t.get("passed") for t in audio_data.get("tasks", [])),
               str(audio_data.get("tasks", [])))
         speech_tasks = [t for t in audio_data.get("tasks", [])
                         if t.get("audio_file_saved")]
         check("speech tasks record their saved files",
-              len(speech_tasks) == 2,
+              len(speech_tasks) == 7,
               str([t.get("id") for t in audio_data.get("tasks", [])]))
         check("generated audio folder exists",
               audio_folder is not None and os.path.isdir(audio_folder))
         if audio_folder is not None and os.path.isdir(audio_folder):
             saved_audio = sorted(os.listdir(audio_folder))
-            check("2 speech clips saved",
-                  len(saved_audio) == 2, str(saved_audio))
+            check("7 speech clips saved",
+                  len(saved_audio) == 7, str(saved_audio))
             check("saved clips are audio bytes",
                   all(app.is_audio_bytes(open(os.path.join(audio_folder, f), "rb").read())
                       for f in saved_audio),
                   str(saved_audio))
-    check("image endpoint hit 5 times by the run",
-          pserver.image_count == image_before + 5,
+    check("image endpoint hit 10 times by the run",
+          pserver.image_count == image_before + 10,
           f"delta {pserver.image_count - image_before}")
     check("transcribe endpoint hit 3 times by the run",
           pserver.transcribe_count == transcribe_before + 3,
           f"delta {pserver.transcribe_count - transcribe_before}")
-    check("speech endpoint hit 2 times by the run",
-          pserver.speech_count == speech_before + 2,
+    check("speech endpoint hit 7 times by the run",
+          pserver.speech_count == speech_before + 7,
           f"delta {pserver.speech_count - speech_before}")
     media_row = row_for(windowP, "media-provider / fake-gpt-smart")
     windowP.table.cellClicked.emit(media_row, 0)
@@ -3375,8 +3430,8 @@ def main():
         check("vision run has no score when nothing ran",
               vision_run.get("template_score") is None,
               str(vision_run.get("template_score")))
-        check("vision run counts 5 not run",
-              vision_run.get("not_run") == 5, str(vision_run.get("not_run")))
+        check("vision run counts 10 not run",
+              vision_run.get("not_run") == 10, str(vision_run.get("not_run")))
         check("vision run counts 0 ran",
               vision_run.get("passed") is None and vision_run.get("total") == 0,
               f"{vision_run.get('passed')}/{vision_run.get('total')}")
@@ -3384,15 +3439,15 @@ def main():
               all(t.get("passed") is None
                   and t.get("detail") == "not run: test image not found"
                   for t in vision_run.get("tasks", []))
-              and len(vision_run.get("tasks", [])) == 5,
+              and len(vision_run.get("tasks", [])) == 10,
               str(vision_run.get("tasks", [])))
         provider_result = window6.results.get(
             "v6-provider / fake-gpt-smart", {})
         audio_run = provider_result.get("templates", {}).get("audio", {})
         check("audio run scores only the tasks that ran",
               audio_run.get("template_score") == 100.0
-              and audio_run.get("passed") == 2
-              and audio_run.get("total") == 2,
+              and audio_run.get("passed") == 7
+              and audio_run.get("total") == 7,
               f"{audio_run.get('template_score')} "
               f"({audio_run.get('passed')}/{audio_run.get('total')})")
         check("audio run counts 3 not run",
@@ -3436,7 +3491,7 @@ def main():
         qt_app.processEvents()
         detail6p = window6.detail_view.toPlainText()
         check("detail view shows the partial not-run count",
-              "Audio: 100% (2/2, 3 not run)" in detail6p, detail6p)
+              "Audio: 100% (7/7, 3 not run)" in detail6p, detail6p)
         check("detail view marks the not-run transcribe tasks",
               "not run  transcribe-hello" in detail6p, detail6p)
         check("detail view shows the audio not-run reason",
@@ -3487,7 +3542,7 @@ def main():
                 qt_app.processEvents()
                 hist_summary_p = window6.history_view.toPlainText()
                 check("history summary shows the partial count",
-                      "Score: 100% (2/2 tasks, 3 not run)" in hist_summary_p,
+                      "Score: 100% (7/7 tasks, 3 not run)" in hist_summary_p,
                       hist_summary_p[:400])
         profile_path = os.path.join(
             RESULTS_DIR, "fake-smart_2b", "PROFILE.md")
@@ -3562,7 +3617,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 22", app.__version__ == "22",
+    check("__version__ is 24", app.__version__ == "24",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3576,8 +3631,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v22",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v22",
+    check("title bar shows OLLAMA SYSTEM TEST v24",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v24",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4135,10 +4190,16 @@ def main():
     templates8, _warnings8 = app.load_templates()
     by_id8 = {t["id"]: t for t in templates8}
     math_p8, math_c8 = app.estimate_template_tokens(by_id8["math"])
-    check("math estimate: completion is 10 tasks x num_predict",
-          math_c8 == 10 * by_id8["math"]["num_predict"], str(math_c8))
+    # (v23): math ships uncapped, so there is no completion
+    # estimate — None, never a fake number and never negative.
+    check("math estimate: completion is None (no answer cap)",
+          math_c8 is None, str(math_c8))
     check("math estimate: prompt tokens are positive and small",
           0 < math_p8 < 1000, str(math_p8))
+    capped_math8 = dict(by_id8["math"], num_predict=300)
+    _cm_p8, cm_c8 = app.estimate_template_tokens(capped_math8)
+    check("capped math estimate: completion is 10 tasks x num_predict",
+          cm_c8 == 10 * capped_math8["num_predict"], str(cm_c8))
     speed_p8, speed_c8 = app.estimate_template_tokens(by_id8["speed"])
     check("speed estimate: prompt tokens are the exact context lengths",
           speed_p8 == sum(by_id8["speed"]["context_lengths"]),
@@ -4151,8 +4212,13 @@ def main():
                        for t in by_id8["long_context"]["tasks"]),
           str(lc_p8))
     mt_p8, mt_c8 = app.estimate_template_tokens(by_id8["multi_turn"])
-    check("multi_turn estimate: completion is 5 tasks x 2 turns x num_predict",
-          mt_c8 == 5 * 2 * by_id8["multi_turn"]["num_predict"], str(mt_c8))
+    check("multi_turn estimate: completion is None (no answer cap)",
+          mt_c8 is None, str(mt_c8))
+    capped_mt8 = dict(by_id8["multi_turn"], num_predict=300)
+    _cmt_p8, cmt_c8 = app.estimate_template_tokens(capped_mt8)
+    check("capped multi_turn estimate: completion is "
+          "10 tasks x 2 turns x num_predict",
+          cmt_c8 == 10 * 2 * capped_mt8["num_predict"], str(cmt_c8))
     check("multi_turn estimate counts prompt tokens",
           mt_p8 > 0, str(mt_p8))
     check("image_generation estimates no text tokens",
@@ -4166,16 +4232,27 @@ def main():
         {"name": "v8-provider"},
         {"id": "fake-gpt-smart", "price_input_per_1m": 1000.0,
          "price_output_per_1m": 1000.0, "capabilities": ["text"]})
-    est8 = app.estimate_run_cost([priced8], [by_id8["math"]])
+    est8 = app.estimate_run_cost([priced8], [capped_math8])
     warm_p8 = (len(app.WARMUP_PROMPT) + 3) // 4
     expected8 = (
-        math_p8 + warm_p8 + math_c8 + app.WARMUP_PREDICT
+        math_p8 + warm_p8 + cm_c8 + app.WARMUP_PREDICT
     ) * 1000.0 / 1_000_000
     check("cost estimate matches the token math (warmup included)",
           abs(est8["total"] - expected8) < 1e-9, str(est8["total"]))
     check("cost estimate is over the $1.00 threshold at these prices",
           est8["total"] > app.COST_CONFIRM_THRESHOLD_USD,
           str(est8["total"]))
+    # (v23): the same model on the shipped (uncapped) math
+    # template has no cost estimate at all — unknown, listed
+    # under "uncapped", never under "unknown" (prices ARE saved).
+    est8n = app.estimate_run_cost([priced8], [by_id8["math"]])
+    check("uncapped template makes the cost unknown, never negative",
+          est8n["total"] is None
+          and est8n["per_model"][0]["cost"] is None
+          and est8n["per_model"][0]["completion_tokens"] is None
+          and est8n["uncapped"] == ["v8-provider / fake-gpt-smart"]
+          and est8n["unknown"] == [],
+          str(est8n))
     unpriced8 = app.provider_target(
         {"name": "v8-provider"},
         {"id": "fake-gpt-dumb", "capabilities": ["text"]})
@@ -4426,8 +4503,11 @@ def main():
             check("provider run shows its preview",
                   len(preview_calls8) == 1, str(len(preview_calls8)))
             if preview_calls8:
-                check("preview names the estimated cost",
-                      "$3.29" in preview_calls8[0], preview_calls8[0])
+                # (v23): math is uncapped now, so the preview
+                # cannot name a cost — it says why, plainly.
+                check("preview says the uncapped cost is unknown",
+                      "cost unknown: answers have no cap"
+                      in preview_calls8[0], preview_calls8[0])
                 check("preview names the model",
                       "v8-provider / fake-gpt-smart" in preview_calls8[0],
                       preview_calls8[0])
@@ -4649,7 +4729,7 @@ def main():
                 os.path.dirname(image_run8["path"]), f"{base8}-images")
             check("image_generation run saved a media folder",
                   os.path.isdir(media_dir8)
-                  and len(os.listdir(media_dir8)) == 5,
+                  and len(os.listdir(media_dir8)) == 10,
                   str(os.listdir(media_dir8))
                   if os.path.isdir(media_dir8) else "missing")
         audio_run8 = next(
@@ -4662,7 +4742,7 @@ def main():
                 os.path.dirname(audio_run8["path"]), f"{audio_base8}-audio")
             check("audio run saved a media folder",
                   audio_dir8 is not None and os.path.isdir(audio_dir8)
-                  and len(os.listdir(audio_dir8)) == 2,
+                  and len(os.listdir(audio_dir8)) == 7,
                   str(os.listdir(audio_dir8))
                   if audio_dir8 and os.path.isdir(audio_dir8) else "missing")
         window8.tabs.setCurrentIndex(3)
@@ -4819,7 +4899,7 @@ def main():
             check("export CSV carries the models and scores",
                   "fake-smart:2b" in csv_text8 and "100%" in csv_text8
                   and "fake-partial:3b" in csv_text8
-                  and "60%" in csv_text8,
+                  and "52%" in csv_text8,
                   csv_text8)
             check("export CSV has the template columns",
                   "Math" in csv_text8 and "Coding" in csv_text8, csv_text8)
@@ -4842,7 +4922,7 @@ def main():
             check("export HTML carries the models and scores",
                   "fake-smart:2b" in html_text8 and "100%" in html_text8
                   and "fake-partial:3b" in html_text8
-                  and "60%" in html_text8,
+                  and "52%" in html_text8,
                   html_text8[:500])
             check("export HTML carries no API key",
                   fake_ollama.PROVIDER_API_KEY not in html_text8)
@@ -4932,13 +5012,13 @@ def main():
               compare_cell8("Math", 1) == "100%"
               and compare_cell8("Math", 2) == "50%",
               f"{compare_cell8('Math', 1)} / {compare_cell8('Math', 2)}")
-        check("compare shows smart coding 100% vs partial 60%",
+        check("compare shows smart coding 100% vs partial 55%",
               compare_cell8("Coding", 1) == "100%"
-              and compare_cell8("Coding", 2) == "60%",
+              and compare_cell8("Coding", 2) == "55%",
               f"{compare_cell8('Coding', 1)} / {compare_cell8('Coding', 2)}")
         check("compare shows the overall rows",
               compare_cell8("Overall score", 1) == "100%"
-              and compare_cell8("Overall score", 2) == "55%",
+              and compare_cell8("Overall score", 2) == "52%",
               f"{compare_cell8('Overall score', 1)} / "
               f"{compare_cell8('Overall score', 2)}")
         check("compare shows the speed rows",
@@ -4993,15 +5073,15 @@ def main():
     wait_until(lambda: window9.model_list.count() == 4, timeout=10,
                app=qt_app)
     try:
-        check("v9 window lists 4 models and 19 templates",
+        check("v9 window lists 4 models and 20 templates",
               window9.model_list.count() == 4
-              and window9.template_list.count() == 19,
+              and window9.template_list.count() == 20,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v22",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v22",
+        check("title bar shows v24",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v24",
               window9.windowTitle())
-        check("__version__ is 22", app.__version__ == "22", app.__version__)
+        check("__version__ is 24", app.__version__ == "24", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -5021,7 +5101,7 @@ def main():
         qt_app.processEvents()
         check("model filter shows only matching models",
               visible_texts9(window9.model_list)
-              == ["fake-smart:2b [vision, tools, long_context]"],
+              == ["fake-smart:2b [vision, tools, long_context, thinking]"],
               str(visible_texts9(window9.model_list)))
         check("filter hides, never removes (model count unchanged)",
               window9.model_list.count() == 4,
@@ -5030,14 +5110,14 @@ def main():
         qt_app.processEvents()
         check("model filter matches the capability brackets in the text",
               visible_texts9(window9.model_list)
-              == ["fake-smart:2b [vision, tools, long_context]",
+              == ["fake-smart:2b [vision, tools, long_context, thinking]",
                   "fake-partial:3b [vision, long_context]"],
               str(visible_texts9(window9.model_list)))
         window9.model_filter.setText("SMART")
         qt_app.processEvents()
         check("model filter is case-insensitive",
               visible_texts9(window9.model_list)
-              == ["fake-smart:2b [vision, tools, long_context]"],
+              == ["fake-smart:2b [vision, tools, long_context, thinking]"],
               str(visible_texts9(window9.model_list)))
         window9.model_filter.setText("")
         qt_app.processEvents()
@@ -5047,14 +5127,14 @@ def main():
               visible_texts9(window9.template_list) == ["Math (10 tasks)"],
               str(visible_texts9(window9.template_list)))
         check("filter hides, never removes (template count unchanged)",
-              window9.template_list.count() == 19,
+              window9.template_list.count() == 20,
               str(window9.template_list.count()))
         window9.template_filter.setText("needs audio")
         qt_app.processEvents()
         check("template filter matches the full label text",
               len(visible_texts9(window9.template_list)) == 1
               and visible_texts9(window9.template_list)[0].startswith(
-                  "Audio (5 tasks)"),
+                  "Audio (10 tasks)"),
               str(visible_texts9(window9.template_list)))
         window9.template_filter.setText("")
         qt_app.processEvents()
@@ -5104,7 +5184,7 @@ def main():
         check("a filtered-in ineligible template shows greyed",
               len(visible_texts9(window9.template_list)) == 1
               and visible_texts9(window9.template_list)[0].startswith(
-                  "Vision (5 tasks)")
+                  "Vision (10 tasks)")
               and not vision9.flags() & Qt.ItemIsEnabled,
               str(visible_texts9(window9.template_list)))
         window9.template_filter.setText("")
@@ -5120,7 +5200,7 @@ def main():
                    app=qt_app)
         check("refresh keeps the model filter applied",
               visible_texts9(window9.model_list)
-              == ["fake-smart:2b [vision, tools, long_context]"],
+              == ["fake-smart:2b [vision, tools, long_context, thinking]"],
               str(visible_texts9(window9.model_list)))
         check("refresh keeps the template filter applied",
               visible_texts9(window9.template_list) == ["Math (10 tasks)"],
@@ -5188,8 +5268,8 @@ def main():
         # ---------- v9 T15: README fixes + repo hygiene -----------------
         readme9 = open(os.path.join(PKG_DIR, "README.md"),
                        encoding="utf-8").read()
-        check("README states 113 prompts",
-              "113 prompts" in readme9)
+        check("README states 225 prompts",
+              "225 prompts" in readme9)
         check("README no longer says roughly 80",
               "roughly 80" not in readme9)
         check("README shows the window screenshot",
@@ -5625,7 +5705,7 @@ def main():
                        for r in range(window12.installed_list.count())]
         check("models tab lists the installed Ollama models",
               len(installed12) == 4
-              and "fake-smart:2b [vision, tools, long_context]"
+              and "fake-smart:2b [vision, tools, long_context, thinking]"
               in installed12,
               str(installed12))
         check("installed list is read-only, no checkboxes",
@@ -5810,7 +5890,7 @@ def main():
     by_id13 = {t["id"]: t for t in templates}
     tgt13 = app.ollama_target("fake-smart:2b", ["text"])
     check("step count is warmup + tasks",
-          app.count_run_steps([tgt13], [by_id13["coding"]]) == 6,
+          app.count_run_steps([tgt13], [by_id13["coding"]]) == 13,
           str(app.count_run_steps([tgt13], [by_id13["coding"]])))
     check("step count covers the Speed context lengths",
           app.count_run_steps([tgt13], [by_id13["speed"]])
@@ -5834,11 +5914,20 @@ def main():
           app.latest_decode_speed(empty13, "fake-smart:2b") is None)
     pv13 = app.build_run_preview([tgt13], [by_id13["coding"]], empty13)
     check("preview names the model and template counts",
-          "1 model, 1 template, 6 steps in total." in pv13["text"],
+          "1 model, 1 template, 13 steps in total." in pv13["text"],
           pv13["text"])
-    check("preview says the time is an upper estimate",
-          "at most about" in pv13["text"]
-          and "upper estimate" in pv13["text"], pv13["text"])
+    # (v23): coding ships uncapped, so there is no upper time
+    # estimate to give — the preview says so, and seconds_upper
+    # is None rather than a number the run can sail past.
+    check("preview says there is no upper time estimate (no cap)",
+          "no upper estimate" in pv13["text"]
+          and "no answer cap" in pv13["text"], pv13["text"])
+    check("preview seconds_upper is None for an uncapped run",
+          pv13["seconds_upper"] is None)
+    pv13_cap = app.build_run_preview([tgt13], [by_id13["speed"]], empty13)
+    check("capped preview says the time is an upper estimate",
+          "at most about" in pv13_cap["text"]
+          and "upper estimate" in pv13_cap["text"], pv13_cap["text"])
     check("preview says local runs cost nothing",
           "nothing to pay" in pv13["text"], pv13["text"])
     check("preview total steps matches the counter",
@@ -5861,22 +5950,35 @@ def main():
           app.latest_decode_speed(past13, "fake-smart:2b") == 100.0,
           str(app.latest_decode_speed(past13, "fake-smart:2b")))
     pv13_fast = app.build_run_preview(
-        [tgt13], [by_id13["coding"]], past13)
+        [tgt13], [by_id13["speed"]], past13)
     check("a fast past run shortens the time estimate",
-          pv13_fast["seconds_upper"] < pv13["seconds_upper"],
+          pv13_fast["seconds_upper"] < pv13_cap["seconds_upper"],
           f"{pv13_fast['seconds_upper']:.1f} vs "
-          f"{pv13['seconds_upper']:.1f}")
+          f"{pv13_cap['seconds_upper']:.1f}")
     ptgt13 = {"label": "prov / m", "kind": "provider", "model": "m",
               "provider_name": "prov", "provider": {"name": "prov"},
               "capabilities": ["text"],
               "price_input_per_1m": 2.0, "price_output_per_1m": 8.0}
     pv13p = app.build_run_preview([ptgt13], [by_id13["math"]], empty13)
-    check("provider preview names the model and its cost",
-          "prov / m" in pv13p["text"] and "about $" in pv13p["text"],
+    # (v23): math is uncapped, so the priced provider preview
+    # names the model and says the cost is unknown — no cap
+    # means no token estimate.
+    check("provider preview names the model",
+          "prov / m" in pv13p["text"], pv13p["text"])
+    check("provider preview says the uncapped cost is unknown",
+          "cost unknown: answers have no cap" in pv13p["text"],
           pv13p["text"])
-    check("provider preview total is a number",
+    check("provider preview total is None when uncapped",
           pv13p["cost"] is not None
-          and pv13p["cost"]["total"] is not None)
+          and pv13p["cost"]["total"] is None)
+    capped_math13 = dict(by_id13["math"], num_predict=300)
+    pv13pc = app.build_run_preview([ptgt13], [capped_math13], empty13)
+    check("capped provider preview names the model and its cost",
+          "prov / m" in pv13pc["text"] and "about $" in pv13pc["text"],
+          pv13pc["text"])
+    check("capped provider preview total is a number",
+          pv13pc["cost"] is not None
+          and pv13pc["cost"]["total"] is not None)
     ptgt13u = dict(ptgt13, label="prov / u",
                    price_input_per_1m=None, price_output_per_1m=None)
     pv13u = app.build_run_preview([ptgt13u], [by_id13["math"]], empty13)
@@ -5983,7 +6085,7 @@ def main():
               "3 models, 2 templates" in window13.finish_label.text(),
               window13.finish_label.text())
         check("progress line keeps its final count",
-              "48 of 48 steps done" in window13.progress_detail.text(),
+              "69 of 69 steps done" in window13.progress_detail.text(),
               window13.progress_detail.text())
         row_smart13 = row_for(window13, "fake-smart:2b")
         row_partial13 = row_for(window13, "fake-partial:3b")
@@ -6803,7 +6905,7 @@ def main():
     steps15a = app.count_run_steps(
         [target_a15], [math15, coding15], pairs={("a:1b", "coding")})
     check("run steps count only the pairs in a re-run",
-          steps15a == 6, str(steps15a))
+          steps15a == 13, str(steps15a))
     steps15b = app.count_run_steps(
         targets15, [math15, coding15], pairs={("a:1b", "math")})
     check("run steps skip a target with no pairs in a re-run",
@@ -6835,10 +6937,10 @@ def main():
         pairs={("a:1b", "math"), ("a:1b", "coding")})
     check("re-run preview names the failed pairs",
           preview15["text"].startswith(
-              "Re-running 2 failed pairs (1 model), 16 steps in total."),
+              "Re-running 2 failed pairs (1 model), 23 steps in total."),
           preview15["text"].splitlines()[0] if preview15["text"] else "")
     check("re-run preview counts only the paired steps",
-          preview15["total_steps"] == 16,
+          preview15["total_steps"] == 23,
           str(preview15["total_steps"]))
     math_preview15 = app.render_template_preview(math15)
     check("template preview names the tasks",
@@ -9605,8 +9707,8 @@ def main():
               {"rule": "steps", "expected": tea21},
               "Bring the water to a boil, pour the hot water, add a "
               "tea bag, let the tea steep.", False) == 0.8)
-    check("planning template allows 500 tokens (was 300)",
-          planning21["num_predict"] == 500)
+    check("planning template has no token cap (v23, was 500)",
+          planning21["num_predict"] == -1)
     check("planning birthday paraphrase passes",
           app.score_steps(
               "Pick a date for the party, send out invitations to "
@@ -9674,8 +9776,8 @@ def main():
             fenced21_ok = False
     check("schema: all 5 fenced answers pass",
           fenced21_ok)
-    check("schema: prose outside the fence still fails",
-          not app.score_schema(
+    check("schema: prose outside the fence grades its structure (v24)",
+          app.score_schema(
               "Here it is:\n```json\n{\"name\": \"Ada\", \"age\": 36}\n```",
               {"type": "object"})[0])
 
@@ -9987,7 +10089,8 @@ def main():
             [], [], "sys21", machine21, results21)
 
         def _canned_chat21(answer):
-            def _chat(target, messages, num_predict, tools=None):
+            def _chat(target, messages, num_predict, tools=None,
+                      think=None):
                 return {
                     "answer": answer, "tool_calls": [],
                     "decode_tok_s": 20.0, "prompt_tok_s": 10.0,
@@ -10047,10 +10150,15 @@ def main():
                                 ("fake-dumb:1b", 0.0)):
             for tid21 in ("refusal", "role_following", "planning",
                           "coding"):
+                # (v24): partial coding is 6 of 11 now — the
+                # two-step chat task fails for the partial brain.
+                want_this21 = (100.0 * 6 / 11
+                               if brain21 == "fake-partial:3b"
+                               and tid21 == "coding" else want21)
                 got21 = run21_results.get(brain21, {}).get(
                     "templates", {}).get(tid21, {}).get("template_score")
-                check(f"{brain21} scores {want21:.0f}% on {tid21}",
-                      got21 == want21, str(got21))
+                check(f"{brain21} scores {want_this21:.0f}% on {tid21}",
+                      got21 == want_this21, str(got21))
         for brain21, want21 in (("fake-smart:2b", 100.0),
                                 ("fake-partial:3b", 50.0),
                                 ("fake-dumb:1b", 25.0)):
@@ -10087,7 +10195,7 @@ def main():
         check("a run file records real token counts",
               smart_planning21.get("prompt_tokens") is not None
               and smart_planning21.get("completion_tokens") is not None
-              and smart_planning21.get("completion_tokens") == 1000,
+              and smart_planning21.get("completion_tokens") == 2000,
               str({k: smart_planning21.get(k) for k in (
                   "prompt_tokens", "completion_tokens")}))
 
@@ -10100,11 +10208,13 @@ def main():
         real_scored21 = direct_worker21._run_scored_task
         calls21 = {"n": 0}
 
-        def _dying_scored21(target, template, task):
+        def _dying_scored21(target, template, task, *args):
+            # (v24): _run_scored_task grew think/repeat arguments;
+            # the stand-in takes and forwards whatever it is given.
             calls21["n"] += 1
             if calls21["n"] >= 2:
                 raise app.OllamaUnreachable("could not reach Ollama")
-            return real_scored21(target, template, task)
+            return real_scored21(target, template, task, *args)
 
         direct_worker21._run_scored_task = _dying_scored21
         direct_err21 = None
@@ -10117,11 +10227,11 @@ def main():
               and getattr(direct_err21, "run_data", None) is not None
               and getattr(direct_err21, "run_path", None) is not None)
         direct_data21 = getattr(direct_err21, "run_data", {}) or {}
-        check("the direct errored record has 1 ran and 4 not-run",
+        check("the direct errored record has 1 ran and 10 not-run",
               direct_data21.get("errored") is True
               and direct_data21.get("template_score") is None
-              and direct_data21.get("not_run") == 4
-              and len(direct_data21.get("tasks", [])) == 5,
+              and direct_data21.get("not_run") == 10
+              and len(direct_data21.get("tasks", [])) == 11,
               str({k: direct_data21.get(k) for k in (
                   "errored", "template_score", "not_run")}))
         check("the direct errored file is on disk",
@@ -10909,7 +11019,7 @@ def main():
         real_api22w = updates_module.API_BASE
         real_codeload22w = updates_module.CODELOAD_BASE
         server22w, port22w = fake_github.start_fake_github(
-            latest_tag="v23")
+            latest_tag="v24")
         base22w = "http://127.0.0.1:%d" % port22w
         updates_module.API_BASE = base22w
         updates_module.CODELOAD_BASE = base22w
@@ -10926,7 +11036,7 @@ def main():
             check("live declined check finishes", done22j)
             check("live declined update is asked",
                   len(asked22w) == 1
-                  and asked22w[0].get("latest") == "23",
+                  and asked22w[0].get("latest") == "24",
                   str(asked22w))
             check("live declined update downloads nothing",
                   not any("/zipball/" in path
@@ -10941,7 +11051,7 @@ def main():
             install22w = os.path.join(scratch22w, "install")
             os.makedirs(os.path.join(install22w, "results"),
                         exist_ok=True)
-            for rel, data in fake_github.FAKE_V22_FILES.items():
+            for rel, data in fake_github.FAKE_V23_FILES.items():
                 path = os.path.join(install22w, *rel.split("/"))
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "wb") as handle:
@@ -10959,16 +11069,16 @@ def main():
                 and window22k._update_check_worker is None,
                 timeout=30)
             check("live accepted pull finishes", done22k)
-            check("live pull installs v23 on disk",
+            check("live pull installs v24 on disk",
                   open(os.path.join(
                       install22w, "ollama_system_test.py"),
-                      encoding="utf-8").read().find('"23"') >= 0)
+                      encoding="utf-8").read().find('"24"') >= 0)
             check("live pull keeps results",
                   open(os.path.join(
                       install22w, "results", "keep.txt"),
                       encoding="utf-8").read() == "my results")
-            check("running copy still says v22",
-                  window22k.windowTitle().endswith("v22"),
+            check("running copy still says v23",
+                  window22k.windowTitle().endswith("v23"),
                   window22k.windowTitle())
             fresh22 = subprocess.run(
                 [sys.executable, "-c",
@@ -10977,9 +11087,9 @@ def main():
                  "print(ollama_system_test.__version__)"
                  % install22w],
                 capture_output=True, text=True, timeout=60)
-            check("a fresh launch runs v23",
+            check("a fresh launch runs v24",
                   fresh22.returncode == 0
-                  and fresh22.stdout.strip() == "23",
+                  and fresh22.stdout.strip() == "24",
                   "rc=%s out=%r err=%s" % (
                       fresh22.returncode, fresh22.stdout,
                       fresh22.stderr))
@@ -10992,6 +11102,445 @@ def main():
             server22w.server_close()
     finally:
         shutil.rmtree(scratch22w, ignore_errors=True)
+
+    # ---------- v23: no answer caps --------------------------------
+    # Loader behavior, against a scratch folder of crafted
+    # templates: -1 passes through unclamped, a missing or
+    # non-integer num_predict defaults to -1 (no cap by default),
+    # and positive values keep the 16..4096 clamp.
+    loader_dir23 = os.path.join(SCRATCH, "templates23")
+    os.makedirs(loader_dir23, exist_ok=True)
+
+    def _write_cap_template23(filename, fields):
+        data = {
+            "id": filename[:-5], "name": filename[:-5],
+            "scored": True,
+            "tasks": [{"id": "t1", "prompt": "Say the word zebra.",
+                       "rule": "contains", "expected": "zebra"}],
+        }
+        data.update(fields)
+        with open(os.path.join(loader_dir23, filename), "w",
+                  encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+    _write_cap_template23("capminus.json", {"num_predict": -1})
+    _write_cap_template23("capmissing.json", {})
+    _write_cap_template23("captext.json", {"num_predict": "lots"})
+    _write_cap_template23("caphuge.json", {"num_predict": 99999})
+    _write_cap_template23("captiny.json", {"num_predict": 4})
+    _write_cap_template23("capmid.json", {"num_predict": 300})
+    loaded23, _warns23 = app.load_templates(loader_dir23)
+    caps23 = {t["id"]: t["num_predict"] for t in loaded23}
+    check("loader passes -1 through unclamped (no cap)",
+          caps23.get("capminus") == -1, str(caps23))
+    check("loader defaults a missing num_predict to no cap",
+          caps23.get("capmissing") == -1, str(caps23))
+    check("loader defaults a non-integer num_predict to no cap",
+          caps23.get("captext") == -1, str(caps23))
+    check("loader still clamps a huge cap to 4096",
+          caps23.get("caphuge") == 4096, str(caps23))
+    check("loader still clamps a tiny cap to 16",
+          caps23.get("captiny") == 16, str(caps23))
+    check("loader keeps an in-range cap as-is",
+          caps23.get("capmid") == 300, str(caps23))
+
+    # The shipped templates: every scored one is uncapped. Speed
+    # keeps 200 — that number defines the measured workload
+    # (decode speed over a fixed generation); it is not a cap on
+    # an answer.
+    shipped23, _warns23s = app.load_templates()
+    by_id23 = {t["id"]: t for t in shipped23}
+    scored_caps23 = {t["id"]: t["num_predict"]
+                     for t in shipped23 if t["scored"]}
+    check("all 19 scored templates ship with no cap",
+          len(scored_caps23) == 19
+          and all(v == -1 for v in scored_caps23.values()),
+          str(scored_caps23))
+    check("speed template keeps its 200-token workload",
+          by_id23["speed"]["num_predict"] == 200
+          and not by_id23["speed"]["scored"])
+
+    # Ollama pass-through: -1 reaches the server untouched, on
+    # both the generate and the chat path.
+    server23, _t23 = fake_ollama.start_server()
+    host23, port23 = server23.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host23}:{port23}"
+    app.generate_once("fake-smart:2b", "Say hello.", -1)
+    check("generate sends num_predict -1 untouched",
+          server23.generate_options[-1].get("num_predict") == -1,
+          str(server23.generate_options[-1]))
+    app.chat_once("fake-smart:2b",
+                  [{"role": "user", "content": "Say hello."}], -1)
+    check("chat sends num_predict -1 untouched",
+          server23.chat_options[-1].get("num_predict") == -1,
+          str(server23.chat_options[-1]))
+
+    # Provider payload: an uncapped call omits max_tokens
+    # entirely (APIs reject a negative cap); a capped call
+    # sends it as before. A fresh server: the first provider
+    # server is shut down long before this section runs, and
+    # every later section starts its own the same way.
+    pserver23, _pt23 = fake_ollama.start_provider_server()
+    phost23, pport23 = pserver23.server_address
+    provider23 = {
+        "name": "fake-provider",
+        "base_url": f"http://{phost23}:{pport23}/v1",
+        "api_key": "sk-fake-good-key",
+        "models": [],
+    }
+    app.provider_generate_once(
+        provider23, "fake-gpt-smart", "Say hello.", -1)
+    check("uncapped provider call omits max_tokens",
+          "max_tokens" not in pserver23.chat_payloads[-1],
+          str(sorted(pserver23.chat_payloads[-1])))
+    app.provider_generate_once(
+        provider23, "fake-gpt-smart", "Say hello.", 64)
+    check("capped provider call sends max_tokens",
+          pserver23.chat_payloads[-1].get("max_tokens") == 64,
+          str(pserver23.chat_payloads[-1].get("max_tokens")))
+    check("provider payload recording saw both v23 calls",
+          len(pserver23.chat_payloads) == 2,
+          str(len(pserver23.chat_payloads)))
+    pserver23.shutdown()
+
+    # Estimates: an uncapped template's completion is None,
+    # never negative; Speed's capped math is unchanged.
+    _p23, c23 = app.estimate_template_tokens(by_id23["planning"])
+    check("planning estimate completion is None (no cap)",
+          c23 is None, str(c23))
+    _sp23, sc23 = app.estimate_template_tokens(by_id23["speed"])
+    check("speed estimate completion is 3 lengths x 200",
+          sc23 == 3 * 200, str(sc23))
+
+    # Template preview wording: "no cap" for an uncapped
+    # template, the figure for Speed.
+    check("template preview says no cap for planning",
+          "No cap on answer length."
+          in app.render_template_preview(by_id23["planning"]))
+    check("template preview names the speed workload",
+          "Up to 200 tokens per answer."
+          in app.render_template_preview(by_id23["speed"]))
+
+    # ---------- v24: the accuracy list ----------
+    # Unpinned templates (the carried sections pinned theirs to
+    # 1) and a fresh fake server: this section proves the v24
+    # machinery itself — repeats, variants, thinking, the loop
+    # guard, dead-server handling, the new graders.
+    templates24, _warns24 = _real_load_templates24()
+    by24 = {t["id"]: t for t in templates24}
+    server24, _t24 = fake_ollama.start_server()
+    host24, port24 = server24.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host24}:{port24}"
+    results24 = os.path.join(SCRATCH, "results24")
+    os.makedirs(results24, exist_ok=True)
+    machine24 = app.machine_info()
+    check("v24 scored templates default to 3 repeats",
+          by24["math"]["repeats"] == 3
+          and by24["knowledge"]["repeats"] == 3
+          and by24["speed"]["repeats"] == 1)
+    check("v24 anchor is a scored text template with 20 tasks",
+          by24["anchor"]["capability"] == "text"
+          and by24["anchor"]["scored"] is True
+          and len(by24["anchor"]["tasks"]) == 20)
+    check("v24 run steps count the repeats",
+          app.count_run_steps(
+              [app.ollama_target("fake-smart:2b")], [by24["math"]]) == 31,
+          str(app.count_run_steps(
+              [app.ollama_target("fake-smart:2b")], [by24["math"]])))
+
+    # Item 2, direct: the fake's looping answer is cut by the
+    # stream guard, and the first complete structure grades.
+    loop_metrics24 = app.generate_once(
+        "fake-smart:2b", "Print the looping json object for Paris.", -1)
+    check("v24 a looping answer is cut while streaming",
+          loop_metrics24.get("loop_cut") is True,
+          str(loop_metrics24.get("loop_cut")))
+    check("v24 the first looped structure survives whole",
+          app.extract_json(loop_metrics24["answer"])
+          == {"city": "Paris", "population": 2140526},
+          loop_metrics24["answer"][:80])
+    schema24 = {
+        "type": "object",
+        "properties": {"city": {"type": "string"},
+                       "population": {"type": "integer"}},
+        "required": ["city", "population"],
+    }
+    check("v24 the cut answer grades against the schema",
+          app.score_task({"id": "loop-schema", "rule": "schema",
+                          "expected": schema24},
+                         loop_metrics24["answer"])[0])
+    guard24 = app._LoopGuard()
+    varied24 = ("The history of the town begins in 1240, when a "
+                "small market was founded by the river. ") * 3 + \
+        " ".join(f"fact number {i} about topic {i * i}"
+                 for i in range(120))
+    cut24 = any(guard24.feed(varied24[i:i + 9])
+                for i in range(0, len(varied24), 9))
+    check("v24 a long varied answer is never loop-cut",
+          not cut24 and guard24.text() == varied24)
+
+    # Item 4, direct: a stated conclusion beats the numbers in
+    # the working; the last = X beats an operand; a bare final
+    # line is a conclusion too.
+    check("v24 a stated conclusion beats the working's numbers",
+          app.score_task(
+              {"id": "bb24", "rule": "numeric", "expected": 5},
+              "The bat costs 100 cents more than the ball. If the "
+              "ball costs x cents, then x + (x + 100) = 110, so "
+              "2x = 10. The answer is 5 cents.")[0])
+    check("v24 the last = X wins over an operand",
+          app.score_task(
+              {"id": "eq24", "rule": "numeric", "expected": 8},
+              "The total is = 5 + 3 = 8 dollars.")[0])
+    check("v24 a bare final line is the conclusion",
+          app.score_task(
+              {"id": "bl24", "rule": "numeric", "expected": 14},
+              "First add: 3 + 4 = 7. Then multiply by 2.\n14")[0])
+
+    # Item 7, direct: XML structures grade like JSON ones.
+    check("v24 an XML structure grades against the schema",
+          app.score_task(
+              {"id": "xml24", "rule": "schema", "expected": schema24},
+              "<get_city_info><city>Paris</city>"
+              "<population>2140526</population></get_city_info>")[0])
+    check("v24 XML with a wrong field fails the schema",
+          not app.score_task(
+              {"id": "xml24b", "rule": "schema", "expected": schema24},
+              "<get_city_info><city>Paris</city>"
+              "<country>France</country></get_city_info>")[0])
+    xml_call24 = app._xml_tool_call(
+        '<function name="get_weather">'
+        '<parameter name="city">Paris</parameter></function>')
+    check("v24 an XML tool call parses",
+          xml_call24 == {"name": "get_weather",
+                         "arguments": {"city": "Paris"}},
+          str(xml_call24))
+    check("v24 an XML tool call scores as a call",
+          app.score_tool_call(by24["tool_calling"]["tasks"][0],
+                              [xml_call24])[0])
+
+    # Items 5, 6, 8, 9, 10 end to end: the smart model runs Math
+    # (thinking on, variants in the repeats) and Refusal (split
+    # recorded) at the shipped 3 repeats.
+    results24a = {}
+    finished24a = {"done": False}
+    paths24a = {}
+    worker24a = app.BenchWorker(
+        [app.ollama_target(
+            "fake-smart:2b",
+            app.capabilities_from_show(
+                app.ollama_show("fake-smart:2b")))],
+        [by24["math"], by24["refusal"]],
+        "sys24", machine24, results24)
+    worker24a.model_done.connect(
+        lambda name, result: results24a.__setitem__(name, result))
+    worker24a.run_finished.connect(
+        lambda reason: finished24a.__setitem__("done", reason))
+    worker24a.template_done.connect(
+        lambda label, data, path: paths24a.__setitem__(
+            data["template"], path))
+    worker24a.start()
+    ok24a = wait_until(lambda: finished24a["done"],
+                       timeout=300, app=qt_app)
+    worker24a.wait()
+    check("v24 repeats run finishes", ok24a
+          and finished24a["done"] == "done", str(finished24a))
+    math24 = results24a.get("fake-smart:2b", {}).get(
+        "templates", {}).get("math", {})
+    check("v24 math averaged 3 repeats of 100",
+          math24.get("template_score") == 100.0
+          and math24.get("repeat_scores") == [100.0, 100.0, 100.0],
+          str({k: math24.get(k)
+               for k in ("template_score", "repeat_scores")}))
+    check("v24 math counts every repeat's tasks",
+          math24.get("passed") == 30 and math24.get("total") == 30
+          and len(math24.get("tasks", [])) == 30
+          and {t.get("repeat") for t in math24.get("tasks", [])}
+          == {1, 2, 3},
+          str({k: math24.get(k) for k in ("passed", "total")}))
+    check("v24 later repeats ran the authored variants",
+          any("23 apples" in (t.get("prompt") or "")
+              for t in math24.get("tasks", [])))
+    check("v24 math ran with thinking on and recorded it",
+          math24.get("thinking") is True
+          and server24.think_seen.count(True) == 30,
+          str(server24.think_seen.count(True)))
+    check("v24 math run file carries the model facts",
+          (math24.get("model_info") or {}).get("quantization")
+          == "Q4_K_M"
+          and (math24.get("model_info") or {}).get("parameter_size")
+          == "2.0B"
+          and (math24.get("model_info") or {}).get("digest")
+          == "sha256:abcdef012345",
+          str(math24.get("model_info")))
+    summary24 = app.render_run_summary(math24)
+    check("v24 summary prints quant, size, digest, thinking",
+          "Model: quant Q4_K_M" in summary24
+          and "size 2.0B" in summary24
+          and "digest sha256:abcdef012345" in summary24
+          and "thinking on" in summary24, summary24[:400])
+    check("v24 summary shows the count and the repeat spread",
+          "average of 3 repeats, 100–100%" in summary24,
+          summary24[:400])
+    check("v24 score text shows count and spread",
+          app.template_score_text(math24)
+          == "100% (30/30, repeats 100–100%)",
+          app.template_score_text(math24))
+    refusal24 = results24a.get("fake-smart:2b", {}).get(
+        "templates", {}).get("refusal", {})
+    split24 = refusal24.get("refusal_split") or {}
+    check("v24 refusal split is recorded per half",
+          (split24.get("refuses_harmful") or {}).get("passed") == 15
+          and (split24.get("refuses_harmful") or {}).get("total") == 15
+          and (split24.get("answers_harmless") or {}).get("passed") == 15
+          and (split24.get("answers_harmless") or {}).get("total") == 15,
+          str(split24))
+    check("v24 refusal records carry the harmful flag",
+          sum(1 for t in refusal24.get("tasks", [])
+              if t.get("harmful")) == 15)
+    summary24r = app.render_run_summary(refusal24)
+    check("v24 summary prints both refusal halves",
+          "Refuses harmful requests: 100% (15/15)" in summary24r
+          and "Answers harmless requests: 100% (15/15)" in summary24r,
+          summary24r[:500])
+
+    # Item 6, the other half: a model without thinking runs
+    # Reasoning untouched.
+    results24b = {}
+    finished24b = {"done": False}
+    think_before24 = len(server24.think_seen)
+    worker24b = app.BenchWorker(
+        [app.ollama_target("fake-dumb:1b")],
+        [by24["reasoning"]],
+        "sys24", machine24, results24)
+    worker24b.model_done.connect(
+        lambda name, result: results24b.__setitem__(name, result))
+    worker24b.run_finished.connect(
+        lambda reason: finished24b.__setitem__("done", reason))
+    worker24b.start()
+    ok24b = wait_until(lambda: finished24b["done"],
+                       timeout=180, app=qt_app)
+    worker24b.wait()
+    reasoning24 = results24b.get("fake-dumb:1b", {}).get(
+        "templates", {}).get("reasoning", {})
+    check("v24 a non-thinking model runs Reasoning without thinking",
+          ok24b and reasoning24.get("thinking") is False
+          and True not in server24.think_seen[think_before24:],
+          str(reasoning24.get("thinking")))
+
+    # Item 3 end to end. The starter is stubbed: the first start
+    # attempted while the server is dead fails (so the per-call
+    # restart cannot save the template), the second revives it
+    # (so the whole-template retry can).
+    real_starter24 = app.start_ollama_process
+    dead_starts24 = {"n": 0}
+
+    def _flaky_starter24(models_folder=None):
+        if not server24.dead:
+            return True, "already running"
+        dead_starts24["n"] += 1
+        if dead_starts24["n"] == 1:
+            return False, "could not start Ollama"
+        server24.dead = False
+        return True, "started"
+
+    def _kill_later24(base_count):
+        def _kill():
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if server24.generate_done >= base_count + 2:
+                    break
+                time.sleep(0.05)
+            server24.dead = True
+        return threading.Thread(target=_kill, daemon=True)
+
+    app.start_ollama_process = _flaky_starter24
+    try:
+        results24c = {}
+        finished24c = {"done": False}
+        worker24c = app.BenchWorker(
+            [app.ollama_target("fake-smart:2b")],
+            [by24["knowledge"]],
+            "sys24", machine24, results24)
+        worker24c.model_done.connect(
+            lambda name, result: results24c.__setitem__(name, result))
+        worker24c.run_finished.connect(
+            lambda reason: finished24c.__setitem__("done", reason))
+        killer24c = _kill_later24(server24.generate_done)
+        killer24c.start()
+        worker24c.start()
+        ok24c = wait_until(lambda: finished24c["done"],
+                           timeout=240, app=qt_app)
+        worker24c.wait()
+        killer24c.join(timeout=10)
+        knowledge24 = results24c.get("fake-smart:2b", {}).get(
+            "templates", {}).get("knowledge", {})
+        check("v24 a mid-template death is retried whole and scores",
+              ok24c and finished24c["done"] == "done"
+              and knowledge24.get("template_score") == 100.0
+              and not knowledge24.get("not_measured")
+              and dead_starts24["n"] == 2,
+              str({k: knowledge24.get(k)
+                   for k in ("template_score", "not_measured")})
+              + f" starts={dead_starts24['n']}")
+
+        # Item 3, no revive: the template is not measured, the
+        # run is flagged incomplete, and no score prints.
+        def _dead_starter24(models_folder=None):
+            if not server24.dead:
+                return True, "already running"
+            return False, "could not start Ollama"
+
+        app.start_ollama_process = _dead_starter24
+        results24d = {}
+        finished24d = {"done": False}
+        worker24d = app.BenchWorker(
+            [app.ollama_target("fake-smart:2b")],
+            [by24["knowledge"]],
+            "sys24", machine24, results24)
+        worker24d.model_done.connect(
+            lambda name, result: results24d.__setitem__(name, result))
+        worker24d.run_finished.connect(
+            lambda reason: finished24d.__setitem__("done", reason))
+        killer24d = _kill_later24(server24.generate_done)
+        killer24d.start()
+        worker24d.start()
+        ok24d = wait_until(lambda: finished24d["done"],
+                           timeout=240, app=qt_app)
+        worker24d.wait()
+        killer24d.join(timeout=10)
+        result24d = results24d.get("fake-smart:2b", {})
+        knowledge24d = result24d.get("templates", {}).get(
+            "knowledge", {})
+        check("v24 an unrevivable death ends the run as ollama_down",
+              ok24d and finished24d["done"] == "ollama_down",
+              str(finished24d))
+        check("v24 the dead template is not measured, never scored",
+              knowledge24d.get("not_measured") is True
+              and knowledge24d.get("template_score") is None
+              and result24d.get("incomplete") is True,
+              str({k: knowledge24d.get(k)
+                   for k in ("not_measured", "template_score")}))
+        check("v24 the summary says not measured - server died",
+              "Score: not measured - server died"
+              in app.render_run_summary(knowledge24d))
+        check("v24 the score text says not measured",
+              app.template_score_text(knowledge24d)
+              == "not measured - server died",
+              app.template_score_text(knowledge24d))
+        report24d = app.render_text_report([result24d])
+        check("v24 the report says not measured and incomplete",
+              "not measured - server died" in report24d
+              and "This run is incomplete" in report24d,
+              report24d[:600])
+        check("v24 the not-measured pair stays pending for a resume",
+              worker24d._manifest.get("pairs", {}).get(
+                  app.pair_key("fake-smart:2b", "knowledge"))
+              == "pending",
+              str(worker24d._manifest.get("pairs")))
+    finally:
+        app.start_ollama_process = real_starter24
+        server24.dead = False
 
     QMessageBox.question = _suite_real_question
     app.MainWindow._show_run_preview = _suite_real_preview
