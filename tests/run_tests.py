@@ -1,4 +1,4 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v28 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v29 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
 answers per model. All v25 checks are carried over (pins updated
 where v26 deliberately changes behavior - the version pin, the
@@ -26,7 +26,22 @@ counts, named in the TEST-REPORT); the v28 checks cover the
 fixed render grid: SURFACE_GRID_N tiles per axis, square tiles
 of one size on both axes of any data grid, a column count
 independent of the data grid's size, and a single measured
-point still spanning the whole field. All v24 checks are carried over (pins updated
+point still spanning the whole field. All v28 checks are carried over (pins updated
+where v29 deliberately changes behavior - the version pin, the
+fake GitHub "newer release" story, and the surface data shape,
+named in the TEST-REPORT); the v29 checks cover the per-model
+surface: Joshua's correction (the surface is ONE model's -
+what it is strongest and weakest at - never all models in one
+landscape), so the builders now return one surface per model
+whose points are its template/category scores, the live tracker
+feeds each model its own surface (partial while a category
+runs, settled at its score, untested categories staying gaps),
+the morph blends two per-model profiles, the Surface tab's
+model picker and skills/weights switch, the report card's
+skills picture (a PNG beside the card, named in the card), and
+the weights view's GGUF reader against a synthetic fixture
+(known values in, known statistics out; an unsupported tensor
+type skipped and counted). All v24 checks are carried over (pins updated
 where v25 deliberately changes behavior - the version pin and the
 tab count, named in the TEST-REPORT); the v25 checks cover the
 Prompt Dialect Test: the six prompt wrappers (the task text
@@ -435,19 +450,44 @@ def main():
           by_id["image_generation"].get("capability") == "image_generation")
     check("audio needs audio", by_id["audio"].get("capability") == "audio")
     # (v24, item 5): every scored template grew to 10 tasks
-    # (coding 11 — it also carries the two-step chat task), and
-    # the anchor template joined with 20.
+    # (coding 11 — it also carried the two-step chat task), and
+    # the anchor template joined with 20. (v29 equal-count
+    # correction, Joshua: "equal amounts of tests for every
+    # test subject — no section bigger than any other"):
+    # every scored subject now has exactly 10 tasks. Coding
+    # drops the standalone is_prime task (prime_counter
+    # already requires is_prime plus count_primes; both v24
+    # harder tasks stay), and Anchor keeps the first five
+    # MMLU-style plus the first five GSM8K-style tasks, as
+    # ordered in its file. Speed stays 2 prompts — it is a
+    # timed generation workload, not questions.
     for tid in ("multi_turn", "code_repair", "planning", "grounded_qa",
                 "summarization", "structured_output",
                 "role_following", "reasoning", "instruction", "knowledge"):
         check(f"{tid} has 10 tasks", len(by_id[tid]["tasks"]) == 10,
               str(len(by_id[tid].get("tasks", []))))
-    check("coding has 11 tasks (10 + the two-step chat task)",
-          len(by_id["coding"]["tasks"]) == 11,
-          str(len(by_id["coding"].get("tasks", []))))
-    check("anchor has 20 tasks",
-          len(by_id["anchor"]["tasks"]) == 20,
-          str(len(by_id["anchor"].get("tasks", []))))
+    check("every scored subject has exactly 10 tasks (v29)",
+          all(len(t["tasks"]) == 10 for t in templates
+              if t.get("scored")),
+          str({t["id"]: len(t.get("tasks", []))
+               for t in templates if t.get("scored")}))
+    check("coding has 10 tasks (v29: standalone is_prime "
+          "dropped, the harder tasks stay)",
+          len(by_id["coding"]["tasks"]) == 10
+          and "is_prime" not in [
+              t["id"] for t in by_id["coding"]["tasks"]]
+          and "prime_counter" in [
+              t["id"] for t in by_id["coding"]["tasks"]]
+          and "double-then-quadruple" in [
+              t["id"] for t in by_id["coding"]["tasks"]],
+          str([t["id"] for t in by_id["coding"]["tasks"]]))
+    check("anchor has 10 tasks (v29: first five of each half)",
+          [t["id"] for t in by_id["anchor"]["tasks"]] == [
+              "anchor-insulin", "anchor-photosynthesis",
+              "anchor-prime", "anchor-ww2", "anchor-salt",
+              "anchor-oranges", "anchor-change", "anchor-shelves",
+              "anchor-fuel", "anchor-reading"],
+          str([t["id"] for t in by_id["anchor"]["tasks"]]))
     check("math has 10 tasks (v16: grown from 5)",
           len(by_id["math"]["tasks"]) == 10,
           str(len(by_id["math"].get("tasks", []))))
@@ -801,7 +841,18 @@ def main():
         if not prompt_tasks:
             continue
         # v16: math is 10 tasks now, partial gets 5 of them.
-        partial_want = 50.0 if template["id"] == "math" else 60.0
+        # v29: the trimmed anchor is 8 of 10 for partial, and
+        # coding's generate-kind tasks are 9 now (the dropped
+        # standalone is_prime was one partial never passed),
+        # of which partial passes 6.
+        if template["id"] == "math":
+            partial_want = 50.0
+        elif template["id"] == "anchor":
+            partial_want = 80.0
+        elif template["id"] == "coding":
+            partial_want = 100.0 * 6 / 9
+        else:
+            partial_want = 60.0
         for brain, want in (("smart", 100.0), ("dumb", 0.0),
                             ("partial", partial_want)):
             passed_count = 0
@@ -1104,7 +1155,10 @@ def main():
 
     expected = {
         "fake-smart:2b": ("100%", "20.0", "done"),
-        "fake-partial:3b": ("59%", "10.0", "done"),
+        # v29: partial's overall is 60% — coding is 6 of 10 now
+        # (60%, was 6 of 11) and its trimmed anchor is 8 of 10
+        # (80%, was 12 of 20).
+        "fake-partial:3b": ("60%", "10.0", "done"),
         # v17: Speed scores now, so dumb's 5 tok/s is 25% on Speed
         # and its overall is 25/14 = 2%, not 0%.
         "fake-dumb:1b": ("2%", "5.0", "done"),
@@ -1133,7 +1187,7 @@ def main():
 
     # Detail pane: smart selected by default (row 0).
     detail = window.detail_view.toPlainText()
-    check("detail shows smart coding 100%", "Coding: 100% (11/11)" in detail, detail[:400])
+    check("detail shows smart coding 100%", "Coding: 100% (10/10)" in detail, detail[:400])
     check("detail shows per-task pass", "pass  fibonacci" in detail, detail[:400])
     # v17: Speed scores now — smart's 20 tok/s is 100% on all 3 lengths.
     check("detail shows speed scored", "Speed: 100% (3/3), 20.0 tok/s" in detail, detail[:400])
@@ -1142,7 +1196,7 @@ def main():
     window.table.cellClicked.emit(dumb_row, 0)
     qt_app.processEvents()
     detail = window.detail_view.toPlainText()
-    check("detail shows dumb coding 0%", "Coding: 0% (0/11)" in detail, detail[:400])
+    check("detail shows dumb coding 0%", "Coding: 0% (0/10)" in detail, detail[:400])
     check("detail shows per-task fail", "fail  fibonacci" in detail, detail[:400])
 
     # Size in RAM recorded in the session results.
@@ -1198,10 +1252,11 @@ def main():
         if run.get("template_score") is not None:
             # v16: math is 10 tasks now, partial gets 5 of them.
             # v17: Speed scores too — partial's 10 tok/s is 50%.
-            # v24: coding is 6 of 11 for partial (the two-step
-            # chat task fails) — not a round number any more.
-            if tid == "coding":
-                want16 = 100.0 * 6 / 11
+            # v29: coding is 6 of 10 for partial (the two-step
+            # chat task still fails) — a round 60% again; the
+            # trimmed anchor is 8 of its 10 for partial.
+            if tid == "anchor":
+                want16 = 80.0
             elif tid in ("math", "speed"):
                 want16 = 50.0
             else:
@@ -1333,7 +1388,12 @@ def main():
     wait_until(lambda: any(f.startswith("bench-results-") for f in os.listdir(RESULTS_DIR)),
                timeout=10, app=qt_app)
     report_files = [f for f in os.listdir(RESULTS_DIR) if f.startswith("bench-results-")]
-    check("report writes 2 files", len(report_files) == 2, str(report_files))
+    check("report writes the card, its data, and a surface "
+          "picture per model (v29)",
+          len(report_files) == 5
+          and sum(f.endswith("-surface.png")
+                  for f in report_files) == 3,
+          str(report_files))
     txt_files = [f for f in report_files if f.endswith(".txt")]
     json_files = [f for f in report_files if f.endswith(".json")]
     check("report txt + json", len(txt_files) == 1 and len(json_files) == 1)
@@ -1343,7 +1403,7 @@ def main():
         with open(txt_path, encoding="utf-8") as handle:
             txt = handle.read()
         check("txt has smart 100%", "Overall score: 100%" in txt)
-        check("txt has per-template line", "Coding: 100% (11/11)" in txt)
+        check("txt has per-template line", "Coding: 100% (10/10)" in txt)
         check("txt has failed model", "fake-broken:1b" in txt)
         with open(json_path, encoding="utf-8") as handle:
             data = json.load(handle)
@@ -2496,7 +2556,16 @@ def main():
         if not prompt_tasks:
             continue
         # v16: math is 10 tasks now, partial gets 5 of them.
-        partial_want = 50.0 if template["id"] == "math" else 60.0
+        # v29: same trims as the Ollama loop — anchor 8 of 10
+        # for partial, coding 6 of its 9 generate-kind tasks.
+        if template["id"] == "math":
+            partial_want = 50.0
+        elif template["id"] == "anchor":
+            partial_want = 80.0
+        elif template["id"] == "coding":
+            partial_want = 100.0 * 6 / 9
+        else:
+            partial_want = 60.0
         for brain, want in (("smart", 100.0), ("dumb", 0.0),
                             ("partial", partial_want)):
             passed_count = 0
@@ -2653,8 +2722,8 @@ def main():
     set_checked_templates(windowP, {t["id"] for t in templates})
     windowP.run_button.click()
     # v24: 900 s, not 300. The provider run grew with the
-    # templates (173 calls at the fake's simulated latency,
-    # ~2x the v21 run) and this machine is shared and loaded;
+    # templates (at the fake's simulated latency, ~2x the
+    # v21 run) and this machine is shared and loaded;
     # the wait is only how long the suite watches — the
     # product has no such limit.
     done = wait_until(
@@ -2677,14 +2746,17 @@ def main():
     # calls over the eligible templates — this section's
     # templates are pinned to 1 repeat, see the note at the
     # first window), plus the warmup call's 20/200, which the
-    # detail totals include.
-    check("detail shows 3,520 prompt tokens", "3,520 in" in detail, detail[:300])
-    check("detail shows 35,200 completion tokens", "35,200 out" in detail, detail[:300])
+    # detail totals include. v29: 164 calls in the runs
+    # (anchor and coding trimmed to 10 tasks each), so
+    # 3,280/32,800 in the runs and 3,300/33,000 with the
+    # warmup.
+    check("detail shows 3,300 prompt tokens", "3,300 in" in detail, detail[:300])
+    check("detail shows 33,000 completion tokens", "33,000 out" in detail, detail[:300])
     check("detail shows cost $0.02", "$0.02" in detail, detail[:300])
     check("detail shows per-template tokens",
           "200 in / 2,000 out" in detail, detail)
     check("detail shows per-template cost",
-          "Coding: 100% (11/11)" in detail and "$0.0015" in detail, detail)
+          "Coding: 100% (10/10)" in detail and "$0.0014" in detail, detail)
     check("detail says tokens include warmup",
           "includes warmup" in detail, detail[:300])
     provider_dir = os.path.join(RESULTS_DIR, "fake-provider_fake-gpt-smart", sid)
@@ -2701,12 +2773,12 @@ def main():
               and pdata.get("model") == "fake-provider / fake-gpt-smart",
               str({k: pdata.get(k) for k in ("provider", "provider_model", "model")}))
         check("provider run file records template tokens",
-              pdata.get("prompt_tokens") == 240
-              and pdata.get("completion_tokens") == 2400
-              and pdata.get("total_tokens") == 2640,
+              pdata.get("prompt_tokens") == 220
+              and pdata.get("completion_tokens") == 2200
+              and pdata.get("total_tokens") == 2420,
               str({k: pdata.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")}))
         check("provider run file records exact template cost",
-              pdata.get("estimated_cost_usd") == 0.001476,
+              pdata.get("estimated_cost_usd") == 0.001353,
               str(pdata.get("estimated_cost_usd")))
         check("provider run file keeps the system id",
               pdata.get("system_id") == sid, str(pdata.get("system_id")))
@@ -2727,9 +2799,10 @@ def main():
         # v24: 3,500/35,000 — the eligible templates grew
         # (anchor added, every template at 10+ tasks; 175
         # calls at 20 in / 200 out). Template runs only,
-        # no warmup.
+        # no warmup. v29: 164 calls after the equal-count
+        # trim, so 3,280 in, 32,800 out.
         check("provider profile totals template tokens",
-              "Tokens used in template runs: 3,500 in, 35,000 out" in prof, prof)
+              "Tokens used in template runs: 3,280 in, 32,800 out" in prof, prof)
         check("provider profile totals template cost",
               "Estimated cost in template runs: $0.02" in prof, prof)
     windowP.grab().save(os.path.join(VERIFY_DIR, "screenshot-provider-results.png"))
@@ -3655,7 +3728,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 28", app.__version__ == "28",
+    check("__version__ is 29", app.__version__ == "29",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3669,8 +3742,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v28",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v28",
+    check("title bar shows OLLAMA SYSTEM TEST v29",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v29",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -3800,7 +3873,7 @@ def main():
         if os.path.exists(RESULTS_DIR) else set()
     )
     check("Save report action writes the report files",
-          len(reports_saved - reports_before) == 2,
+          len(reports_saved - reports_before) == 3,
           str(reports_saved - reports_before))
 
     # Ctrl+R during a run is a no-op; Esc cancels the run.
@@ -4272,14 +4345,36 @@ def main():
          "price_output_per_1m": 1000.0, "capabilities": ["text"]})
     est8 = app.estimate_run_cost([priced8], [capped_math8])
     warm_p8 = (len(app.WARMUP_PROMPT) + 3) // 4
-    expected8 = (
-        math_p8 + warm_p8 + cm_c8 + app.WARMUP_PREDICT
-    ) * 1000.0 / 1_000_000
+    # (v29): the warmup is uncapped now - it was capped at 64
+    # tokens, which cut a thinking model off mid-thought and
+    # aborted the run - so even with a capped template the
+    # completion total has no upper estimate. The prompt math
+    # stays exact; the cost is unknown and the model is listed
+    # under "uncapped", never a total built on the -1.
     check("cost estimate matches the token math (warmup included)",
-          abs(est8["total"] - expected8) < 1e-9, str(est8["total"]))
+          est8["per_model"][0]["prompt_tokens"] == math_p8 + warm_p8
+          and est8["per_model"][0]["completion_tokens"] is None
+          and est8["per_model"][0]["cost"] is None
+          and est8["total"] is None
+          and est8["uncapped"] == ["v8-provider / fake-gpt-smart"]
+          and est8["unknown"] == [],
+          str(est8))
+    # The $1.00 threshold still bites on a fully capped
+    # workload: a vision-only target gets no text warmup, so
+    # a capped vision template prices out exactly.
+    priced8v = app.provider_target(
+        {"name": "v8-provider"},
+        {"id": "fake-gpt-vision", "price_input_per_1m": 1000.0,
+         "price_output_per_1m": 1000.0, "capabilities": ["vision"]})
+    capped_vis8 = dict(by_id8["vision"], num_predict=2000)
+    vis_p8, vis_c8 = app.estimate_template_tokens(capped_vis8)
+    est8t = app.estimate_run_cost([priced8v], [capped_vis8])
     check("cost estimate is over the $1.00 threshold at these prices",
-          est8["total"] > app.COST_CONFIRM_THRESHOLD_USD,
-          str(est8["total"]))
+          est8t["total"] is not None
+          and abs(est8t["total"]
+                  - (vis_p8 + vis_c8) * 1000.0 / 1_000_000) < 1e-9
+          and est8t["total"] > app.COST_CONFIRM_THRESHOLD_USD,
+          str(est8t["total"]))
     # (v23): the same model on the shipped (uncapped) math
     # template has no cost estimate at all — unknown, listed
     # under "uncapped", never under "unknown" (prices ARE saved).
@@ -4306,8 +4401,8 @@ def main():
     est8v = app.estimate_run_cost([priced8], [by_id8["vision"]])
     check("templates the model cannot run are not estimated",
           est8v["per_model"][0]["prompt_tokens"] == warm_p8
-          and est8v["per_model"][0]["completion_tokens"]
-          == app.WARMUP_PREDICT,
+          and est8v["per_model"][0]["completion_tokens"] is None
+          and est8v["uncapped"] == ["v8-provider / fake-gpt-smart"],
           str(est8v["per_model"][0]))
     check("is_budget_stopped marks only the budget detail",
           app.is_budget_stopped(
@@ -4937,7 +5032,7 @@ def main():
             check("export CSV carries the models and scores",
                   "fake-smart:2b" in csv_text8 and "100%" in csv_text8
                   and "fake-partial:3b" in csv_text8
-                  and "52%" in csv_text8,
+                  and "55%" in csv_text8,
                   csv_text8)
             check("export CSV has the template columns",
                   "Math" in csv_text8 and "Coding" in csv_text8, csv_text8)
@@ -4960,7 +5055,7 @@ def main():
             check("export HTML carries the models and scores",
                   "fake-smart:2b" in html_text8 and "100%" in html_text8
                   and "fake-partial:3b" in html_text8
-                  and "52%" in html_text8,
+                  and "55%" in html_text8,
                   html_text8[:500])
             check("export HTML carries no API key",
                   fake_ollama.PROVIDER_API_KEY not in html_text8)
@@ -5050,13 +5145,13 @@ def main():
               compare_cell8("Math", 1) == "100%"
               and compare_cell8("Math", 2) == "50%",
               f"{compare_cell8('Math', 1)} / {compare_cell8('Math', 2)}")
-        check("compare shows smart coding 100% vs partial 55%",
+        check("compare shows smart coding 100% vs partial 60%",
               compare_cell8("Coding", 1) == "100%"
-              and compare_cell8("Coding", 2) == "55%",
+              and compare_cell8("Coding", 2) == "60%",
               f"{compare_cell8('Coding', 1)} / {compare_cell8('Coding', 2)}")
         check("compare shows the overall rows",
               compare_cell8("Overall score", 1) == "100%"
-              and compare_cell8("Overall score", 2) == "52%",
+              and compare_cell8("Overall score", 2) == "55%",
               f"{compare_cell8('Overall score', 1)} / "
               f"{compare_cell8('Overall score', 2)}")
         check("compare shows the speed rows",
@@ -5116,10 +5211,10 @@ def main():
               and window9.template_list.count() == 20,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v28",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v28",
+        check("title bar shows v29",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v29",
               window9.windowTitle())
-        check("__version__ is 28", app.__version__ == "28", app.__version__)
+        check("__version__ is 29", app.__version__ == "29", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -5493,7 +5588,7 @@ def main():
     )
     new_reports11 = reports_after11 - reports_before11
     check("two saves in one minute produce two reports",
-          len(new_reports11) == 4, str(new_reports11))
+          len(new_reports11) == 6, str(new_reports11))
     md_dir11 = os.path.join(RESULTS_DIR, "fake-markdown_1b")
     os.makedirs(md_dir11, exist_ok=True)
     with open(os.path.join(md_dir11, "PROFILE.md"), "w",
@@ -5928,7 +6023,7 @@ def main():
     by_id13 = {t["id"]: t for t in templates}
     tgt13 = app.ollama_target("fake-smart:2b", ["text"])
     check("step count is warmup + tasks",
-          app.count_run_steps([tgt13], [by_id13["coding"]]) == 13,
+          app.count_run_steps([tgt13], [by_id13["coding"]]) == 12,
           str(app.count_run_steps([tgt13], [by_id13["coding"]])))
     check("step count covers the Speed context lengths",
           app.count_run_steps([tgt13], [by_id13["speed"]])
@@ -5952,7 +6047,7 @@ def main():
           app.latest_decode_speed(empty13, "fake-smart:2b") is None)
     pv13 = app.build_run_preview([tgt13], [by_id13["coding"]], empty13)
     check("preview names the model and template counts",
-          "1 model, 1 template, 13 steps in total." in pv13["text"],
+          "1 model, 1 template, 12 steps in total." in pv13["text"],
           pv13["text"])
     # (v23): coding ships uncapped, so there is no upper time
     # estimate to give — the preview says so, and seconds_upper
@@ -6013,12 +6108,18 @@ def main():
           and pv13p["cost"]["total"] is None)
     capped_math13 = dict(by_id13["math"], num_predict=300)
     pv13pc = app.build_run_preview([ptgt13], [capped_math13], empty13)
-    check("capped provider preview names the model and its cost",
-          "prov / m" in pv13pc["text"] and "about $" in pv13pc["text"],
+    # (v29): the template is capped, but the warmup no longer
+    # is - its 64-token cap cut thinking models off mid-thought
+    # and aborted runs - so even a capped run's cost is
+    # unknown: the warmup's answer has no cap either.
+    check("capped provider preview names the model and says "
+          "the cost is unknown (uncapped warmup)",
+          "prov / m" in pv13pc["text"]
+          and "cost unknown: answers have no cap" in pv13pc["text"],
           pv13pc["text"])
-    check("capped provider preview total is a number",
+    check("capped provider preview total is None (uncapped warmup)",
           pv13pc["cost"] is not None
-          and pv13pc["cost"]["total"] is not None)
+          and pv13pc["cost"]["total"] is None)
     ptgt13u = dict(ptgt13, label="prov / u",
                    price_input_per_1m=None, price_output_per_1m=None)
     pv13u = app.build_run_preview([ptgt13u], [by_id13["math"]], empty13)
@@ -6125,7 +6226,7 @@ def main():
               "3 models, 2 templates" in window13.finish_label.text(),
               window13.finish_label.text())
         check("progress line keeps its final count",
-              "69 of 69 steps done" in window13.progress_detail.text(),
+              "66 of 66 steps done" in window13.progress_detail.text(),
               window13.progress_detail.text())
         row_smart13 = row_for(window13, "fake-smart:2b")
         row_partial13 = row_for(window13, "fake-partial:3b")
@@ -6945,7 +7046,7 @@ def main():
     steps15a = app.count_run_steps(
         [target_a15], [math15, coding15], pairs={("a:1b", "coding")})
     check("run steps count only the pairs in a re-run",
-          steps15a == 13, str(steps15a))
+          steps15a == 12, str(steps15a))
     steps15b = app.count_run_steps(
         targets15, [math15, coding15], pairs={("a:1b", "math")})
     check("run steps skip a target with no pairs in a re-run",
@@ -6977,10 +7078,10 @@ def main():
         pairs={("a:1b", "math"), ("a:1b", "coding")})
     check("re-run preview names the failed pairs",
           preview15["text"].startswith(
-              "Re-running 2 failed pairs (1 model), 23 steps in total."),
+              "Re-running 2 failed pairs (1 model), 22 steps in total."),
           preview15["text"].splitlines()[0] if preview15["text"] else "")
     check("re-run preview counts only the paired steps",
-          preview15["total_steps"] == 23,
+          preview15["total_steps"] == 22,
           str(preview15["total_steps"]))
     math_preview15 = app.render_template_preview(math15)
     check("template preview names the tasks",
@@ -10190,11 +10291,10 @@ def main():
                                 ("fake-dumb:1b", 0.0)):
             for tid21 in ("refusal", "role_following", "planning",
                           "coding"):
-                # (v24): partial coding is 6 of 11 now — the
-                # two-step chat task fails for the partial brain.
-                want_this21 = (100.0 * 6 / 11
-                               if brain21 == "fake-partial:3b"
-                               and tid21 == "coding" else want21)
+                # (v29): partial coding is 6 of 10 — the
+                # two-step chat task fails for the partial brain,
+                # so it lands on the same 60% as the rest.
+                want_this21 = want21
                 got21 = run21_results.get(brain21, {}).get(
                     "templates", {}).get(tid21, {}).get("template_score")
                 check(f"{brain21} scores {want_this21:.0f}% on {tid21}",
@@ -10267,11 +10367,11 @@ def main():
               and getattr(direct_err21, "run_data", None) is not None
               and getattr(direct_err21, "run_path", None) is not None)
         direct_data21 = getattr(direct_err21, "run_data", {}) or {}
-        check("the direct errored record has 1 ran and 10 not-run",
+        check("the direct errored record has 1 ran and 9 not-run",
               direct_data21.get("errored") is True
               and direct_data21.get("template_score") is None
-              and direct_data21.get("not_run") == 10
-              and len(direct_data21.get("tasks", [])) == 11,
+              and direct_data21.get("not_run") == 9
+              and len(direct_data21.get("tasks", [])) == 10,
               str({k: direct_data21.get(k) for k in (
                   "errored", "template_score", "not_run")}))
         check("the direct errored file is on disk",
@@ -11059,7 +11159,7 @@ def main():
         real_api22w = updates_module.API_BASE
         real_codeload22w = updates_module.CODELOAD_BASE
         server22w, port22w = fake_github.start_fake_github(
-            latest_tag="v29")
+            latest_tag="v30")
         base22w = "http://127.0.0.1:%d" % port22w
         updates_module.API_BASE = base22w
         updates_module.CODELOAD_BASE = base22w
@@ -11076,7 +11176,7 @@ def main():
             check("live declined check finishes", done22j)
             check("live declined update is asked",
                   len(asked22w) == 1
-                  and asked22w[0].get("latest") == "29",
+                  and asked22w[0].get("latest") == "30",
                   str(asked22w))
             check("live declined update downloads nothing",
                   not any("/zipball/" in path
@@ -11109,16 +11209,16 @@ def main():
                 and window22k._update_check_worker is None,
                 timeout=30)
             check("live accepted pull finishes", done22k)
-            check("live pull installs v29 on disk",
+            check("live pull installs v30 on disk",
                   open(os.path.join(
                       install22w, "ollama_system_test.py"),
-                      encoding="utf-8").read().find('"29"') >= 0)
+                      encoding="utf-8").read().find('"30"') >= 0)
             check("live pull keeps results",
                   open(os.path.join(
                       install22w, "results", "keep.txt"),
                       encoding="utf-8").read() == "my results")
-            check("running copy still says v28",
-                  window22k.windowTitle().endswith("v28"),
+            check("running copy still says v29",
+                  window22k.windowTitle().endswith("v29"),
                   window22k.windowTitle())
             fresh22 = subprocess.run(
                 [sys.executable, "-c",
@@ -11127,9 +11227,9 @@ def main():
                  "print(ollama_system_test.__version__)"
                  % install22w],
                 capture_output=True, text=True, timeout=60)
-            check("a fresh launch runs v29",
+            check("a fresh launch runs v30",
                   fresh22.returncode == 0
-                  and fresh22.stdout.strip() == "29",
+                  and fresh22.stdout.strip() == "30",
                   "rc=%s out=%r err=%s" % (
                       fresh22.returncode, fresh22.stdout,
                       fresh22.stderr))
@@ -11278,10 +11378,11 @@ def main():
           by24["math"]["repeats"] == 3
           and by24["knowledge"]["repeats"] == 3
           and by24["speed"]["repeats"] == 1)
-    check("v24 anchor is a scored text template with 20 tasks",
+    check("v24 anchor is a scored text template with 10 tasks "
+          "(v29 trim)",
           by24["anchor"]["capability"] == "text"
           and by24["anchor"]["scored"] is True
-          and len(by24["anchor"]["tasks"]) == 20)
+          and len(by24["anchor"]["tasks"]) == 10)
     check("v24 run steps count the repeats",
           app.count_run_steps(
               [app.ollama_target("fake-smart:2b")], [by24["math"]]) == 31,
@@ -11916,6 +12017,11 @@ def main():
     # worker run feeding a tracker: partial while a template
     # runs, settled at its score when it finishes), and the
     # Surface tab / Compare morph wiring on a real window.
+    # (v29: the builders are per-model now - one surface per
+    # model, its points its category scores - and the checks
+    # below read them that way; the renderer-level checks
+    # further down still feed hand-built data dicts, because
+    # the renderer's contract did not change.)
 
     check("v26 surface colour at 0 is strongly blue",
           app.surface_rgb(0) == (25, 80, 210),
@@ -11972,70 +12078,145 @@ def main():
         },
     }
     app.save_manifest(results_dir26, manifest26)
-    data26 = app.surface_data_from_manifest(results_dir26, manifest26)
-    check("v26 manifest surface axes are models by templates",
-          data26["kind"] == "ost_scores"
-          and data26["x_labels"] == ["fake-smart:2b", "fake-dumb:1b"]
-          and data26["y_labels"] == ["Instruction", "Math", "vision"],
-          str((data26["x_labels"], data26["y_labels"])))
-    check("v26 manifest surface matrix, gaps where unmeasured",
-          data26["values"] == [[90.0, None, None], [0.0, None, None]],
+    surfaces26 = dict(app.model_surfaces_from_manifest(
+        results_dir26, manifest26))
+    data26 = surfaces26["fake-smart:2b"]
+
+    def _cat26(data, name):
+        """A category's (value, detail) on a skills patch
+        field, through its patch_categories map."""
+        coord = {v: k for k, v in
+                 data["patch_categories"].items()}[name]
+        xi, yi = (int(p) for p in coord.split(","))
+        return data["values"][xi][yi], data["details"].get(coord, "")
+
+    check("v29 manifest surfaces are one per model, points are "
+          "its categories",
+          list(surfaces26) == ["fake-smart:2b", "fake-dumb:1b"]
+          and data26["kind"] == "ost_skills"
+          and data26["model"] == "fake-smart:2b"
+          and data26["category_order"] == ["Instruction", "Math",
+                                           "vision"]
+          and data26["patch_layout"] == {"rows": 2, "columns": 2}
+          and data26["patch_categories"] == {
+              "0,0": "Instruction", "0,1": "Math", "1,0": "vision"},
+          str((list(surfaces26), data26["patch_categories"])))
+    check("v29 manifest surface patch field, gaps where "
+          "unmeasured",
+          data26["values"] == [[90.0, None], [None, None]]
+          and surfaces26["fake-dumb:1b"]["values"]
+          == [[0.0, None], [None, None]],
           str(data26["values"]))
-    check("v26 manifest surface details carry score and counts",
-          "90%" in data26["details"].get("0,0", "")
-          and "9/10" in data26["details"].get("0,0", "")
-          and "1,1" not in data26["details"]
-          and "0,1" not in data26["details"],
+    check("v29 manifest surface details name model, category, "
+          "score and counts",
+          "fake-smart:2b" in _cat26(data26, "Instruction")[1]
+          and "Instruction" in _cat26(data26, "Instruction")[1]
+          and "90%" in _cat26(data26, "Instruction")[1]
+          and "9/10" in _cat26(data26, "Instruction")[1]
+          and _cat26(data26, "Math")[1] == ""
+          and _cat26(data26, "vision")[1] == "",
           str(data26["details"]))
 
     data26b = app.surface_data_from_model_runs(
         results_dir26, app.slugify_model("fake-smart:2b"))
-    check("v26 model-runs surface takes the latest per template",
-          data26b["x_labels"] == ["fake-smart:2b"]
-          and data26b["values"][0][
-              data26b["y_labels"].index("Instruction")] == 90.0
-          and data26b["values"][0][
-              data26b["y_labels"].index("Math")] is None,
+    check("v29 model-runs surface is the model's own, latest "
+          "per template",
+          data26b["kind"] == "ost_skills"
+          and data26b["model"] == "fake-smart:2b"
+          and _cat26(data26b, "Instruction")[0] == 90.0
+          and _cat26(data26b, "Math")[0] is None,
           str(data26b["values"]))
 
-    # The morph: endpoints exact, middle blended, and the
-    # missing-cell rule (a cell only one side measured fades
-    # toward the floor and is a gap at the far end - it never
-    # takes the other side's value).
-    morph_a26 = {
-        "kind": "ost_scores", "title": "Run A",
-        "x_labels": ["m1"], "y_labels": ["t1", "t2"],
-        "values": [[80.0, None]],
-        "details": {"0,0": "A says"},
-        "partial": [[False, False]],
-    }
-    morph_b26 = {
-        "kind": "ost_scores", "title": "Run B",
-        "x_labels": ["m1", "m2"], "y_labels": ["t1", "t2"],
-        "values": [[40.0, 60.0], [70.0, 30.0]],
-        "details": {"0,0": "B says", "0,1": "B only",
-                    "1,0": "B m2"},
-        "partial": [[False, False], [False, False]],
-    }
+    # The morph (v29 shape): two per-model profiles. Endpoints
+    # exact, middle blended, and the missing-category rule (a
+    # category only one side measured fades toward the floor
+    # and is a gap at the far end - it never takes the other
+    # side's value).
+    morph_a26 = app.skills_surface_data("m1", "Run A", [
+        {"name": "t1", "value": 80.0, "passed": 8, "total": 10,
+         "partial": False},
+        {"name": "t2", "value": None, "passed": None, "total": 0,
+         "partial": False},
+    ])
+    morph_b26 = app.skills_surface_data("m1", "Run B", [
+        {"name": "t1", "value": 40.0, "passed": 4, "total": 10,
+         "partial": False},
+        {"name": "t2", "value": 60.0, "passed": 6, "total": 10,
+         "partial": False},
+    ])
     morph0_26 = app.morph_surface_data(morph_a26, morph_b26, 0.0)
     morph5_26 = app.morph_surface_data(morph_a26, morph_b26, 0.5)
     morph1_26 = app.morph_surface_data(morph_a26, morph_b26, 1.0)
-    check("v26 morph at t=0 is surface A exactly",
-          morph0_26["values"] == [[80.0, None], [None, None]],
+    check("v29 morph at t=0 is profile A exactly",
+          morph0_26["values"] == [[80.0, None]],
           str(morph0_26["values"]))
-    check("v26 morph at t=1 is surface B exactly",
-          morph1_26["values"] == [[40.0, 60.0], [70.0, 30.0]],
+    check("v29 morph at t=1 is profile B exactly",
+          morph1_26["values"] == [[40.0, 60.0]],
           str(morph1_26["values"]))
-    check("v26 morph at t=0.5 blends and fades single-side cells",
-          morph5_26["values"] == [[60.0, 30.0], [35.0, 15.0]],
+    check("v29 morph at t=0.5 blends and fades single-side "
+          "categories",
+          morph5_26["values"] == [[60.0, 30.0]],
           str(morph5_26["values"]))
-    check("v26 morph axes are the union, details from the near side",
-          morph5_26["x_labels"] == ["m1", "m2"]
-          and morph5_26["details"].get("0,0") == "B says"
+    check("v29 morph layout is the category union, details from "
+          "the near side",
+          morph5_26["category_order"] == ["t1", "t2"]
+          and morph5_26["model"] == "m1"
+          and morph5_26["details"].get("0,0")
+          == morph_b26["details"].get("0,0")
           and app.morph_surface_data(
               morph_a26, morph_b26, 0.25)["details"].get("0,0")
-          == "A says",
+          == morph_a26["details"].get("0,0"),
           str(morph5_26["details"]))
+    morph_x26 = app.morph_surface_data(
+        app.skills_surface_data("mA", "Run A", [
+            {"name": "t1", "value": 80.0, "passed": 8, "total": 10,
+             "partial": False},
+            {"name": "t2", "value": None, "passed": None, "total": 0,
+             "partial": False},
+        ]),
+        app.skills_surface_data("mB", "Run B", [
+            {"name": "t1", "value": 40.0, "passed": 4, "total": 10,
+             "partial": False},
+            {"name": "t2", "value": 60.0, "passed": 6, "total": 10,
+             "partial": False},
+        ]), 0.5)
+    check("v29 a morph between two models is one blended "
+          "profile, labelled as the move",
+          morph_x26["model"] == "mA to mB"
+          and morph_x26["values"] == [[60.0, 30.0]],
+          str(morph_x26["model"]))
+    # The union layout: two profiles whose categories differ
+    # share ONE patch field computed from the union (canonical
+    # order kept), a category only one side measured fades,
+    # and the endpoints carry each side's own values on that
+    # shared field.
+    morph_u_a26 = app.skills_surface_data("m1", "Run A", [
+        {"name": n, "value": v, "passed": None, "total": 0,
+         "partial": False}
+        for n, v in (("Alpha", 80.0), ("Beta", 60.0),
+                     ("Gamma", None))])
+    morph_u_b26 = app.skills_surface_data("m1", "Run B", [
+        {"name": n, "value": v, "passed": None, "total": 0,
+         "partial": False}
+        for n, v in (("Alpha", 40.0), ("Delta", 100.0),
+                     ("Beta", 20.0), ("Epsilon", 0.0))])
+    morph_u26 = app.morph_surface_data(
+        morph_u_a26, morph_u_b26, 0.5)
+    check("v29 morph patch layout comes from the union of "
+          "both sides' categories",
+          morph_u26["category_order"] == [
+              "Alpha", "Delta", "Beta", "Epsilon", "Gamma"]
+          and morph_u26["patch_layout"] == {"rows": 2,
+                                             "columns": 3}
+          and morph_u26["values"] == [[60.0, 50.0, 40.0],
+                                      [0.0, None, None]]
+          and app.morph_surface_data(
+              morph_u_a26, morph_u_b26, 0.0)["values"]
+          == [[80.0, None, 60.0], [None, None, None]]
+          and app.morph_surface_data(
+              morph_u_a26, morph_u_b26, 1.0)["values"]
+          == [[40.0, 100.0, 20.0], [0.0, None, None]],
+          str(morph_u26["values"]))
 
     check("v26 the fill interpolates between measured neighbours",
           app.surface_filled_values([[100.0, None], [None, 0.0]])
@@ -12044,16 +12225,15 @@ def main():
           app.surface_filled_values([[None]]) == [[None]])
 
     # The widget: picking goes through its own projection, and a
-    # known matrix renders with both ends of the ramp present.
+    # known profile renders with both ends of the ramp present.
     view26 = app.SurfaceView()
     view26.resize(640, 420)
     view26.set_data({
-        "kind": "ost_scores", "title": "Smoke",
-        "x_labels": ["a", "b", "c"], "y_labels": ["t1", "t2", "t3"],
-        "values": [[100.0, 100.0, 0.0], [100.0, 100.0, 0.0],
-                   [0.0, 0.0, 0.0]],
-        "details": {"0,0": "a - t1: 100%"},
-        "partial": [[False] * 3 for _ in range(3)],
+        "kind": "ost_skills", "title": "Smoke", "model": "solo:1b",
+        "x_labels": ["solo:1b"], "y_labels": ["t1", "t2", "t3"],
+        "values": [[100.0, 0.0, 50.0]],
+        "details": {"0,0": "solo:1b - t1: 100%"},
+        "partial": [[False, False, False]],
     })
     view26.show()
     qt_app.processEvents()
@@ -12062,10 +12242,10 @@ def main():
           point26 is not None
           and view26.pick(point26[0], point26[1]) == (0, 0),
           str(point26))
-    point26b = view26.project(2, 2, 0.0)
-    check("v26 picking at the low corner returns its cell",
+    point26b = view26.project(0, 2, 50.0)
+    check("v26 picking at the last category returns its cell",
           point26b is not None
-          and view26.pick(point26b[0], point26b[1]) == (2, 2),
+          and view26.pick(point26b[0], point26b[1]) == (0, 2),
           str(point26b))
     check("v26 picking far from every marker returns nothing",
           view26.pick(1, 1) is None)
@@ -12109,15 +12289,13 @@ def main():
           and orb_shine26,
           f"orb={orb26} centre={orb_centre26} shine={orb_shine26}")
     view26.set_morph(morph_a26, morph_b26)
-    check("v26 the widget morph starts at surface A",
+    check("v29 the widget morph starts at profile A",
           view26.in_morph_mode()
-          and view26.current_data()["values"]
-          == [[80.0, None], [None, None]],
+          and view26.current_data()["values"] == [[80.0, None]],
           str(view26.current_data()["values"]))
     view26.set_morph_t(0.5)
-    check("v26 the widget morph follows the slider maths",
-          view26.current_data()["values"]
-          == [[60.0, 30.0], [35.0, 15.0]],
+    check("v29 the widget morph follows the slider maths",
+          view26.current_data()["values"] == [[60.0, 30.0]],
           str(view26.current_data()["values"]))
     view26.close()
 
@@ -12148,12 +12326,11 @@ def main():
 
         def _task26(label, template_id, record):
             tracker26.task_done(label, template_id, record)
-            snap = tracker26.data("Live")
-            xi = tracker26.x_labels.index(label)
+            snap = tracker26.data_for(label)
             yi = tracker26.y_ids.index(template_id)
             snaps26.append(
-                (label, snap["values"][xi][yi],
-                 snap["partial"][xi][yi]))
+                (label, snap["values"][0][yi],
+                 snap["partial"][0][yi]))
 
         worker26 = app.BenchWorker(
             targets26, [template26], "sys26", app.machine_info(),
@@ -12171,7 +12348,8 @@ def main():
         worker26.wait()
         check("v26 the live-hook run finishes", ok26
               and finished26.get("done") == "done", str(finished26))
-        check("v26 cells are partial while their template runs",
+        check("v29 a model's point is partial on its own surface "
+              "while its category runs",
               any(label == "fake-smart:2b" and partial
                   and value == 100.0
                   for label, value, partial in snaps26)
@@ -12179,18 +12357,27 @@ def main():
                       and value == 0.0
                       for label, value, partial in snaps26),
               str(snaps26[:3]))
-        final26 = tracker26.data("Latest run")
-        check("v26 cells settle at the template scores",
-              final26["values"] == [[100.0], [0.0]]
+        final26 = tracker26.data_for("fake-smart:2b", "Latest run")
+        final26d = tracker26.data_for("fake-dumb:1b", "Latest run")
+        check("v29 points settle at the category scores, each on "
+              "its own model's surface",
+              final26["values"] == [[100.0]]
+              and final26d["values"] == [[0.0]]
+              and final26["model"] == "fake-smart:2b"
+              and final26["patch_categories"] == {"0,0": "Instruction"}
               and not any(any(row) for row in final26["partial"])
               and "100%" in final26["details"].get("0,0", "")
               and "10/10" in final26["details"].get("0,0", ""),
-              str(final26["values"]))
-        manifest_data26 = app.surface_data_from_manifest(
-            results_dir26, worker26._manifest)
-        check("v26 the finished run's manifest rebuilds its surface",
-              manifest_data26["values"] == [[100.0], [0.0]],
-              str(manifest_data26["values"]))
+              str((final26["values"], final26d["values"])))
+        manifest_data26 = dict(app.model_surfaces_from_manifest(
+            results_dir26, worker26._manifest))
+        check("v29 the finished run's manifest rebuilds each "
+              "model's surface",
+              manifest_data26["fake-smart:2b"]["values"] == [[100.0]]
+              and manifest_data26["fake-dumb:1b"]["values"]
+              == [[0.0]],
+              str({k: v["values"]
+                   for k, v in manifest_data26.items()}))
     finally:
         if prior_host26 is None:
             os.environ.pop("OLLAMA_HOST", None)
@@ -12246,6 +12433,10 @@ def main():
           and window26.surface_status_label.text().startswith(
               "No run yet"),
           window26.surface_status_label.text())
+    check("v29 the Surface tab starts with no model picked and "
+          "skills showing",
+          window26.surface_model_combo.count() == 0
+          and window26.surface_kind_combo.currentData() == "skills")
     check("v26 the Compare run pickers start unpicked",
           window26.compare_run_a.currentData() is None
           and window26.compare_run_b.currentData() is None)
@@ -12266,32 +12457,50 @@ def main():
                 return True
         return False
 
+    def _pick_model26(combo, name):
+        for i in range(combo.count()):
+            if combo.itemText(i) == name:
+                combo.setCurrentIndex(i)
+                return True
+        return False
+
+    # The morph compares the two picked models' profiles: Run
+    # 1's smart (80) moving to Run 2's dumb (70) - one model's
+    # surface at a time, never a shared landscape.
+    _pick_model26(window26.compare_model_a, "fake-smart:2b")
+    _pick_model26(window26.compare_model_b, "fake-dumb:1b")
     picked26 = _pick26(window26.compare_run_a, "20261120-080000-v26") \
         and _pick26(window26.compare_run_b, "20261120-090000-v26")
     if picked26:
         qt_app.processEvents()
-        check("v26 two picked runs start the morph at Run 1",
+        check("v29 two picked runs start the morph at Run 1's "
+              "model profile",
               window26.compare_surface.in_morph_mode()
               and window26.compare_surface.morph_t() == 0.0
               and window26.compare_surface.current_data()["values"]
-              == [[80.0], [20.0]]
+              == [[80.0]]
+              and window26.compare_surface.current_data()[
+                  "model"] == "fake-smart:2b"
               and window26.compare_morph_slider.isEnabled()
               and window26.compare_morph_button.isEnabled(),
-              str(window26.compare_surface.current_data()["values"]))
+              str(window26.compare_surface.current_data()))
         window26.compare_morph_slider.setValue(50)
         qt_app.processEvents()
-        check("v26 the morph slider blends the two runs",
+        check("v29 the morph slider blends the two profiles",
               window26.compare_surface.morph_t() == 0.5
               and window26.compare_surface.current_data()["values"]
-              == [[55.0], [45.0]],
+              == [[75.0]],
               str(window26.compare_surface.current_data()["values"]))
         window26.compare_morph_slider.setValue(100)
         qt_app.processEvents()
-        check("v26 the morph slider drives the blend to Run 2",
+        check("v29 the morph slider drives the blend to Run 2's "
+              "model profile",
               window26.compare_surface.morph_t() == 1.0
               and window26.compare_surface.current_data()["values"]
-              == [[30.0], [70.0]],
-              str(window26.compare_surface.current_data()["values"]))
+              == [[70.0]]
+              and window26.compare_surface.current_data()[
+                  "model"] == "fake-dumb:1b",
+              str(window26.compare_surface.current_data()))
         window26.compare_morph_button.click()
         qt_app.processEvents()
         playing26 = window26.compare_surface.is_playing()
@@ -12307,15 +12516,379 @@ def main():
         enabled26 = window26.history_surface_button.isEnabled()
         window26.show_history_surface()
         qt_app.processEvents()
-        check("v26 View surface loads the run onto the Surface tab",
+        check("v29 View surface loads the run's model onto the "
+              "Surface tab",
               enabled26
               and window26.tabs.currentIndex()
               == window26.TAB_SURFACE
               and window26.surface_view.current_data() is not None
+              and window26.surface_view.current_data()["model"]
+              == window26.surface_model_combo.currentData()
               and window26.surface_status_label.text().startswith(
                   "Showing"),
               window26.surface_status_label.text())
     window26.close()
+
+    # --- v29: the report card's picture, the weights reader,
+    # and the Surface tab's per-model wiring ---
+    # The skills builder: the model's categories laid out as
+    # a patch field (row-major, ceil(sqrt(n)) across), an
+    # untested category staying a gap, and the picking text
+    # naming model, category and score.
+    data29 = app.skills_surface_data(
+        "fake-smart:2b", "fake-smart:2b - run",
+        [{"name": "Coding", "value": 95.0, "passed": 19,
+          "total": 20, "partial": False},
+         {"name": "Vision", "value": 20.0, "passed": 2,
+          "total": 10, "partial": False},
+         {"name": "Math", "value": None, "passed": None,
+          "total": None, "partial": False}])
+    check("v29 the skills builder: one model, categories as "
+          "patches, untested stays a gap",
+          data29["kind"] == "ost_skills"
+          and data29["model"] == "fake-smart:2b"
+          and data29["category_order"] == ["Coding", "Vision",
+                                           "Math"]
+          and data29["patch_layout"] == {"rows": 2, "columns": 2}
+          and data29["patch_categories"] == {
+              "0,0": "Coding", "0,1": "Vision", "1,0": "Math"}
+          and data29["values"] == [[95.0, 20.0], [None, None]]
+          and "fake-smart:2b" in data29["details"].get("0,0", "")
+          and "Coding" in data29["details"].get("0,0", "")
+          and "Vision" in data29["details"].get("0,1", "")
+          and "1,0" not in data29["details"],
+          str(data29["values"]))
+    # The patch field at n >= 4: at least two rows AND two
+    # columns, every category exactly once in canonical
+    # order, row-major coordinates, untested categories as
+    # gaps with no orb, and a deterministic layout.
+    field29 = app.skills_surface_data(
+        "m:1b", "m:1b",
+        [{"name": name, "value": value, "passed": None,
+          "total": 0, "partial": False}
+         for name, value in (("Alpha", 100.0), ("Beta", 80.0),
+                             ("Gamma", None), ("Delta", 20.0),
+                             ("Epsilon", 0.0), ("Zeta", 55.0))])
+    field29b = app.skills_surface_data(
+        "m:1b", "m:1b",
+        [{"name": name, "value": value, "passed": None,
+          "total": 0, "partial": False}
+         for name, value in (("Alpha", 100.0), ("Beta", 80.0),
+                             ("Gamma", None), ("Delta", 20.0),
+                             ("Epsilon", 0.0), ("Zeta", 55.0))])
+    check("v29 the patch field: >= 2 rows and >= 2 columns, "
+          "each category once, row-major, deterministic",
+          field29["patch_layout"] == {"rows": 2, "columns": 3}
+          and field29["category_order"] == [
+              "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"]
+          and field29["patch_categories"] == {
+              "0,0": "Alpha", "0,1": "Beta", "0,2": "Gamma",
+              "1,0": "Delta", "1,1": "Epsilon", "1,2": "Zeta"}
+          and field29["values"] == [[100.0, 80.0, None],
+                                    [20.0, 0.0, 55.0]]
+          and field29 == field29b,
+          str(field29["patch_categories"]))
+    desc29 = app.surface_scene_description(field29)
+    check("v29 an untested patch makes no orb; every measured "
+          "patch does",
+          {(o["xi"], o["yi"]) for o in desc29["orbs"]}
+          == {(0, 0), (0, 1), (1, 0), (1, 1), (1, 2)},
+          str([(o["xi"], o["yi"]) for o in desc29["orbs"]]))
+    # Picking a patch resolves to its category: the widget's
+    # own projection at the Vision patch picks that cell, and
+    # the cell's detail names model, category and score.
+    view29 = app.SurfaceView()
+    view29.resize(640, 420)
+    view29.set_data(data29)
+    view29.show()
+    qt_app.processEvents()
+    point29 = view29.project(0, 1, 20.0)
+    check("v29 picking a patch resolves to its category",
+          point29 is not None
+          and view29.pick(point29[0], point29[1]) == (0, 1)
+          and "Vision" in data29["details"].get("0,1", "")
+          and "20%" in data29["details"].get("0,1", ""),
+          str(point29))
+    view29.close()
+    # The card's picture: the painter renderer drawn to an
+    # image - headless, no GL - with real content in it.
+    png29 = os.path.join(SCRATCH, "card-surface29.png")
+    rendered29 = app.render_surface_png(data29, png29)
+    from PySide6.QtGui import QImage as _QImage29
+    image29 = _QImage29(png29) if rendered29 else None
+    check("v29 the report picture renders headless with real "
+          "content",
+          rendered29 and os.path.getsize(png29) > 2000
+          and image29 is not None and not image29.isNull()
+          and image29.width() == 1200,
+          f"{os.path.getsize(png29) if os.path.exists(png29) else 0}"
+          " bytes")
+    # The picture's labels: a rendered skills surface names
+    # its patches with their categories - the label set is
+    # exactly the categories present, at their own patches,
+    # never the grid's "Patch row/column" words - and a
+    # surface without patches draws no patch labels.
+    labels29 = app.surface_patch_labels(field29)
+    check("v29 the rendered skills surface labels its patches "
+          "with the category names",
+          {text for _xi, _yi, text in labels29}
+          == set(field29["patch_categories"].values())
+          and {(xi, yi) for xi, yi, _text in labels29}
+          == {(int(key.split(",")[0]), int(key.split(",")[1]))
+              for key in field29["patch_categories"]}
+          and not any("Patch" in text
+                      for _xi, _yi, text in labels29)
+          and app.surface_patch_labels(
+              {"kind": "ost_weights", "values": [[1.0]]}) == [],
+          str(labels29))
+    # (v29, second fix): the warmup request itself carries no
+    # cap. It used to stop at 64 tokens - a thinking model
+    # spends its first tokens thinking, so the cap cut the
+    # warmup off mid-thought and the run aborted before any
+    # test. A thinking-capable target's first generate call
+    # (the warmup) must carry num_predict -1, and its run
+    # must finish.
+    server29w, _t29w = fake_ollama.start_server()
+    host29w, port29w = server29w.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host29w}:{port29w}"
+    target29w = app.ollama_target(
+        "fake-smart:2b",
+        app.capabilities_from_show(app.ollama_show("fake-smart:2b")))
+    tmpls29w = {t["id"]: t for t in app.load_templates()[0]}
+    results29w = {}
+    finished29w = {"done": False}
+    worker29w = app.BenchWorker(
+        [target29w],
+        [dict(tmpls29w["instruction"], repeats=1)],
+        "sys29w", app.machine_info(),
+        os.path.join(SCRATCH, "results29w"))
+    worker29w.model_done.connect(
+        lambda name, result: results29w.__setitem__(name, result))
+    worker29w.run_finished.connect(
+        lambda reason: finished29w.__setitem__("done", reason))
+    worker29w.start()
+    ok29w = wait_until(lambda: finished29w["done"],
+                       timeout=180, app=qt_app)
+    worker29w.wait()
+    warmup_options29w = (server29w.generate_options[0]
+                         if server29w.generate_options else {})
+    check("v29 the warmup request carries no cap for a "
+          "thinking-capable target",
+          ok29w and finished29w["done"] == "done"
+          and "thinking" in (target29w.get("capabilities") or [])
+          and app.WARMUP_PREDICT == app.NO_CAP
+          and warmup_options29w.get("num_predict") == -1,
+          str(warmup_options29w))
+    server29w.shutdown()
+    result29 = {
+        "name": "fake-smart:2b", "status": "done",
+        "overall": 95.0,
+        "template_scores": [("instruction", 95.0)],
+        "templates": {"instruction": {
+            "template_name": "Instruction",
+            "template_score": 95.0, "passed": 19, "total": 20,
+            "tasks": []}},
+        "model_info": None,
+    }
+    text29 = app.render_text_report(
+        [result29], surface_pictures={
+            "fake-smart:2b": "card-fake-smart_2b-surface.png"})
+    check("v29 the card names its skills picture in plain words",
+          "Skills picture: card-fake-smart_2b-surface.png"
+          in text29, text29[:800])
+    check("v29 without a picture the card claims none",
+          "Skills picture" not in app.render_text_report(
+              [result29]))
+    # The weights reader against a synthetic GGUF the suite
+    # writes itself: known values in, known statistics out; an
+    # unsupported type skipped and counted, never guessed.
+    import struct as _struct29
+
+    def _write_gguf29(path):
+        payloads29 = [
+            ("token_embd.weight", 0, [4],
+             _struct29.pack("<4f", 1.0, -2.0, 3.0, -4.0)),
+            ("blk.0.attn_q.weight", 8, [32],
+             _struct29.pack("<e", 1.0) + bytes([2] * 32)),
+            ("blk.0.ffn_down.weight", 2, [32], bytes(18)),
+        ]
+        header29 = bytearray(
+            b"GGUF" + _struct29.pack("<IQQ", 3, len(payloads29), 0))
+        blobs29 = bytearray()
+        entries29 = []
+        offset29 = 0
+        for name29, type29, dims29, payload29 in payloads29:
+            pad29 = (-offset29) % 32
+            blobs29 += b"\0" * pad29
+            offset29 += pad29
+            entries29.append((name29, type29, dims29, offset29))
+            blobs29 += payload29
+            offset29 += len(payload29)
+        for name29, type29, dims29, off29 in entries29:
+            encoded29 = name29.encode()
+            header29 += _struct29.pack("<Q", len(encoded29))
+            header29 += encoded29
+            header29 += _struct29.pack("<I", len(dims29))
+            for dim29 in dims29:
+                header29 += _struct29.pack("<Q", dim29)
+            header29 += _struct29.pack("<I", type29)
+            header29 += _struct29.pack("<Q", off29)
+        start29 = (len(header29) + 31) // 32 * 32
+        with open(path, "wb") as handle29:
+            handle29.write(bytes(header29)
+                           + b"\0" * (start29 - len(header29))
+                           + bytes(blobs29))
+
+    fixture29 = os.path.join(SCRATCH, "fixture29.gguf")
+    _write_gguf29(fixture29)
+    stats29, skipped29 = app.gguf_weight_stats(fixture29)
+    check("v29 the weights reader: known values in, known "
+          "statistics out",
+          abs(stats29["token_embd.weight"][0] - 2.5) < 1e-6
+          and abs(stats29["token_embd.weight"][1]
+                  - 7.25 ** 0.5) < 1e-4
+          and abs(stats29["blk.0.attn_q.weight"][0] - 2.0) < 1e-6
+          and stats29["blk.0.attn_q.weight"][1] == 0.0,
+          str(stats29))
+    check("v29 an unsupported tensor type is skipped and "
+          "counted, never guessed",
+          skipped29 == [("blk.0.ffn_down.weight", "Q4_0")]
+          and "blk.0.ffn_down.weight" not in stats29,
+          str(skipped29))
+    wdata29, winfo29 = app.weights_data_from_stats(
+        "fix:1b", stats29, skipped29)
+    check("v29 the weights surface groups layers and "
+          "normalizes to the model's own peak",
+          wdata29["kind"] == "ost_weights"
+          and wdata29["x_labels"] == ["Embedding", "Layer 0"]
+          and wdata29["values"][0][
+              wdata29["y_labels"].index("Embed / head")] == 100.0
+          and abs(wdata29["values"][1][
+              wdata29["y_labels"].index("Attn Q")] - 80.0) < 1e-6
+          and winfo29["tensors_read"] == 2,
+          str(wdata29["values"]))
+    store29 = os.path.join(SCRATCH, "store29")
+    os.makedirs(os.path.join(
+        store29, "manifests", "registry.ollama.ai", "library",
+        "fix"), exist_ok=True)
+    os.makedirs(os.path.join(store29, "blobs"), exist_ok=True)
+    with open(os.path.join(
+            store29, "manifests", "registry.ollama.ai",
+            "library", "fix", "1b"), "w",
+            encoding="utf-8") as handle29:
+        json.dump({"layers": [{
+            "mediaType": "application/vnd.ollama.image.model",
+            "digest": "sha256:" + "a" * 64}]}, handle29)
+    shutil.copyfile(fixture29, os.path.join(
+        store29, "blobs", "sha256-" + "a" * 64))
+    blob29, _why29 = app.find_model_blob("fix:1b", store29)
+    check("v29 the weights view resolves a local model "
+          "through its manifest",
+          blob29 is not None
+          and blob29.endswith("sha256-" + "a" * 64), str(blob29))
+    none29, why29 = app.find_model_blob("ghost:9b", store29)
+    check("v29 a model with no local file gets a plain note, "
+          "never a fake surface",
+          none29 is None and "No local model file" in why29, why29)
+    # A real (fake-server) run on a fresh window: the Surface
+    # tab follows the model being tested, the weights view
+    # answers honestly for a file-less name, and the saved
+    # card ships its picture.
+    server29, _t29 = fake_ollama.start_server()
+    host29, port29 = server29.server_address
+    prior_host29 = os.environ.get("OLLAMA_HOST")
+    os.environ["OLLAMA_HOST"] = f"http://{host29}:{port29}"
+    # The suite restores the REAL run preview just before this
+    # section (the v26 section never starts a run from a
+    # window, so it never noticed); a window run here would
+    # park on the preview dialog forever offscreen. Stub it
+    # for this block, like the v8/v15 sections do, and put
+    # the real one back after.
+    real_preview29 = app.MainWindow._show_run_preview
+    app.MainWindow._show_run_preview = (
+        lambda self, t, m, p=None: True)
+    try:
+        window29 = app.MainWindow()
+        window29.show()
+        qt_app.processEvents()
+        window29.refresh_models()
+        wait_until(lambda: window29.model_list.count() >= 1,
+                   timeout=10, app=qt_app)
+        set_checked_list(window29.model_list, {"fake-smart:2b"})
+        set_checked_templates(window29, {"instruction"})
+        window29.start_run()
+        done29 = wait_until(lambda: window29.worker is None,
+                            timeout=180, app=qt_app)
+        check("v29 the window run finishes", done29)
+        live29 = window29._surface_skills.get("fake-smart:2b")
+        check("v29 the Surface tab holds the tested model's "
+              "own surface",
+              live29 is not None and live29["values"] == [[100.0]]
+              and window29.surface_model_combo.currentData()
+              == "fake-smart:2b",
+              str(live29 and live29["values"]))
+        window29._surface_skills["provider-x / demo"] = live29
+        window29._surface_set_models(
+            ["fake-smart:2b", "provider-x / demo"],
+            "provider-x / demo")
+        kind29 = window29.surface_kind_combo
+        kind29.setCurrentIndex(kind29.findData("weights"))
+        noted29 = wait_until(
+            lambda: "No local model file"
+            in window29.surface_status_label.text(),
+            timeout=60, app=qt_app)
+        check("v29 the weights view shows its own caption and "
+              "the no-file note",
+              noted29
+              and window29.surface_view.current_data() is None
+              and window29.surface_caption_label.text()
+              == app.WEIGHTS_HONESTY_CAPTION,
+              window29.surface_status_label.text())
+        kind29.setCurrentIndex(kind29.findData("skills"))
+        qt_app.processEvents()
+        check("v29 switching back shows the skills surface "
+              "and its caption",
+              window29.surface_caption_label.text()
+              == app.SURFACE_HONESTY_CAPTION
+              and window29.surface_view.current_data() is not None,
+              window29.surface_caption_label.text())
+        before29 = (
+            {f for f in os.listdir(RESULTS_DIR)
+             if f.startswith("bench-results-")}
+            if os.path.exists(RESULTS_DIR) else set())
+        window29.save_report()
+        qt_app.processEvents()
+        after29 = (
+            {f for f in os.listdir(RESULTS_DIR)
+             if f.startswith("bench-results-")}
+            if os.path.exists(RESULTS_DIR) else set())
+        new29 = sorted(f for f in (after29 - before29)
+                       if f.endswith(".txt"))
+        card29 = ""
+        stem29 = ""
+        pic29 = ""
+        if new29:
+            stem29 = new29[0][:-4]
+            card29 = open(os.path.join(RESULTS_DIR, new29[0]),
+                          encoding="utf-8").read()
+            pic29 = os.path.join(
+                RESULTS_DIR,
+                f"{stem29}-fake-smart_2b-surface.png")
+        check("v29 a saved card ships its model's surface "
+              "picture beside it, named in the card",
+              bool(new29) and os.path.exists(pic29)
+              and os.path.getsize(pic29) > 2000
+              and f"Skills picture: {stem29}-fake-smart_2b"
+              "-surface.png" in card29,
+              card29[:400])
+        window29.close()
+    finally:
+        app.MainWindow._show_run_preview = real_preview29
+        if prior_host29 is None:
+            os.environ.pop("OLLAMA_HOST", None)
+        else:
+            os.environ["OLLAMA_HOST"] = prior_host29
+        server29.shutdown()
 
     # --- v26 GL wire-in: scene description, ramp, fallback ---
     # The ramp's top is the deepened saturated orange (the

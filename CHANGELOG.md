@@ -1,5 +1,92 @@
 # Changelog
 
+## v29 (2026-11-21)
+
+The surface is one model's surface now - and it goes on
+the report card.
+
+- Corrected the surface's design on Joshua's order: OST
+  tests one model at a time, so the surface shows ONE
+  model - what it is strongest and weakest at. The
+  v26-v28 design (every model of a run in one shared
+  landscape, models along one axis and templates along
+  the other) was never his instruction and is retired.
+  Each point is now one of the model's test categories,
+  in the app's test order, the score as the height -
+  peaks strong, valleys weak. It still builds
+  live as the model is tested (a category's point is
+  partial while it runs, settled at its score when it
+  finishes; untested categories stay gaps), and picking
+  names the model, the category and the score. A run
+  that covered several models (a re-run, a resume) has
+  one surface per model, chosen with the tab's new model
+  picker; during a run the tab follows the model being
+  tested. The fixed 25x25 square-cube grid, the matte
+  finish, the thin cage, the colours and the honesty
+  caption are unchanged.
+- The grid goes on the report card: saving a report now
+  also saves a PNG picture of each tested model's skills
+  surface next to the report (drawn by the painted
+  renderer, so it needs no OpenGL), and the card names
+  the picture in plain words. The Profiles tab - the
+  in-app report card - shows the model's surface with
+  its card.
+- A second view on the Surface tab: Weights. The app
+  reads the model's own GGUF file from Ollama's store
+  (found through its manifest) and draws weight strength
+  by layer - one row per layer, the embedding and head
+  as their own rows, one point per part of the layer
+  (attention q/k/v/out and merged parts, MLP
+  gate/up/down, norms) - the height being the part's
+  average |weight| scaled to the model's strongest part.
+  F32, F16, Q8_0, Q4_K and Q6_K tensors are dequantized
+  and measured (the dequantizers were verified bit-exact
+  against gguf-py); a tensor in an unreadable format is
+  skipped and counted, never guessed. The caption says
+  plainly that it shows the file's numbers, not what the
+  model is good at. A provider model or a missing file
+  gets a plain "no local model file" note - never a fake
+  surface. The read runs off the window's thread; a 2B
+  model file takes about half a minute.
+- The Compare morph blends two per-model profiles now -
+  the same model across two runs, or two models - under
+  the same missing-category fade rule as before.
+- numpy is a requirement now (the weights reader uses
+  it); install.sh verifies it imports. The app imports
+  it lazily and the weights view degrades to its plain
+  note without it, so an auto-update from v28 (whose
+  updater cannot install new packages) still runs - it
+  just cannot read weight files until a full install.
+- Layout correction (pre-ship, Joshua's call): the first
+  v29 build laid the categories out as one row - each
+  category a long flat strip across the field, which
+  reads as rectangles, the look he had already rejected
+  three times. The categories now fill a two-dimensional
+  patch field instead: row-major in the app's test
+  order, ceil(sqrt(n)) patches across, each patch one
+  category's score, leftover cells gaps - so neighbouring
+  patches at different heights step up and down like the
+  reference video's terrain. Picking a patch still names
+  its category and score (the data carries a
+  patch-to-category map), and the Compare morph lays
+  both profiles out on the union of their categories so
+  the two sides share one field. The renderer, the
+  fixed square-cube grid, colours, cage and camera are
+  unchanged - only the layout of the points moved.
+- Equal test counts (Joshua: "equal amounts of tests
+  for every test subject - no section bigger than any
+  other"): every scored subject now has exactly 10
+  tasks. Anchor goes 20 -> 10, keeping the first five
+  MMLU-style and the first five GSM8K-style questions;
+  Coding goes 11 -> 10, dropping the standalone is_prime
+  task (the prime_counter task already requires is_prime
+  plus count_primes, and both harder v24 tasks stay).
+  Speed keeps its 2 prompts - it is a timed generation
+  workload, not questions - and still gets its own
+  patch on the surface. Because the question sets
+  changed, Anchor and Coding scores on v29 cards are
+  not directly comparable with pre-v29 cards.
+
 ## v28 (2026-11-20)
 
 The surface's grid is fixed: small square cubes.

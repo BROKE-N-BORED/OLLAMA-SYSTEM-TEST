@@ -173,16 +173,24 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "28"
+__version__ = "29"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
-WARMUP_PREDICT = 64
 # (v23): a template's num_predict of -1 means NO CAP — the model
 # writes until it stops on its own. That is Ollama's own meaning
 # for -1, and the shipped default: a cap cut long answers off
 # mid-thought and scored them wrong for a harness reason. The one
 # real bound left is the model's own context window.
 NO_CAP = -1
+# (v29): the warmup follows the same no-cap rule as the
+# templates. It used to stop at 64 tokens; a thinking model
+# spends its first tokens thinking (one was measured at ~167
+# tokens before its first answer word), so the cap cut the
+# warmup off mid-thought and the whole run aborted before a
+# single test. The warmup now goes through the same uncapped
+# path the templates use: Ollama gets -1, providers omit
+# max_tokens.
+WARMUP_PREDICT = NO_CAP
 # (v24): runaway-loop detection (item 2). A model that finds its
 # answer and then repeats it instead of stopping — the FARA
 # failure — must not eat an uncapped run or bury the right answer
@@ -1313,8 +1321,10 @@ def estimate_run_cost(targets, templates, pairs=None):
     Ollama targets are free and never appear. The warmup call is
     counted (the provider charges for it too), for text models only
     — a model with no text capability gets a connection test instead
-    of a text warmup, same as the worker. Templates a target cannot
-    run are skipped, same as the worker. When pairs is given (a
+    of a text warmup, same as the worker. The warmup is uncapped
+    (v29), so a text model's completion estimate is None and its
+    cost unknown - it is listed under "uncapped". Templates a
+    target cannot run are skipped, same as the worker. When pairs is given (a
     re-run of failed pairs, R24), only the pairs in the set count.
     """
     per_model = []
@@ -1333,7 +1343,12 @@ def estimate_run_cost(targets, templates, pairs=None):
         completion_tokens = 0
         if "text" in set(target.get("capabilities") or ["text"]):
             prompt_tokens += _chars_to_tokens(len(WARMUP_PROMPT))
-            completion_tokens += WARMUP_PREDICT
+            # (v29): the warmup is uncapped, like the templates
+            # since v23, so its completion has no upper estimate:
+            # the count becomes None and stays None - the same
+            # convention estimate_template_tokens uses for an
+            # uncapped call. (Never arithmetic on the -1.)
+            completion_tokens = None
         for template in mine:
             if not template_eligible(template, target):
                 continue
@@ -5724,7 +5739,7 @@ def build_report_data(results):
     }
 
 
-def render_text_report(results):
+def render_text_report(results, surface_pictures=None):
     lines = [
         "OLLAMA SYSTEM TEST - benchmark report",
         f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
@@ -5761,6 +5776,16 @@ def render_text_report(results):
         info_line = _model_info_line(result.get("model_info"))
         if info_line:
             lines.append(f"  {info_line}")
+        picture = (surface_pictures or {}).get(result["name"])
+        if picture:
+            # (v29): the model's grid goes on its report card -
+            # a picture of its skills surface, saved next to
+            # this report.
+            lines.append(
+                f"  Skills picture: {picture} - a picture of "
+                "this model's surface (what it is strongest "
+                "and weakest at), saved next to this report."
+            )
         if result.get("total_tokens") is not None:
             lines.append(
                 f"  Tokens: {fmt_tokens(result.get('prompt_tokens'))} in, "
@@ -8453,15 +8478,33 @@ class BenchWorker(QThread):
 #    "partial": [[true/false per y] per x] (optional; true means
 #                the point is still being measured)}
 #
-# In OST: x = models, y = templates, value = the template score
-# (the measured pass share of its finished tasks). The fill the
-# widget draws between points is interpolated and VISUAL ONLY -
-# the caption under every surface says so.
+# In OST (v29, Joshua's correction of 2026-11-21): a surface is
+# ONE model's. OST only ever tests one model at a time, so the
+# v26-v28 axes (every model in the run as a row of one shared
+# landscape) are retired - they were never his instruction. The
+# skills surface is that model's strongest-to-weakest profile:
+# its test categories in canonical template order, laid out as
+# a two-dimensional patch field (row-major, ceil(sqrt(n))
+# patches across), value = the category score (the measured
+# pass share of its finished tasks). The data's patch_categories
+# map names the category behind every patch coordinate, which
+# is what picking reads. The weights surface (below) is
+# the same model's file read directly: x = layers, y = tensor
+# groups, value = average |weight| scaled within the model. The
+# fill the widget draws between points is interpolated and
+# VISUAL ONLY - the caption under every surface says so.
 # ---------------------------------------------------------------------------
 
 SURFACE_HONESTY_CAPTION = (
     "Points are measured scores. The smooth surface between them "
     "is a visual guide, not measured data."
+)
+
+WEIGHTS_HONESTY_CAPTION = (
+    "Weight strength by layer, read from the model file. Each "
+    "point is a part of the file's average weight size, scaled "
+    "so this model's strongest part is 100. It shows the file's "
+    "numbers, not what the model is good at."
 )
 
 # The colour ramp: blue at 0, through light blue and a warm
@@ -8529,6 +8572,95 @@ def surface_detail_text(model, template_name, value, passed, total,
     if partial:
         text += " (still being measured)"
     return text
+
+
+def skills_patch_layout(count):
+    """The skills patch field's shape for count categories:
+    (rows, columns), deterministic for every count >= 1 -
+    columns = ceil(sqrt(count)), rows = ceil(count /
+    columns), categories filling the field row-major
+    (left-to-right, top-to-bottom). Leftover cells in the
+    last row are gaps. One category is a single patch, which
+    the renderers spread across the whole field."""
+    if count < 1:
+        return 0, 0
+    columns = math.ceil(math.sqrt(count))
+    rows = math.ceil(count / columns)
+    return rows, columns
+
+
+def skills_surface_data(model, title, categories):
+    """One model's skills surface (v29): its strongest-to-weakest
+    profile as surface data. categories is a list of dicts, one
+    per test category in canonical template order:
+    {"name": ..., "value": score-or-None, "passed": ...,
+     "total": ..., "partial": bool}. The categories are laid
+    out as a two-dimensional patch field (see
+    skills_patch_layout): each patch carries its category's
+    single score, and patch_categories names the category
+    behind every patch coordinate - picking a patch or its
+    orb reads its detail text, which names model, category
+    and score. A category with no score (not run, not
+    eligible, the server died) is a gap - never a 0. Every
+    skills producer (the live tracker, a saved run, a
+    report card, a profile) builds through here, so they can
+    never disagree about the shape."""
+    categories = list(categories)
+    rows, columns = skills_patch_layout(len(categories))
+    values = [[None] * columns for _ in range(rows)]
+    partial = [[False] * columns for _ in range(rows)]
+    details = {}
+    patch_categories = {}
+    for index, category in enumerate(categories):
+        xi, yi = divmod(index, columns)
+        value = category.get("value")
+        values[xi][yi] = value
+        partial[xi][yi] = bool(category.get("partial"))
+        patch_categories[f"{xi},{yi}"] = category.get("name", "")
+        if value is not None:
+            details[f"{xi},{yi}"] = surface_detail_text(
+                model, category.get("name", ""),
+                value, category.get("passed"),
+                category.get("total"),
+                bool(category.get("partial")))
+    return {
+        "kind": "ost_skills",
+        "title": title,
+        "model": model,
+        "x_labels": [f"Patch row {xi + 1}" for xi in range(rows)],
+        "y_labels": [f"Patch column {yi + 1}"
+                     for yi in range(columns)],
+        "values": values,
+        "details": details,
+        "partial": partial,
+        "category_order": [c.get("name", "") for c in categories],
+        "patch_categories": patch_categories,
+        "patch_layout": {"rows": rows, "columns": columns},
+    }
+
+
+def surface_patch_labels(data):
+    """The labels a rendered picture puts on a skills surface:
+    (x index, y index, category name) for every patch, read
+    from the data's patch_categories map. The picture names
+    the model's categories at their patches - the grid's own
+    words ("Patch row 1", "Patch column 2") say nothing about
+    the model, so they are never drawn on it. Empty for any
+    other surface (the weights map keeps its axis labels).
+    Pure - no Qt - so the suite can check the label set
+    without a window."""
+    patch_categories = (data or {}).get("patch_categories") or {}
+    labels = []
+    for key, name in patch_categories.items():
+        if not name:
+            continue
+        try:
+            xi_text, yi_text = key.split(",", 1)
+            labels.append((int(xi_text), int(yi_text), name))
+        except (ValueError, AttributeError):
+            continue
+    labels.sort()
+    return labels
 
 
 class SurfaceTracker:
@@ -8626,47 +8758,38 @@ class SurfaceTracker:
         cell["passed"] = run_data.get("passed")
         cell["total"] = run_data.get("total") or 0
 
-    def data(self, title):
-        """The shared surface-data shape for the run so far."""
-        values = []
-        partial = []
-        details = {}
-        for xi, label in enumerate(self.x_labels):
-            column = []
-            partial_column = []
-            for yi, template_id in enumerate(self.y_ids):
-                cell = self.cells.get((label, template_id))
-                value = cell["value"] if cell else None
-                column.append(value)
-                partial_column.append(
-                    bool(cell and cell["partial"]))
-                if value is not None and cell is not None:
-                    details[f"{xi},{yi}"] = surface_detail_text(
-                        label,
-                        self.y_names.get(template_id, template_id),
-                        value, cell.get("passed"),
-                        cell.get("total"),
-                        bool(cell["partial"]))
-            values.append(column)
-            partial.append(partial_column)
-        return {
-            "kind": "ost_scores",
-            "title": title,
-            "x_labels": list(self.x_labels),
-            "y_labels": [self.y_names.get(tid, tid)
-                         for tid in self.y_ids],
-            "values": values,
-            "details": details,
-            "partial": partial,
-        }
+    def labels(self):
+        """The run's model labels, in run order."""
+        return list(self.x_labels)
+
+    def data_for(self, label, title=None):
+        """One model's skills surface for the run so far (v29):
+        its categories in the run's template order, each settled
+        at its real score or still partial at the measured pass
+        share of its finished tasks. A model the run has not
+        reached yet is all gaps."""
+        if label not in self.x_labels:
+            return None
+        categories = []
+        for template_id in self.y_ids:
+            cell = self.cells.get((label, template_id))
+            categories.append({
+                "name": self.y_names.get(template_id, template_id),
+                "value": cell["value"] if cell else None,
+                "passed": cell.get("passed") if cell else None,
+                "total": cell.get("total") if cell else 0,
+                "partial": bool(cell and cell["partial"]),
+            })
+        return skills_surface_data(
+            label, title or label, categories)
 
 
-def surface_data_from_manifest(results_dir, manifest):
-    """A saved run's surface, rebuilt from its manifest and run
-    files: x = the run's models, y = the run's templates, each
-    value the run file's template score. Pairs that never
-    produced a scored run file stay gaps."""
-    x_labels = [t.get("label") for t in manifest.get("targets") or []]
+def model_surfaces_from_manifest(results_dir, manifest):
+    """A saved run's skills surfaces, one per model (v29):
+    a list of (label, surface data) in the run's target order.
+    Each model's categories follow the run's template order;
+    a category whose run file never produced a score stays a
+    gap."""
     y_ids = list(manifest.get("templates") or [])
     names = {}
     cells = {}
@@ -8678,73 +8801,247 @@ def surface_data_from_manifest(results_dir, manifest):
             continue
         names[template_id] = run_data.get("template_name") or template_id
         cells[(label, template_id)] = run_data
-    values = []
-    details = {}
-    for xi, label in enumerate(x_labels):
-        column = []
-        for yi, template_id in enumerate(y_ids):
-            run_data = cells.get((label, template_id))
-            value = (run_data.get("template_score")
-                     if run_data else None)
-            column.append(value)
-            if value is not None and run_data is not None:
-                details[f"{xi},{yi}"] = surface_detail_text(
-                    label,
-                    names.get(template_id, template_id),
-                    value, run_data.get("passed"),
-                    run_data.get("total"))
-        values.append(column)
     started = (manifest.get("started") or "").replace("T", " ")
-    return {
-        "kind": "ost_scores",
-        "title": f"Run {started}".strip(),
-        "x_labels": x_labels,
-        "y_labels": [names.get(tid, tid) for tid in y_ids],
-        "values": values,
-        "details": details,
-        "partial": [[False] * len(y_ids) for _ in x_labels],
-    }
+    surfaces = []
+    for target in manifest.get("targets") or []:
+        label = target.get("label")
+        if label is None:
+            continue
+        categories = []
+        for template_id in y_ids:
+            run_data = cells.get((label, template_id))
+            categories.append({
+                "name": names.get(template_id, template_id),
+                "value": (run_data.get("template_score")
+                          if run_data else None),
+                "passed": (run_data.get("passed")
+                           if run_data else None),
+                "total": (run_data.get("total") or 0
+                          if run_data else 0),
+                "partial": False,
+            })
+        surfaces.append((label, skills_surface_data(
+            label, f"{label} - run {started}".strip(), categories)))
+    return surfaces
 
 
 def surface_data_from_model_runs(results_dir, model_slug):
-    """One model's surface from its latest run of each template
-    (the Past runs fallback, for a run file whose manifest is
-    gone): x = the model alone, y = its templates."""
+    """One model's skills surface from its latest run of each
+    template (the Past runs fallback, for a run file whose
+    manifest is gone). Categories are ordered by template id -
+    the canonical order templates load in."""
     runs = load_model_runs(results_dir, model_slug)
     latest = {}
-    order = []
     name = model_slug
     for run_data in runs:
         template_id = run_data.get("template")
         if not template_id:
             continue
-        if template_id not in latest:
-            order.append(template_id)
         latest[template_id] = run_data
         if run_data.get("model"):
             name = run_data["model"]
-    values = []
-    details = {}
-    column = []
-    for yi, template_id in enumerate(order):
+    categories = []
+    for template_id in sorted(latest):
         run_data = latest[template_id]
-        value = run_data.get("template_score")
-        column.append(value)
+        categories.append({
+            "name": run_data.get("template_name") or template_id,
+            "value": run_data.get("template_score"),
+            "passed": run_data.get("passed"),
+            "total": run_data.get("total") or 0,
+            "partial": False,
+        })
+    return skills_surface_data(
+        name, f"{name} - latest scores", categories)
+
+
+def skills_surface_data_from_result(result, templates):
+    """One model's skills surface from a finished benchmark
+    result (the report card's picture, v29). Categories follow
+    the canonical template order of the given templates list;
+    templates the result never ran are not categories here,
+    and a template that ran without a score is a gap."""
+    categories = []
+    runs = result.get("templates") or {}
+    for template in templates:
+        template_id = template.get("id")
+        run = runs.get(template_id)
+        if run is None:
+            continue
+        categories.append({
+            "name": run.get("template_name")
+                    or template.get("name") or template_id,
+            "value": run.get("template_score"),
+            "passed": run.get("passed"),
+            "total": run.get("total") or 0,
+            "partial": False,
+        })
+    return skills_surface_data(
+        result.get("name", ""), result.get("name", ""), categories)
+
+
+def skills_surface_data_from_profile(numbers):
+    """One model's skills surface from its profile numbers
+    (the Profiles tab's card, v29): the latest score on each
+    template, in canonical (template id) order. A template
+    with no scored run is a gap."""
+    categories = []
+    for name, latest, _best, _count, _not_run in \
+            numbers.get("template_rows") or []:
+        categories.append({
+            "name": name,
+            "value": latest,
+            "passed": None,
+            "total": 0,
+            "partial": False,
+        })
+    return skills_surface_data(
+        numbers.get("model_name", ""),
+        numbers.get("model_name", ""), categories)
+
+
+def _skills_category_entries(data):
+    """One skills surface's categories as {name: entry}, in
+    the surface's own category order: each entry carries its
+    patch coordinate, value, partial flag and detail text.
+    Reads the patch-field shape skills_surface_data builds
+    (patch_categories is the coordinate -> category map);
+    a pre-patch 1 x N surface (categories along y, the model
+    alone on x) reads the same way, so a morph can meet one."""
+    entries = {}
+    values = data.get("values") or []
+    partial_grid = data.get("partial") or []
+    details = data.get("details") or {}
+
+    def _entry(name, xi, yi):
+        try:
+            value = values[xi][yi]
+        except (IndexError, TypeError):
+            value = None
+        try:
+            partial = bool(partial_grid[xi][yi])
+        except (IndexError, TypeError):
+            partial = False
+        return {"name": name, "xi": xi, "yi": yi, "value": value,
+                "partial": partial,
+                "detail": details.get(f"{xi},{yi}")}
+
+    patch_categories = data.get("patch_categories") or {}
+    if patch_categories:
+        def _coord(key):
+            xi, yi = key.split(",", 1)
+            return int(xi), int(yi)
+
+        for key in sorted(patch_categories, key=_coord):
+            xi, yi = _coord(key)
+            name = patch_categories[key]
+            entries[name] = _entry(name, xi, yi)
+        return entries
+    order = data.get("category_order") or []
+    if order:
+        _rows, columns = skills_patch_layout(len(order))
+        for index, name in enumerate(order):
+            xi, yi = divmod(index, columns)
+            entries[name] = _entry(name, xi, yi)
+        return entries
+    for yi, name in enumerate(data.get("y_labels") or []):
+        entries[name] = _entry(name, 0, yi)
+    return entries
+
+
+def _merge_category_orders(order_a, order_b):
+    """The union of two surfaces' category orders, keeping
+    BOTH sides' canonical order: every name lands after the
+    names its own side put before it and before the names
+    its own side put after it, whenever the two sides agree
+    on an order at all (they do - both are subsequences of
+    the one canonical template order)."""
+    merged = list(order_a)
+    for index, name in enumerate(order_b):
+        if name in merged:
+            continue
+        low = 0
+        for before in order_b[:index]:
+            if before in merged:
+                low = max(low, merged.index(before) + 1)
+        high = len(merged)
+        for after in order_b[index + 1:]:
+            if after in merged:
+                high = min(high, merged.index(after))
+        if low > high:
+            low = high = len(merged)
+        merged.insert(low if low == high else max(low, min(high, low)),
+                      name)
+    return merged
+
+
+def _morph_skills_data(data_a, data_b, t):
+    """Blend two per-model skills surfaces (v29): the same
+    model's two report cards, or two models'. The patch
+    layout is computed from the UNION of both sides'
+    categories (canonical order), so both profiles share
+    one field; the missing-cell rule is
+    morph_surface_data's own - a category measured on only
+    one side fades toward the floor and is a gap at the far
+    end. The blend is one model's profile morphing into
+    another, never two models side by side."""
+    entries_a = _skills_category_entries(data_a)
+    entries_b = _skills_category_entries(data_b)
+    order = _merge_category_orders(
+        list(entries_a), list(entries_b))
+    categories = []
+    chosen_details = {}
+    for name in order:
+        entry_a = entries_a.get(name)
+        entry_b = entries_b.get(name)
+        a = entry_a["value"] if entry_a else None
+        b = entry_b["value"] if entry_b else None
+        if a is not None and b is not None:
+            value = a + (b - a) * t
+        elif a is not None:
+            value = a * (1.0 - t) if t < 1.0 else None
+        elif b is not None:
+            value = b * t if t > 0.0 else None
+        else:
+            value = None
+        categories.append({
+            "name": name, "value": value, "passed": None,
+            "total": 0,
+            "partial": bool(
+                (entry_a and entry_a["partial"])
+                or (entry_b and entry_b["partial"])),
+        })
         if value is not None:
-            details[f"0,{yi}"] = surface_detail_text(
-                name, run_data.get("template_name") or template_id,
-                value, run_data.get("passed"), run_data.get("total"))
-    values.append(column)
-    return {
-        "kind": "ost_scores",
-        "title": f"{name} - latest scores",
-        "x_labels": [name],
-        "y_labels": [(latest[tid].get("template_name") or tid)
-                     for tid in order],
-        "values": values,
-        "details": details,
-        "partial": [[False] * len(order)],
-    }
+            near, far = (entry_a, entry_b) if t < 0.5 \
+                else (entry_b, entry_a)
+            text = None
+            for entry in (near, far):
+                if entry and entry["detail"]:
+                    text = entry["detail"]
+                    break
+            if text:
+                chosen_details[name] = text
+    model_a = data_a.get("model") or ""
+    model_b = data_b.get("model") or ""
+    if model_a == model_b or t <= 0.0:
+        label = model_a
+    elif t >= 1.0:
+        label = model_b
+    else:
+        label = f"{model_a} to {model_b}"
+    result = skills_surface_data(
+        label,
+        f"{data_a.get('title', '')} to {data_b.get('title', '')}",
+        categories)
+    result["kind"] = data_a.get("kind", "ost_skills")
+    # The detail behind each blended patch is the nearer
+    # side's own words for that category, not a re-rendered
+    # line about the blend - at the endpoints the morph
+    # speaks exactly as the endpoint surface does.
+    result["details"] = {
+        coord: chosen_details[name]
+        for coord, name in result["patch_categories"].items()
+        if name in chosen_details}
+    return result
 
 
 def morph_surface_data(data_a, data_b, t):
@@ -8761,6 +9058,12 @@ def morph_surface_data(data_a, data_b, t):
     ever invented for a missing cell.
     """
     t = max(0.0, min(1.0, float(t)))
+    if data_a.get("kind") == "ost_skills" \
+            or data_b.get("kind") == "ost_skills":
+        # v29: a skills surface is one model's - two of them
+        # blend profile into profile over the union patch
+        # layout, never side by side in one landscape.
+        return _morph_skills_data(data_a, data_b, t)
     x_labels = list(data_a["x_labels"]) + [
         x for x in data_b["x_labels"] if x not in data_a["x_labels"]]
     y_labels = list(data_a["y_labels"]) + [
@@ -8839,6 +9142,475 @@ def morph_surface_data(data_a, data_b, t):
         "details": details,
         "partial": partial,
     }
+
+
+# ---------------------------------------------------------------------------
+# The weights map (v29): the model's own file, read directly.
+#
+# Joshua's first instinct for the surface was "represent the
+# model's weights". This is that view, honestly labelled: a
+# pure-Python GGUF reader parses the file's header, then streams
+# ONE tensor at a time and dequantizes it (F32, F16, Q8_0, Q4_K
+# and Q6_K - the roster's types; anything else is skipped and
+# counted, never guessed) to get each tensor's average |weight|.
+# The dequantizers were verified bit-exact against gguf-py
+# 0.19's reference on real roster blobs. Points are layers x
+# tensor groups, height = the average |weight| scaled so the
+# model's strongest part is 100. These are the file's numbers -
+# they say nothing about what the model is good at, and the
+# caption under the view says so.
+#
+# Cost, measured on the sandbox against qwen3.5:2b-q4_K_M
+# (1.27 GB file, 320 tensors, 1.36B values): ~35 s and ~110 MB
+# of extra memory, streaming - it never holds more than one
+# tensor chunk. numpy does the dequantizing; without it the
+# view reports that plainly instead of faking a surface.
+# ---------------------------------------------------------------------------
+
+GGUF_MAGIC = 0x46554747  # "GGUF"
+_GGUF_TYPE_NAMES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0",
+    7: "Q5_1", 8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K",
+    12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K",
+}
+# ggml type id -> (values per block, bytes per block)
+_GGUF_BLOCKS = {0: (1, 4), 1: (1, 2), 8: (32, 34),
+                12: (256, 144), 14: (256, 210)}
+_GGUF_CHUNK_VALUES = 1 << 22
+
+WEIGHT_GROUPS = [
+    "Attn Q", "Attn K", "Attn V", "Attn out", "Attn QKV",
+    "Attn gate", "SSM", "MLP gate", "MLP up", "MLP down",
+    "Norms", "Embed / head",
+]
+
+
+def _gguf_read_string(handle):
+    import struct as _struct
+    (n,) = _struct.unpack("<Q", handle.read(8))
+    return handle.read(n).decode("utf-8", "replace")
+
+
+def _gguf_skip_value(handle, vtype):
+    import struct as _struct
+    if vtype in (0, 1, 7):
+        handle.seek(1, 1)
+    elif vtype in (2, 3):
+        handle.seek(2, 1)
+    elif vtype in (4, 5, 6):
+        handle.seek(4, 1)
+    elif vtype in (10, 11, 12):
+        handle.seek(8, 1)
+    elif vtype == 8:
+        (n,) = _struct.unpack("<Q", handle.read(8))
+        handle.seek(n, 1)
+    elif vtype == 9:
+        (etype,) = _struct.unpack("<I", handle.read(4))
+        (count,) = _struct.unpack("<Q", handle.read(8))
+        for _ in range(count):
+            _gguf_skip_value(handle, etype)
+    else:
+        raise ValueError(f"bad GGUF metadata type {vtype}")
+
+
+def gguf_parse_header(path):
+    """(metadata, tensors, data_start) for a GGUF file.
+    tensors: [{name, dims, type, offset, count, nbytes}] -
+    nbytes is None for a type this reader cannot dequantize."""
+    import struct as _struct
+    with open(path, "rb") as handle:
+        magic, _version = _struct.unpack("<II", handle.read(8))
+        if magic != GGUF_MAGIC:
+            raise ValueError("not a GGUF file")
+        n_tensors, n_meta = _struct.unpack("<QQ", handle.read(16))
+        metadata = {}
+        for _ in range(n_meta):
+            key = _gguf_read_string(handle)
+            (vtype,) = _struct.unpack("<I", handle.read(4))
+            if vtype == 4:
+                metadata[key] = _struct.unpack(
+                    "<I", handle.read(4))[0]
+            elif vtype == 5:
+                metadata[key] = _struct.unpack(
+                    "<i", handle.read(4))[0]
+            elif vtype == 8:
+                metadata[key] = _gguf_read_string(handle)
+            else:
+                _gguf_skip_value(handle, vtype)
+        tensors = []
+        for _ in range(n_tensors):
+            name = _gguf_read_string(handle)
+            (ndims,) = _struct.unpack("<I", handle.read(4))
+            dims = _struct.unpack(f"<{ndims}Q", handle.read(8 * ndims))
+            (ttype,) = _struct.unpack("<I", handle.read(4))
+            (offset,) = _struct.unpack("<Q", handle.read(8))
+            count = 1
+            for d in dims:
+                count *= d
+            info = _GGUF_BLOCKS.get(ttype)
+            tensors.append({
+                "name": name, "dims": dims, "type": ttype,
+                "offset": offset, "count": count,
+                "nbytes": (count // info[0] * info[1]
+                           if info else None),
+            })
+        pos = handle.tell()
+    alignment = metadata.get("general.alignment", 32) or 32
+    data_start = (pos + alignment - 1) // alignment * alignment
+    return metadata, tensors, data_start
+
+
+def _dequant_q8_0(np, raw):
+    a = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 34)
+    d = a[:, :2].copy().view(np.float16).reshape(-1).astype(np.float32)
+    q = a[:, 2:].copy().view(np.int8).astype(np.float32)
+    return q * d[:, None]
+
+
+def _scale_min_k4(np, scales, j):
+    """ggml's get_scale_min_k4 for sub-block j of a Q4_K
+    super-block: scales is (n, 12) uint8."""
+    if j < 4:
+        sc = scales[:, j] & 63
+        mn = scales[:, j + 4] & 63
+    else:
+        sc = (scales[:, j + 4] & 0x0F) | ((scales[:, j - 4] >> 6) << 4)
+        mn = (scales[:, j + 4] >> 4) | ((scales[:, j] >> 6) << 4)
+    return sc.astype(np.float32), mn.astype(np.float32)
+
+
+def _dequant_q4_k(np, raw):
+    a = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 144)
+    d = a[:, 0:2].copy().view(np.float16).reshape(-1).astype(np.float32)
+    dmin = a[:, 2:4].copy().view(np.float16).reshape(-1) \
+        .astype(np.float32)
+    scales = a[:, 4:16]
+    qs = a[:, 16:144]
+    out = np.empty((a.shape[0], 256), dtype=np.float32)
+    for j in range(4):
+        chunk = qs[:, j * 32:(j + 1) * 32].astype(np.float32)
+        sc0, mn0 = _scale_min_k4(np, scales, 2 * j)
+        sc1, mn1 = _scale_min_k4(np, scales, 2 * j + 1)
+        out[:, j * 64:j * 64 + 32] = (
+            d[:, None] * sc0[:, None] * (chunk % 16)
+            - dmin[:, None] * mn0[:, None])
+        out[:, j * 64 + 32:j * 64 + 64] = (
+            d[:, None] * sc1[:, None] * (chunk // 16)
+            - dmin[:, None] * mn1[:, None])
+    return out
+
+
+def _dequant_q6_k(np, raw):
+    """Q6_K in gguf-py's grouping (verified bit-exact against
+    gguf 0.19): the 256 values form 8 groups of 32; group g
+    pairs nibbles of ql bytes (g//4)*64 + (g%2)*32 + l (low
+    nibble for g%4 < 2, high for g%4 >= 2) with 2-bit fields
+    of qh byte (g//4)*32 + l at shift (g%4)*2, and scale
+    index g*2 + l//16."""
+    a = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 210)
+    ql = a[:, 0:128]
+    qh = a[:, 128:192]
+    scales = a[:, 192:208].copy().view(np.int8).astype(np.float32)
+    d = a[:, 208:210].copy().view(np.float16).reshape(-1) \
+        .astype(np.float32)
+    n = a.shape[0]
+    ql4 = ((ql.reshape(n, 2, 1, 64)
+            >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1))
+           & np.uint8(0x0F)).reshape(n, 8, 32)
+    qh4 = ((qh.reshape(n, 2, 1, 32)
+            >> np.array([0, 2, 4, 6],
+                        dtype=np.uint8).reshape(1, 1, 4, 1))
+           & np.uint8(0x03)).reshape(n, 8, 32)
+    q = (ql4 | (qh4 << np.uint8(4))).astype(np.float32) \
+        - np.float32(32.0)
+    q = q.reshape(n, 16, 16)
+    return ((d.reshape(n, 1) * scales).reshape(n, 16, 1)
+            * q).reshape(n, 256)
+
+
+def _gguf_tensor_stats(np, handle, data_start, tensor):
+    """(mean |value|, std) for one tensor, streamed in chunks
+    so no more than one chunk of values is ever in memory."""
+    import math as _math
+    ttype = tensor["type"]
+    block_values, block_bytes = _GGUF_BLOCKS[ttype]
+    total_blocks = tensor["count"] // block_values
+    sum_abs = 0.0
+    sum_v = 0.0
+    sum_sq = 0.0
+    done = 0
+    base = data_start + tensor["offset"]
+    per_chunk = max(1, _GGUF_CHUNK_VALUES // block_values)
+    while done < total_blocks:
+        take = min(per_chunk, total_blocks - done)
+        handle.seek(base + done * block_bytes)
+        raw = handle.read(take * block_bytes)
+        if ttype == 0:
+            vals = np.frombuffer(raw, dtype=np.float32)
+        elif ttype == 1:
+            vals = np.frombuffer(raw, dtype=np.float16) \
+                .astype(np.float32)
+        elif ttype == 8:
+            vals = _dequant_q8_0(np, raw)
+        elif ttype == 12:
+            vals = _dequant_q4_k(np, raw)
+        else:
+            vals = _dequant_q6_k(np, raw)
+        v = vals.reshape(-1).astype(np.float64)
+        sum_abs += float(np.abs(v).sum())
+        sum_v += float(v.sum())
+        sum_sq += float((v * v).sum())
+        done += take
+    n = tensor["count"]
+    mean = sum_v / n
+    var = max(0.0, sum_sq / n - mean * mean)
+    return sum_abs / n, _math.sqrt(var)
+
+
+def gguf_weight_stats(path):
+    """Every readable tensor's (mean |weight|, std, count) in
+    a GGUF file: (stats, skipped) - skipped lists (name, type
+    name) for tensors whose type this reader cannot dequantize.
+    They are counted and reported, never guessed."""
+    np = _import_numpy()
+    _metadata, tensors, data_start = gguf_parse_header(path)
+    stats = {}
+    skipped = []
+    with open(path, "rb") as handle:
+        for tensor in tensors:
+            if tensor["type"] not in _GGUF_BLOCKS:
+                skipped.append((
+                    tensor["name"],
+                    _GGUF_TYPE_NAMES.get(
+                        tensor["type"], str(tensor["type"]))))
+                continue
+            mean_abs, std = _gguf_tensor_stats(
+                np, handle, data_start, tensor)
+            stats[tensor["name"]] = (mean_abs, std, tensor["count"])
+    return stats, skipped
+
+
+def _import_numpy():
+    """numpy, imported lazily: the weights view is the only
+    part of OST that needs it, and the rest of the app must
+    never depend on it being importable."""
+    import numpy
+    return numpy
+
+
+def ollama_models_dir():
+    """Where Ollama keeps its model files, as the app itself
+    resolves it: the saved models folder when one is set, else
+    the environment's, else Ollama's default under home."""
+    settings = load_app_settings()
+    return settings["models_folder"] or detect_models_folder()
+
+
+def find_model_blob(model_name, models_dir=None):
+    """(path, reason): a local Ollama model's GGUF file,
+    resolved through Ollama's own manifest store - the
+    manifest for the model name names the model blob's digest,
+    and the blob is the file. reason explains, in plain words,
+    when there is no file (a provider model, a name that was
+    never pulled, a store that moved)."""
+    name = (model_name or "").strip()
+    if not name:
+        return None, "No model picked."
+    parts = name.split("/")
+    last = parts[-1]
+    if ":" in last:
+        repo, tag = last.rsplit(":", 1)
+    else:
+        repo, tag = last, "latest"
+    parts[-1] = repo
+    if len(parts) == 1:
+        rel = ["registry.ollama.ai", "library", repo]
+    elif len(parts) == 2:
+        rel = ["registry.ollama.ai", parts[0], repo]
+    else:
+        rel = list(parts)
+    root = models_dir or ollama_models_dir()
+    manifest_path = os.path.join(root, "manifests", *rel, tag)
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError):
+        return None, (
+            f"No local model file for {name}. The weights view "
+            "reads the model's own file from Ollama's store, and "
+            "no manifest for that name was found there. Provider "
+            "models keep their files on the provider's side.")
+    digest = None
+    for layer in manifest.get("layers") or []:
+        if str(layer.get("mediaType", "")).endswith("image.model"):
+            digest = layer.get("digest")
+            break
+    if not digest:
+        return None, (
+            f"Ollama's manifest for {name} names no model file.")
+    blob = os.path.join(root, "blobs", digest.replace(":", "-"))
+    if not os.path.isfile(blob):
+        return None, (
+            f"The model file for {name} is missing from "
+            "Ollama's store (the manifest is there, the file "
+            "is not).")
+    try:
+        with open(blob, "rb") as handle:
+            magic = handle.read(4)
+        if magic != b"GGUF":
+            return None, (
+                f"The file Ollama stores for {name} is not a "
+                "GGUF model file, so its weights cannot be read.")
+    except OSError:
+        return None, f"The model file for {name} cannot be read."
+    return blob, ""
+
+
+_WEIGHT_BASE_GROUPS = {
+    "attn_q": "Attn Q", "attn_k": "Attn K", "attn_v": "Attn V",
+    "attn_output": "Attn out", "attn_qkv": "Attn QKV",
+    "attn_gate": "Attn gate", "ffn_gate": "MLP gate",
+    "ffn_up": "MLP up", "ffn_down": "MLP down",
+}
+
+
+def _weight_point_for(name):
+    """(row, group) for one tensor name, or None when the
+    tensor belongs to no known part (a vision tower, a
+    projector, rope tables) - those are counted as unplaced,
+    never forced into a group."""
+    if name == "token_embd.weight":
+        return "Embedding", "Embed / head"
+    if name == "output.weight":
+        return "Head", "Embed / head"
+    if name == "output_norm.weight":
+        return "Head", "Norms"
+    if not name.startswith("blk."):
+        return None
+    parts = name.split(".", 2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return None
+    row = f"Layer {int(parts[1])}"
+    rest = parts[2]
+    base = rest
+    for suffix in (".weight", ".bias"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    if base in _WEIGHT_BASE_GROUPS:
+        return row, _WEIGHT_BASE_GROUPS[base]
+    if base.startswith("ssm_") and base != "ssm_norm":
+        return row, "SSM"
+    if "norm" in base:
+        return row, "Norms"
+    return None
+
+
+def weights_data_from_stats(model, stats, skipped):
+    """A model's weights surface from its tensor stats:
+    (data, info). Points are layers x tensor groups; a group's
+    value is the count-weighted average |weight| of its
+    tensors, scaled so the model's strongest point is 100.
+    info reports what was read, what was skipped (unsupported
+    type) and what could not be placed in a group - all three
+    counts are part of the honesty of this view."""
+    cells = {}
+    unplaced = []
+    for name, (mean_abs, _std, count) in stats.items():
+        point = _weight_point_for(name)
+        if point is None:
+            unplaced.append(name)
+            continue
+        cells.setdefault(point, []).append((name, mean_abs, count))
+    if not cells:
+        return None, {
+            "tensors_read": len(stats), "skipped": skipped,
+            "unplaced": unplaced, "points": 0,
+        }
+    combined = {}
+    for point, members in cells.items():
+        total = sum(count for _n, _m, count in members)
+        combined[point] = (
+            sum(m * count for _n, m, count in members) / total,
+            members)
+    peak = max(value for value, _m in combined.values())
+    rows = []
+    if "Embedding" in {r for r, _g in combined}:
+        rows.append("Embedding")
+    layers = sorted({int(r.split()[1]) for r, _g in combined
+                     if r.startswith("Layer ")})
+    rows.extend(f"Layer {i}" for i in layers)
+    if "Head" in {r for r, _g in combined}:
+        rows.append("Head")
+    values = []
+    details = {}
+    for xi, row in enumerate(rows):
+        column = []
+        for yi, group in enumerate(WEIGHT_GROUPS):
+            entry = combined.get((row, group))
+            if entry is None:
+                column.append(None)
+                continue
+            raw, members = entry
+            value = 100.0 * raw / peak if peak > 0 else 0.0
+            column.append(value)
+            if len(members) == 1:
+                what = members[0][0]
+            else:
+                what = f"{group} ({len(members)} tensors)"
+            shown = (f"{value:.0f}" if value >= 10
+                     else f"{value:.1f}")
+            details[f"{xi},{yi}"] = (
+                f"{row} - {what}: average |weight| {raw:.5f} "
+                f"({shown} of this model's strongest part)")
+        values.append(column)
+    data = {
+        "kind": "ost_weights",
+        "title": f"{model} - weights",
+        "model": model,
+        "x_labels": rows,
+        "y_labels": list(WEIGHT_GROUPS),
+        "values": values,
+        "details": details,
+        "partial": [[False] * len(WEIGHT_GROUPS) for _ in rows],
+    }
+    info = {
+        "tensors_read": len(stats), "skipped": skipped,
+        "unplaced": unplaced,
+        "points": len(combined),
+    }
+    return data, info
+
+
+def weights_surface_data(model_name, models_dir=None):
+    """(data, note, info): one model's weights surface, read
+    from its local file. data is None - with a plain note, never
+    a fake surface - when there is no readable local file."""
+    import time as _time
+    blob, reason = find_model_blob(model_name, models_dir)
+    if blob is None:
+        return None, reason, None
+    try:
+        _import_numpy()
+    except ImportError:
+        return None, (
+            "The weights view needs numpy to read the model "
+            "file, and this install does not have it."), None
+    started = _time.time()
+    try:
+        stats, skipped = gguf_weight_stats(blob)
+    except (OSError, ValueError) as exc:
+        return None, (
+            f"The model file for {model_name} could not be "
+            f"read: {exc}"), None
+    data, info = weights_data_from_stats(model_name, stats, skipped)
+    if data is None:
+        return None, (
+            f"None of the tensors in {model_name}'s file could "
+            "be placed in the weights map."), info
+    info["seconds"] = _time.time() - started
+    info["blob"] = blob
+    return data, "", info
 
 
 def surface_filled_values(values):
@@ -11602,10 +12374,17 @@ class SurfaceView(QWidget):
                 painter.drawEllipse(
                     QPointF(cxp, cyp),
                     orb_radius + 4, orb_radius + 4)
-        # Axis labels: x along the front edge (the last y row),
-        # y along the left edge (the first x column). Each sits
-        # on a dark backing, so it stays readable where the
-        # raised surface passes behind it.
+        # Labels. A skills surface names its patches instead:
+        # each patch IS one of the model's categories, so the
+        # category name is drawn at its patch, just under the
+        # patch's orb (on the floor of an unmeasured patch) -
+        # the generic axis labels only name the grid ("Patch
+        # row 1"), which says nothing about the model, so they
+        # are not drawn for that data. Any other surface keeps
+        # the axis labels: x along the front edge (the last y
+        # row), y along the left edge (the first x column).
+        # Every label sits on a dark backing, so it stays
+        # readable where the raised surface passes behind it.
         painter.setPen(self.LABEL_COLOR)
         font = painter.font()
         font.setPointSize(max(7, font.pointSize() - 2))
@@ -11620,16 +12399,31 @@ class SurfaceView(QWidget):
             painter.setPen(self.LABEL_COLOR)
             painter.drawText(rect, align, text)
 
-        for xi, label in enumerate(data.get("x_labels") or []):
-            point = self._project_full(xi, ny - 1, 0.0)
-            text = metrics.elidedText(str(label), Qt.ElideRight, 96)
-            _label(QRect(int(point[0]) - 48, int(point[1]) + 6, 96, 16),
-                   Qt.AlignHCenter | Qt.AlignTop, text)
-        for yi, label in enumerate(data.get("y_labels") or []):
-            point = self._project_full(0, yi, 0.0)
-            text = metrics.elidedText(str(label), Qt.ElideRight, 60)
-            _label(QRect(int(point[0]) - 64, int(point[1]) - 8, 60, 16),
-                   Qt.AlignRight | Qt.AlignVCenter, text)
+        patch_labels = surface_patch_labels(data)
+        if patch_labels:
+            for xi, yi, name in patch_labels:
+                try:
+                    value = values[xi][yi]
+                except (IndexError, TypeError):
+                    value = None
+                point = proj(xi, yi, value)
+                text = metrics.elidedText(
+                    str(name), Qt.ElideRight, 110)
+                _label(QRect(int(point[0]) - 55,
+                             int(point[1]) + int(orb_radius) + 3,
+                             110, 16),
+                       Qt.AlignHCenter | Qt.AlignTop, text)
+        else:
+            for xi, label in enumerate(data.get("x_labels") or []):
+                point = self._project_full(xi, ny - 1, 0.0)
+                text = metrics.elidedText(str(label), Qt.ElideRight, 96)
+                _label(QRect(int(point[0]) - 48, int(point[1]) + 6, 96, 16),
+                       Qt.AlignHCenter | Qt.AlignTop, text)
+            for yi, label in enumerate(data.get("y_labels") or []):
+                point = self._project_full(0, yi, 0.0)
+                text = metrics.elidedText(str(label), Qt.ElideRight, 60)
+                _label(QRect(int(point[0]) - 64, int(point[1]) - 8, 60, 16),
+                       Qt.AlignRight | Qt.AlignVCenter, text)
         title = data.get("title") or ""
         if title:
             painter.setPen(self.TITLE_COLOR)
@@ -12311,6 +13105,45 @@ def make_surface_view(parent=None):
     return SurfaceView(parent)
 
 
+def render_surface_png(data, path, width=1200, height=800):
+    """Save a picture of a surface as a PNG (v29: the report
+    card's grid). Always the PAINTER renderer drawn onto an
+    image - it needs no GL context, so it works headless and
+    on any machine the app runs on. Returns True when the
+    file was written."""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QImage, QPainter
+    view = SurfaceView()
+    view.resize(width, height)
+    view.set_data(data)
+    image = QImage(width, height, QImage.Format_ARGB32)
+    image.fill(SurfaceView.BACKGROUND)
+    painter = QPainter(image)
+    try:
+        view.render(painter, QPoint(0, 0))
+    finally:
+        painter.end()
+    return bool(image.save(path, "PNG"))
+
+
+class WeightsWorker(QThread):
+    """Reads one model's weights surface off the UI thread -
+    the file read takes seconds on a small model, longer on a
+    big one, and the window must never freeze for it."""
+
+    weights_done = Signal(str, object, str, object)
+
+    def __init__(self, label, models_dir=None):
+        super().__init__()
+        self.label = label
+        self.models_dir = models_dir
+
+    def run(self):
+        data, note, info = weights_surface_data(
+            self.label, self.models_dir)
+        self.weights_done.emit(self.label, data, note, info)
+
+
 class MainWindow(QMainWindow):
     # Tab order (R1): setup, run, models, then the v1-v9 tabs.
     TAB_SETUP = 0
@@ -12427,6 +13260,14 @@ class MainWindow(QMainWindow):
         # is True while the surface on show belongs to a run.
         self._surface_tracker = SurfaceTracker()
         self._surface_live = False
+        # v29: the Surface tab's per-model surfaces - skills by
+        # label (from the live tracker, a saved run, or a
+        # profile) and weights by label (read from the model's
+        # own file, on request, cached here).
+        self._surface_skills = {}
+        self._surface_weights = {}
+        self._surface_weights_notes = {}
+        self._weights_worker = None
         self.templates = []
         self.providers = []
         # The provider being edited on the Providers tab: a working copy
@@ -12611,6 +13452,17 @@ class MainWindow(QMainWindow):
         self.profile_speed_chart = LineChartWidget()
         self.profile_speed_chart.setFixedHeight(150)
         profile_left.addWidget(self.profile_speed_chart)
+        # v29: the model's grid goes on its report card - the
+        # Profiles tab is the in-app card, so its skills surface
+        # stands with it (the same per-model surface as the
+        # Surface tab, from the same numbers as the bars).
+        self.profile_surface_title = QLabel("")
+        self.profile_surface_title.setWordWrap(True)
+        profile_left.addWidget(self.profile_surface_title)
+        self.profile_surface = make_surface_view()
+        self.profile_surface.setMinimumHeight(240)
+        profile_left.addWidget(self.profile_surface)
+        profile_left.addWidget(QLabel(SURFACE_HONESTY_CAPTION))
         profile_left.addStretch()
         profile_columns.addLayout(profile_left, 1)
         self.profile_view = QTextEdit()
@@ -15506,6 +16358,8 @@ class MainWindow(QMainWindow):
             self.profile_bars.set_data([])
             self.profile_speed_title.setText("")
             self.profile_speed_chart.set_data([])
+            self.profile_surface_title.setText("")
+            self.profile_surface.set_data(None)
             return
         self.profile_tiles.setVisible(True)
         self.profile_hero_value.setText(fmt_score(numbers["overall_latest"]))
@@ -15524,6 +16378,12 @@ class MainWindow(QMainWindow):
         )
         self.profile_bars.set_data(numbers["template_scores"])
         self.profile_bars_title.setText(self.profile_bars.takeaway_title())
+        self.profile_surface.set_data(
+            skills_surface_data_from_profile(numbers))
+        self.profile_surface_title.setText(
+            f"{numbers['model_name']}'s surface - its strongest "
+            "and weakest subjects, the same scores as the bars "
+            "above.")
         speed_points = [
             (_short_date(stamp), value)
             for stamp, value in numbers["speed_points"]
@@ -15699,6 +16559,27 @@ class MainWindow(QMainWindow):
         if not enabled and self.compare_surface.is_playing():
             self.compare_surface.toggle_play()
 
+    def _compare_surface_for(self, run_id, model_hint):
+        """One picked run's surface for the morph (v29): the
+        surface of the model the Compare tab is comparing,
+        when that model is in the run - else the run's first
+        model's surface. A morph is always one model's profile
+        moving into another's (or the same model's, from an
+        earlier run)."""
+        if not run_id:
+            return None
+        results_dir = get_results_dir()
+        manifest = load_manifest(results_dir, run_id)
+        if manifest is None:
+            return None
+        surfaces = model_surfaces_from_manifest(results_dir, manifest)
+        if not surfaces:
+            return None
+        for label, data in surfaces:
+            if label == model_hint:
+                return data
+        return surfaces[0][1]
+
     def _update_compare_morph(self, _index=None):
         """Load the picked runs' surfaces: both picked (and
         different) starts the morph at Run 1; one picked shows
@@ -15707,19 +16588,10 @@ class MainWindow(QMainWindow):
             return
         run_a = self.compare_run_a.currentData()
         run_b = self.compare_run_b.currentData()
-        self._compare_surface_a = None
-        self._compare_surface_b = None
-        results_dir = get_results_dir()
-        if run_a:
-            manifest = load_manifest(results_dir, run_a)
-            if manifest is not None:
-                self._compare_surface_a = surface_data_from_manifest(
-                    results_dir, manifest)
-        if run_b:
-            manifest = load_manifest(results_dir, run_b)
-            if manifest is not None:
-                self._compare_surface_b = surface_data_from_manifest(
-                    results_dir, manifest)
+        self._compare_surface_a = self._compare_surface_for(
+            run_a, self.compare_model_a.currentText())
+        self._compare_surface_b = self._compare_surface_for(
+            run_b, self.compare_model_b.currentText())
         if self._compare_surface_a and self._compare_surface_b:
             if run_a == run_b:
                 self.compare_surface.set_data(self._compare_surface_a)
@@ -16271,26 +17143,52 @@ class MainWindow(QMainWindow):
         self._dialect_folders = {}
 
     def _build_surface_tab(self, tabs):
-        """The Surface tab (v26): the live 3D decision surface in
-        its own workspace. During a run it builds as tasks finish;
-        after the run it keeps the final surface. A finished run
-        from Past runs can be loaded here too (its View surface
-        button)."""
+        """The Surface tab (v26, per-model since v29): one
+        model's surface in its own workspace. The skills view
+        is the model being tested, building live as its
+        categories finish, and staying as its final surface
+        after the run; a finished run from Past runs loads its
+        model's surface here too. The weights view reads the
+        same model's own file. A run that tested several
+        models (a re-run, a resume) has one surface per model -
+        the model picker chooses whose, and it follows the
+        model being tested while a run is live."""
         surface_tab = QWidget()
         tabs.addTab(surface_tab, "Surface")
         layout = QVBoxLayout(surface_tab)
         intro = QLabel(
-            "Scores as a landscape: one point for each model and "
-            "test, and the height is the score. Orange peaks are "
-            "strong areas, blue valleys are weak ones. Drag to "
-            "turn the surface, scroll to zoom, tap a point to see "
+            "One model's surface: what it is strongest and "
+            "weakest at. Each point is one test category, and "
+            "the height is its score - orange peaks are strong "
+            "subjects, blue valleys are weak ones. Drag to turn "
+            "the surface, scroll to zoom, tap a point to see "
             "the score behind it."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
+        picker_row = QHBoxLayout()
+        picker_row.addWidget(QLabel("Model:"))
+        self.surface_model_combo = QComboBox()
+        self.surface_model_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToContents)
+        self.surface_model_combo.currentIndexChanged.connect(
+            self._on_surface_model_changed)
+        picker_row.addWidget(self.surface_model_combo)
+        picker_row.addWidget(QLabel("Show:"))
+        self.surface_kind_combo = QComboBox()
+        self.surface_kind_combo.addItem(
+            "Skills - what it is best and worst at", "skills")
+        self.surface_kind_combo.addItem(
+            "Weights - read from its file", "weights")
+        self.surface_kind_combo.currentIndexChanged.connect(
+            self._on_surface_kind_changed)
+        picker_row.addWidget(self.surface_kind_combo)
+        picker_row.addStretch()
+        layout.addLayout(picker_row)
         self.surface_status_label = QLabel(
-            "No run yet. When a test run starts, its scores "
-            "appear here as they land."
+            "No run yet. When a test run starts, the model "
+            "being tested builds its surface here as its "
+            "scores land."
         )
         self.surface_status_label.setWordWrap(True)
         layout.addWidget(self.surface_status_label)
@@ -16309,57 +17207,195 @@ class MainWindow(QMainWindow):
 
     # -- live surface feed (v26) ------------------------------------
 
+    # -- the Surface tab's per-model state (v29) ---------------
+
+    def _surface_set_models(self, labels, current=None):
+        """Rebuild the Surface tab's model picker from labels,
+        keeping or setting the shown model."""
+        combo = self.surface_model_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for label in labels:
+            combo.addItem(label, label)
+        if current in labels:
+            combo.setCurrentIndex(labels.index(current))
+        combo.blockSignals(False)
+
+    def _surface_current_label(self):
+        return self.surface_model_combo.currentData()
+
+    def _surface_current_kind(self):
+        return self.surface_kind_combo.currentData() or "skills"
+
+    def _on_surface_model_changed(self, _index=None):
+        self._surface_show_current()
+
+    def _on_surface_kind_changed(self, _index=None):
+        self._surface_show_current()
+
+    def _surface_show_current(self, coalesce=False):
+        """Show the picked model's picked view (skills or
+        weights), with the caption that belongs to it. The
+        weights view reads the model's file on first ask, off
+        the UI thread; until then the tab says so."""
+        label = self._surface_current_label()
+        kind = self._surface_current_kind()
+        if label is None:
+            self.surface_view.set_data(None)
+            return
+        if kind == "weights":
+            self.surface_caption_label.setText(
+                WEIGHTS_HONESTY_CAPTION)
+            self.surface_detail_label.setText(
+                "Tap a point to see the part of the file "
+                "behind it.")
+            if label in self._surface_weights:
+                self.surface_view.set_data(
+                    self._surface_weights[label])
+                note = self._surface_weights_notes.get(label)
+                if note:
+                    self.surface_status_label.setText(note)
+                return
+            note = self._surface_weights_notes.get(label)
+            if note:
+                self.surface_view.set_data(None)
+                self.surface_status_label.setText(note)
+                return
+            self.surface_view.set_data(None)
+            self.surface_status_label.setText(
+                f"Reading {label}'s model file - its weights "
+                "surface lands here when the read finishes.")
+            self._start_weights_read(label)
+            return
+        self.surface_caption_label.setText(SURFACE_HONESTY_CAPTION)
+        self.surface_detail_label.setText(
+            "Tap a point on the surface to see the score "
+            "behind it.")
+        self.surface_view.set_data(
+            self._surface_skills.get(label), coalesce=coalesce)
+
+    def _start_weights_read(self, label):
+        if self._weights_worker is not None:
+            return
+        worker = WeightsWorker(label, ollama_models_dir())
+        worker.weights_done.connect(self._on_weights_done)
+        worker.finished.connect(self._on_weights_worker_finished)
+        self._weights_worker = worker
+        worker.start()
+
+    def _on_weights_worker_finished(self):
+        self._weights_worker = None
+        # A second model's read may have been asked for while
+        # this one ran - start it now if it is still wanted.
+        label = self._surface_current_label()
+        if (self._surface_current_kind() == "weights"
+                and label is not None
+                and label not in self._surface_weights
+                and label not in self._surface_weights_notes):
+            self._surface_show_current()
+
+    def _on_weights_done(self, label, data, note, info):
+        if data is not None:
+            self._surface_weights[label] = data
+            skipped = len((info or {}).get("skipped") or [])
+            unplaced = len((info or {}).get("unplaced") or [])
+            extra = ""
+            if skipped:
+                extra += (
+                    f" {skipped} tensors skipped (a format "
+                    "this reader cannot read) - counted, "
+                    "never guessed.")
+            if unplaced:
+                extra += (
+                    f" {unplaced} tensors not placed in a "
+                    "group - counted, never guessed.")
+            self._surface_weights_notes[label] = (
+                f"{label}'s weights, read from its file: "
+                f"{(info or {}).get('tensors_read', 0)} tensors."
+                + extra)
+        else:
+            self._surface_weights_notes[label] = note
+        if (self._surface_current_kind() == "weights"
+                and self._surface_current_label() == label):
+            self._surface_show_current()
+
+    # -- live surface feed (v26, per-model since v29) ----------
+
     def _surface_begin_run(self, targets, templates, pairs=None,
                              resume=None):
         """A run starts: the Surface tab tracks it from its first
-        task. A resume's finished pairs are settled on the
-        surface before the worker starts, like the results
-        table does."""
+        task, one surface per model. A resume's finished pairs
+        are settled on the surfaces before the worker starts,
+        like the results table does."""
         preloaded = resume[1] if resume is not None else None
         self._surface_tracker.begin(
             targets, templates, pairs, preloaded)
         self._surface_live = True
+        labels = self._surface_tracker.labels()
+        self._surface_skills = {
+            label: self._surface_tracker.data_for(label, "Live run")
+            for label in labels
+        }
+        self._surface_set_models(
+            labels, labels[0] if labels else None)
         self.surface_status_label.setText(
-            "Live run: scores land here as each task finishes.")
-        self.surface_detail_label.setText(
-            "Tap a point on the surface to see the score behind it.")
-        self.surface_view.set_data(
-            self._surface_tracker.data("Live run"))
+            "Live run: the model being tested builds its "
+            "surface here as each category finishes.")
+        self._surface_show_current()
+
+    def _surface_feed(self, label):
+        """One task or template landed for label: refresh its
+        surface and follow it - the tab shows the model being
+        tested now."""
+        data = self._surface_tracker.data_for(label, "Live run")
+        if data is None:
+            return
+        self._surface_skills[label] = data
+        if self._surface_current_label() != label:
+            self._surface_set_models(
+                self._surface_tracker.labels(), label)
+        if self._surface_current_kind() == "skills":
+            self._surface_show_current(coalesce=True)
 
     def _on_surface_task_done(self, label, template_id, record):
         if not self._surface_live:
             return
         self._surface_tracker.task_done(label, template_id, record)
-        self.surface_view.set_data(
-            self._surface_tracker.data("Live run"), coalesce=True)
+        self._surface_feed(label)
 
     def _on_surface_template_done(self, name, run_data, _path):
         if not self._surface_live:
             return
         self._surface_tracker.template_done(name, run_data)
-        self.surface_view.set_data(
-            self._surface_tracker.data("Live run"), coalesce=True)
+        self._surface_feed(name)
 
     def _on_surface_run_finished(self, reason):
         if not self._surface_live:
             return
-        self.surface_view.set_data(
-            self._surface_tracker.data("Latest run"))
+        for label in self._surface_tracker.labels():
+            data = self._surface_tracker.data_for(
+                label, "Latest run")
+            if data is not None:
+                self._surface_skills[label] = data
+        label = self._surface_current_label() or ""
+        if self._surface_current_kind() == "skills":
+            self._surface_show_current()
         if reason == "done":
             self.surface_status_label.setText(
-                "Run finished. This is its final surface - it "
-                "stays here until the next run or until you open "
-                "a saved run from Past runs.")
+                f"Run finished. This is {label}'s final "
+                "surface - it stays here until the next run "
+                "or until you open a saved run from Past runs.")
         elif reason == "ollama_down":
             self.surface_status_label.setText(
                 "The run stopped when Ollama went down. Points "
-                "still hollow were being measured when it stopped; "
-                "templates with no point were never measured.")
+                "still hollow were being measured when it "
+                "stopped; categories with no point were never "
+                "measured.")
         else:
             self.surface_status_label.setText(
                 "Run cancelled. Points still hollow were being "
-                "measured when it stopped; the scores shown are "
-                "the tasks that did finish.")
+                "measured when it stopped; the scores shown "
+                "are the tasks that did finish.")
 
     def _on_surface_picked(self, text):
         self.surface_detail_label.setText(
@@ -16367,37 +17403,48 @@ class MainWindow(QMainWindow):
                     "behind it.")
 
     def show_history_surface(self):
-        """Past runs' View surface: load the selected run onto
-        the Surface tab - the whole run it belongs to when its
-        manifest is still there, else the model's latest score
-        on each template."""
+        """Past runs' View surface: load the selected run's
+        models onto the Surface tab, showing the model the
+        picked result belongs to - or, when its manifest is
+        gone, that model's latest score on each template."""
         item = self.history_list.currentItem()
         if item is None:
             return
         path = item.data(Qt.UserRole)
         results_dir = get_results_dir()
-        data = None
-        source = ""
+        surfaces = None
+        picked_model = None
+        run_data = load_run_file(path)
+        if run_data is not None:
+            picked_model = run_data.get("model")
         for manifest in list_manifests(results_dir):
             run_files = manifest.get("run_files") or {}
             if any(os.path.normpath(os.path.join(results_dir, rel))
                    == os.path.normpath(path)
                    for rel in run_files.values()):
-                data = surface_data_from_manifest(results_dir, manifest)
-                source = "the run this result belongs to"
+                surfaces = model_surfaces_from_manifest(
+                    results_dir, manifest)
                 break
-        if data is None:
+        if surfaces:
+            self._surface_skills = dict(surfaces)
+            labels = [label for label, _data in surfaces]
+            current = (picked_model if picked_model in labels
+                       else labels[0])
+            source = "the run this result belongs to"
+        else:
             slug = self.history_model_combo.currentData()
             if not slug:
                 return
             data = surface_data_from_model_runs(results_dir, slug)
+            current = data["model"]
+            self._surface_skills = {current: data}
+            labels = [current]
             source = "this model's latest score on each template"
         self._surface_live = False
-        self.surface_view.set_data(data)
+        self._surface_set_models(labels, current)
+        self._surface_show_current()
         self.surface_status_label.setText(
-            f"Showing {source}: {data.get('title', '')}.")
-        self.surface_detail_label.setText(
-            "Tap a point on the surface to see the score behind it.")
+            f"Showing {current}'s surface: {source}.")
         self.tabs.setCurrentIndex(self.TAB_SURFACE)
 
     def refresh_dialect_models(self):
@@ -16597,10 +17644,36 @@ class MainWindow(QMainWindow):
             json_path = os.path.join(folder, f"{base}-{suffix}.json")
             suffix += 1
         results = [self.results[name] for name in self.result_order]
+        # (v29): each model's grid goes on its report card - a
+        # PNG of its skills surface saved next to the report.
+        # The pictures are rendered first, so the card only
+        # names the ones that actually exist.
+        pictures = {}
+        stem = os.path.splitext(os.path.basename(txt_path))[0]
+        for result in results:
+            if result.get("status") != "done":
+                continue
+            data = skills_surface_data_from_result(
+                result, self.templates)
+            if not any(value is not None
+                       for row in data["values"] for value in row):
+                continue
+            filename = (
+                f"{stem}-{slugify_model(result['name'])}"
+                "-surface.png")
+            try:
+                if render_surface_png(
+                        data, os.path.join(folder, filename)):
+                    pictures[result["name"]] = filename
+            except Exception:
+                # No picture, no claim in the card - the report
+                # itself must never fail over a picture.
+                pass
         with open(txt_path, "w", encoding="utf-8") as handle:
             handle.write(render_text_report(
                 [self._with_dialect_profile(result)
-                 for result in results]))
+                 for result in results],
+                surface_pictures=pictures))
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(build_report_data(results), handle, indent=2)
         self.status_label.setText(f"Report saved: {txt_path}")

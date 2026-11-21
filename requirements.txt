@@ -1,3 +1,7 @@
-# The one package OLLAMA SYSTEM TEST needs. Pinned to the version the
-# v6 verification suite was run against — do not unpin it.
+# The packages OLLAMA SYSTEM TEST needs. Pinned to the versions the
+# verification suite was run against — do not unpin them.
 PySide6-Essentials==6.12.0
+# v29: the weights view reads model files (GGUF) with numpy. The app
+# imports it lazily and degrades to a plain note without it, but a
+# real install carries it.
+numpy==2.5.4

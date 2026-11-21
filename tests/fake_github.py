@@ -3,9 +3,9 @@
 Serves the three endpoints the updater uses — the latest release,
 a commit's file list, and a tag's source archive — from small
 crafted trees: a fake v22 install and a fake v23 release for the
-updater unit tests, plus fake v28/v29 trees so the window-level
+updater unit tests, plus fake v29/v30 trees so the window-level
 tests can run the same story one version up (the app itself is
-v28 now, so its "newer release" is v29). The blob checksums are
+v29 now, so its "newer release" is v30). The blob checksums are
 computed here with hashlib, independently of the updates module
 under test, so the verification checks prove the two agree
 rather than the module agreeing with itself.
@@ -13,7 +13,7 @@ rather than the module agreeing with itself.
 The server records every request path (server.requests), so a test
 can prove a declined update downloaded nothing. Configure it
 through start_fake_github: latest_tag ("v22", "v23", "v24",
-"v25", "v26", "v27", "v28" or "v29"),
+"v25", "v26", "v27", "v28", "v29" or "v30"),
 tamper (serve the latest archive with one file changed, while
 the file list still names the original bytes — verification must
 refuse it), no_commit (the release names no commit, so the pull
@@ -36,6 +36,7 @@ V26_COMMIT = "e" * 40
 V27_COMMIT = "f" * 40
 V28_COMMIT = "1" * 40
 V29_COMMIT = "2" * 40
+V30_COMMIT = "3" * 40
 
 FAKE_V22_FILES = {
     "ollama_system_test.py": (
@@ -117,6 +118,16 @@ FAKE_V29_FILES = {
     "run.sh": b"#!/bin/sh\necho v29\n",
 }
 
+FAKE_V30_FILES = {
+    "ollama_system_test.py": (
+        b'"""Fake OST v30."""\n__version__ = "30"\n'
+    ),
+    "new_file.txt": b"new in v30\n",
+    "templates/old.json": b'{"id": "old"}',
+    "README.md": b"v30 readme\n",
+    "run.sh": b"#!/bin/sh\necho v30\n",
+}
+
 # run.sh is executable in the fake trees, like a real script file.
 EXECUTABLE = {"run.sh"}
 
@@ -180,7 +191,8 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
         server.requests.append(path)
         if path.endswith("/releases/latest"):
             tag = server.latest_tag
-            commit = {"v29": V29_COMMIT, "v28": V28_COMMIT,
+            commit = {"v30": V30_COMMIT, "v29": V29_COMMIT,
+                      "v28": V28_COMMIT,
                       "v27": V27_COMMIT,
                       "v26": V26_COMMIT,
                       "v25": V25_COMMIT,
@@ -199,7 +211,9 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
             return
         if "/git/trees/" in path:
             sha = path.rsplit("/git/trees/", 1)[1]
-            if sha in (V29_COMMIT, "v29"):
+            if sha in (V30_COMMIT, "v30"):
+                self._send_json(build_tree(FAKE_V30_FILES))
+            elif sha in (V29_COMMIT, "v29"):
                 self._send_json(build_tree(FAKE_V29_FILES))
             elif sha in (V28_COMMIT, "v28"):
                 self._send_json(build_tree(FAKE_V28_FILES))
@@ -220,7 +234,12 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
             return
         if "/zipball/refs/tags/" in path:
             tag = path.rsplit("/zipball/refs/tags/", 1)[1]
-            if tag == "v29":
+            if tag == "v30":
+                files = dict(FAKE_V30_FILES)
+                if server.tamper:
+                    files["README.md"] = b"tampered readme\n"
+                self._send_bytes(build_zipball(files, V30_COMMIT))
+            elif tag == "v29":
                 files = dict(FAKE_V29_FILES)
                 if server.tamper:
                     files["README.md"] = b"tampered readme\n"

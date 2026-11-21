@@ -1,3 +1,251 @@
+# TEST-REPORT — OLLAMA SYSTEM TEST v29
+
+Verified 2026-11-21 in a Linux sandbox (x86_64, PySide6 6.12.0,
+Python 3.12.3) under the Qt test env from AGENTS.md:
+QT_QPA_PLATFORM=offscreen for the suite, Xvfb + xcb for the GUI
+drives, LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-
+linux-gnu, venv ~/workspace/forge-v2-testenv/bin/python, default
+HOME, TMPDIR on tmpfs.
+
+v29 corrects the surface's design on Joshua's direct orders
+(2026-11-21, after he rejected the v26-v28 look and then the
+design underneath it). His words: the surface is for ONE model
+at a time — "We have ever only tested 1 model at a time" —
+it must represent THE MODEL, "what its strongest vs weakest
+at", "not fucking tasks", and "The grid goes on the fucking
+report card too." He also named the v26-v28 design for what it
+was: built "without my 100 percent prompt to do so or my
+cosign". He was right: the models-x-templates axes (every model
+of a run in one landscape) were the builder's spec assumption,
+never his instruction. That design is RETIRED in this version.
+
+What v29 is:
+
+- PER-MODEL SKILLS SURFACE. Surface data is per-model now
+  ({kind "ost_skills", model, patch field}): the points are
+  the model's template/category scores in the app's canonical
+  template order, laid out as a two-dimensional patch field —
+  row-major, ceil(sqrt(n)) patches across, each patch one
+  category's score, leftover cells gaps, and a
+  patch_categories map naming the category behind every
+  patch coordinate (that map is what picking reads). One
+  choke point (skills_surface_data) builds it for every
+  producer:
+  the live tracker (SurfaceTracker.data_for(label) — partial =
+  pass share while a category runs, settling at its score;
+  untested categories stay gaps), saved runs
+  (model_surfaces_from_manifest returns one surface per model,
+  in run order), the latest-scores fallback, report cards
+  (skills_surface_data_from_result) and the Profiles tab
+  (skills_surface_data_from_profile). The Surface tab gained a
+  model picker (only needed when a run covered several models —
+  a re-run or a resume; during a run it follows the model being
+  tested) and a Show switch (Skills / Weights). Picking names
+  the model, the category and the score. The fixed 25x25
+  square-cube grid, full-square placement, matte finish, thin
+  cage, colours and the honesty caption are unchanged — the
+  renderer contract did not change, only the data producers.
+  Compare morphs blend two per-model surfaces (same model,
+  different runs, or two models): _morph_skills_data computes
+  the patch layout from the UNION of both sides' categories
+  (canonical order) so both profiles share one field, under
+  the same missing-cell fade rule, and the blended profile is
+  labelled with the model's own name at the endpoints (the
+  morph contract: at the ends it IS the two profiles exactly)
+  and "A to B" only between.
+- THE GRID ON THE REPORT CARD. Saving a report renders each
+  done model's skills surface to a PNG beside the card
+  (<card>-<model>-surface.png) with the QPainter renderer
+  drawn onto a QImage — no GL context involved, works
+  headless — and the card names the picture in plain words
+  ("Skills picture: ... — a picture of this model's surface
+  (what it is strongest and weakest at), saved next to this
+  report."). Pictures render BEFORE the text is written, so
+  the card only names files that exist; render_text_report
+  without the new argument is byte-identical to v28. The
+  Profiles tab (the in-app card) shows the same surface under
+  the model's speed chart.
+- THE WEIGHTS MAP (Joshua's first instinct: "represent the
+  model's weights"). A pure-Python GGUF reader in the app:
+  header parse (names, shapes, types, offsets, general.
+  alignment), then per-tensor mean-|value| and std streamed
+  ONE tensor at a time in bounded chunks, dequantizing F32,
+  F16, Q8_0, Q4_K and Q6_K; any other type is skipped and
+  counted, never guessed. The dequantizers were verified
+  BIT-EXACT (max difference 0.0) against gguf-py 0.19.0's own
+  dequantizers on real tensors from real roster blobs (Q4_K
+  and Q6_K from qwen3.5:2b-q4_K_M, Q8_0 from
+  minicpm5-heretic:2b). PROTOTYPE GATE, measured before the
+  view was built: the 1,274,396,992-byte qwen3.5:2b-q4_K_M
+  blob read in 32.8 s at 133 MB peak RSS (295/320 tensors;
+  the 25 skipped were Q6_K, before Q6_K support landed).
+  Through the app's finished code the same blob reads ALL
+  320/320 tensors, 0 skipped, 0 unplaced, in 37.6 s (223 MB
+  peak RSS for the whole interpreter process; the reader
+  itself adds ~130 MB) — far under the gate (2 min / 1.5 GB).
+  VERDICT: gate passed, the view is built. Points = rows
+  (Embedding, Layer 0..N, Head) x groups (Attn Q/K/V/out,
+  Attn QKV, Attn gate, SSM, MLP gate/up/down, Norms,
+  Embed/head) — the grouping tolerates real architectures
+  (qwen3.5-2B is a hybrid: 18 of its 24 layers are SSM blocks
+  with merged attn_qkv, only 6 have separate q/k/v/out;
+  missing parts are gaps, and its token_embd is Q6_K, which
+  is why Q6_K support is not optional). Values are the
+  count-weighted mean of per-tensor mean-|weight| per cell,
+  normalized so the model's strongest part is 100. The view
+  is labelled honestly ("Weight strength by layer, read from
+  the model file... It shows the file's numbers, not what the
+  model is good at."). The file is resolved through Ollama's
+  manifest/blobs (find_model_blob); provider models and
+  missing files get the plain "No local model file" note —
+  never a fake surface. The read runs on a QThread
+  (WeightsWorker); results cache per model.
+- numpy is a requirement now (requirements.txt pins
+  numpy==2.5.4; install.sh verifies the import loudly). The
+  app imports numpy LAZILY, only inside the weights
+  functions, and the weights view degrades to its plain note
+  without it — because the v22 updater cannot install new
+  packages, a v28 install auto-updating to v29 would
+  otherwise break; this way it runs and simply cannot read
+  weight files until a full install. DEVIATION, stated
+  plainly: this is the first version whose full feature set
+  needs more than PySide6.
+
+- LAYOUT CORRECTION (pre-ship, Joshua's call, 2026-11-21):
+  the first v29 build emitted the skills surface as a 1 x N
+  row — each category one long flat strip across the field,
+  which reads as RECTANGLES, the look he has now rejected
+  three times; the cubes being square did not save it.
+  skills_surface_data now arranges the categories as a
+  genuine 2D patch field (skills_patch_layout: columns =
+  ceil(sqrt(n)), rows = ceil(n / columns), row-major in
+  canonical template order; leftover cells are gaps — value
+  None, no orb). The existing filled-field sampling then
+  gives each patch a plateau with stepped sides between
+  different heights — the video's terrain — instead of
+  planks. The renderer, the 25x25 fixed square-cube grid,
+  the fill rule, colours, cage and camera are untouched.
+  New suite checks pin the field: for n >= 4 at least two
+  rows AND two columns, every category exactly once,
+  untested categories gaps with no orb, deterministic
+  layout, the union morph layout, and picking a patch
+  resolving to its category through the widget's own
+  projection.
+- EQUAL TEST COUNTS (Joshua, same day: "equal amounts of
+  tests for every test subject — no section bigger than
+  any other"). Verified before the change: every scored
+  subject had 10 tasks except Anchor (20) and Coding (11).
+  Coding 11 -> 10: the task dropped is `is_prime` — the
+  standalone prime test is duplicated inside prime_counter
+  (which requires is_prime plus count_primes), and both
+  v24 harder-top-end tasks (prime_counter,
+  double-then-quadruple) stay. Anchor 20 -> 10: kept the
+  first five MMLU-style (anchor-insulin,
+  anchor-photosynthesis, anchor-prime, anchor-ww2,
+  anchor-salt) and the first five GSM8K-style
+  (anchor-oranges, anchor-change, anchor-shelves,
+  anchor-fuel, anchor-reading), as ordered in the file.
+  Speed stays 2 — it is a timed generation workload (a
+  stopwatch), not questions; it still gets one equal patch
+  on the surface. Every suite pin that referenced the old
+  counts was updated at the same strictness (partial-brain
+  ratios, provider token/cost totals, the errored-record
+  not-run count, the report lines). NOTE: Anchor and
+  Coding scores are not directly comparable with pre-v29
+  cards — the question sets are different.
+
+Suite: 2011 passed, 0 failed, end-to-end on a fresh copy of
+the final tree (fresh5; log ~/workspace/ost-v29-verify/
+full5.log). The road there, honestly: the original v29 build
+reached green at 2006 (log full3.log) after its own pin fixes
+(report-file counts for the new surface pictures; a
+run-preview stub for the new window block, the pattern the
+v8/v15 sections use). The layout-correction round then ran
+the suite on a fresh copy (full4.log), which surfaced the
+equal-count fallout as pin failures only - canned-answer
+partial ratios (anchor 80, coding 100x6/9 of the generate
+kind), provider token totals (164 calls in the runs:
+3,280 in / 32,800 out; 3,300 / 33,000 with the warmup),
+export/compare rows (partial 60 coding, 55 overall), and
+step counts (coding pair 12 with warmup; run totals 66) -
+every one updated at the same strictness, none loosened,
+plus the errored-record not-run count (9 of 10). A runtime
+restart killed that run at 1,558 passes; the final run on
+the finished tree is the green one above. The surface checks
+pin the patch field (layout rule, every category exactly
+once, row-major order, untested = gap with no orb, picking
+resolves to the category), the union morph (shared layout
+from both models' categories, missing side fades to gap,
+endpoint labels exact), the report picture, the weights
+reader against a synthetic GGUF fixture the suite writes
+itself, manifest resolution, and the tab wiring. Version
+pins rolled 28 -> 29; the update story seeds v29 and pulls
+a fake v30. The fixed-grid square-tile checks are unchanged
+and still pass. No app defect shipped.
+
+Drives (Xvfb + xcb, 1366x768, fake server; the drive-only
+fake-profile:2b answers smart except on vision/refusal tasks,
+where it answers dumb, so its surface is a real profile).
+Re-shot for the patch field: (a) drive-gl-done-field.png -
+the finished profile in the GL window: Coding/Instruction/
+Math 100 as ONE orange mesa across the back row of the
+2-row x 3-column patch field, Refusal Behavior 0 and Vision
+0 as the blue valley in the front row, the leftover cell a
+gap; (b) drive-report-surface-field.png - the saved card's
+own PNG (372,135 bytes): the same field close up, discrete
+square cubes with stepped sides, five orbs; (c)
+drive-fallback-field.png - OST_NO_GL=1, the painter's view
+of the same field. Eyeball verdict against the reference
+video frame (~/workspace/ost-v26-verify/
+ref-video-frame-1.png): the finished surface reads as a
+FIELD of cube plateaus and valleys - the high ground is a
+two-dimensional region, not bands; there are no long strips
+or planks in any of the three shots. Picking the Coding
+patch in the GL drive resolved to cell (0, 0) and named
+"fake-profile:2b - Coding: 100% (10/10 tasks)". Two honest
+notes: the GL drive's later weights phase timed out at its
+300-second drive-script deadline under sandbox load - the
+weights reader itself is unchanged by this round and was
+timed separately on the same real qwen3.5:2b-q4_K_M blob at
+291.5 seconds (176 rows x 12 groups), so the morph
+screenshot was not re-shot this round; the morph is covered
+by the new union checks in the suite.
+
+Label correction (same day, pre-ship): the patch-field
+pictures labelled the axes "Patch row 1" / "Patch column 2"
+- the grid's words, not the model's. The painter now names
+each patch with its category, read from the data's
+patch_categories map and drawn at the patch under its orb
+(the weights map keeps its axis labels); a new suite check
+pins the rendered label set to exactly the categories
+present. Re-shot: drive-report-surface-field.png and
+drive-fallback-field.png - Coding / Instruction / Math on
+the plateau, Refusal Behavior / Vision in the valley, no
+"Patch row/column" text anywhere.
+
+Warm-up cap fix (same day, pre-ship): the run warm-up still
+stopped generation at 64 tokens - the cap v23 removed from
+the templates had survived in the warm-up. A thinking model
+spends its first tokens thinking (~167 measured before its
+first answer word), so the warm-up died mid-thought and
+every test in the run aborted (hit live by the training
+thread on this build). The warm-up now follows the v23
+rule - no cap, through the same paths as the templates
+(Ollama gets -1, providers omit max_tokens) - and the run
+preview estimates it as an uncapped call (completion
+unknown, never arithmetic on the -1). New suite check: a
+thinking-capable target's warm-up request carries
+num_predict -1 and its run finishes.
+
+What is NOT verified here: the weights view and the GL
+surface on Joshua's PC (Vega iGPU hardware GL, his real model
+files); a weights read on a much larger model file (the reader
+streams, so memory stays bounded, but a 4B+ file will take
+proportionally longer); the first real report saved on his PC
+with its picture. The painter fallback covers any GL failure,
+and the picture never depends on GL at all.
+
+---
 # TEST-REPORT — OLLAMA SYSTEM TEST v28
 
 Verified 2026-11-20 in a Linux sandbox (x86_64, PySide6 6.12.0,

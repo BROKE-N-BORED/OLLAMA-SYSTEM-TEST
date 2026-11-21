@@ -38,6 +38,14 @@ if ! .venv/bin/python -c "import PySide6.QtOpenGLWidgets, shiboken6" 2>/dev/null
   echo "Try running sh install.sh again."
   exit 1
 fi
+# v29: the weights view reads model files with numpy. The app
+# degrades to a plain note without it, but an install that cannot
+# import it is not the install this version promises — say so.
+if ! .venv/bin/python -c "import numpy" 2>/dev/null; then
+  echo "Install failed: numpy cannot be imported (the weights view needs it)."
+  echo "Try running sh install.sh again."
+  exit 1
+fi
 if ! .venv/bin/python -m py_compile ollama_system_test.py light_engine/*.py; then
   echo "Install failed: ollama_system_test.py does not compile."
   exit 1

@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v28
+# OLLAMA SYSTEM TEST v29
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,30 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v29 corrects the surface: it is ONE model's surface. OST
+tests one model at a time, so the Surface tab now shows the
+model being tested - what it is strongest and weakest at.
+Each point is one test category's score, the categories
+filling a two-dimensional patch field in test order:
+orange peaks are its strong subjects, blue valleys
+its weak ones. (v26-v28 drew every model of a run in one
+shared landscape; that was never the design asked for, and
+it is retired.) The tab carries a model picker for the rare
+run that covered several models, and a Show switch: Skills
+(the scores) or Weights - a second surface read from the
+model's own file, layer by layer, part by part, showing
+each part's average weight size scaled to the model's
+strongest part. The weights view is honest about what it
+is: the file's numbers, not what the model is good at, and
+a model with no local file (a provider model, a missing
+file) gets a plain note, never a made-up surface. The grid
+also goes on the report card now: saving a report saves a
+picture of each model's skills surface next to it, named
+in the card, and the Profiles tab shows the same surface
+with the model's card. The Compare morph blends two
+per-model profiles - the same model across two runs, or
+two models. The benchmark itself is untouched.
 
 v28 fixes the decision surface's grid: the landscape is
 now drawn on a fixed grid of small square cubes - 25 tiles
@@ -404,59 +428,98 @@ remembered next time.
 
 ## The surface graph
 
-The Surface tab (and the morph on the Compare tab) draws the
-scores as a 3D block landscape: models along one flat axis,
-templates along the other, score (0 to 100) as the height.
-Each block's top sits at its height, so high scores form
-flat-topped plateaus with steep stepped sides and low
-scores read as valleys. Blue is low, orange is high, every
-measured point carries a satin orb, and a thin, faint
-wireframe cage boxes the plot. The blocks stand on a fixed
-grid - 25 tiles to a side, each one the same small square
-on both axes, however many models or templates the run
-covered - so the mesh reads like the reference video's
-uniform field of cubes, and the data only ever sets a
-cube's height and colour. The landscape fills the
-square edge to edge - the first point on one edge of the
-plot, the last on the other - and a run over a single
-template or a single model spans the whole square on that
-axis too, the one score extending flat across it. The surface is rendered in
-real 3D by the Light Engine from Reblend (Joshua's own
-renderer), vendored into this app in the light_engine/
-folder from Reblend v0.2-pkl - the app carries its own
-copy and never depends on the Reblend repo at runtime. The
-light on the blocks is real lighting and shadow, not a
-painted effect and not bloom; the blocks and orbs are
-finished matte, with a soft sheen. Live updates move the
-blocks that changed instead of rebuilding the scene, at
-most about twice a second, and a morph moves them frame by
-frame - so it never slows a run down. If OpenGL is not
-available on the machine (or OST_NO_GL=1 is set), the tab
-falls back to the app's own 2D painting of the same
-surface - same data, same controls - so the tab is never
-dead. SKULLPT was tried for this surface and not used: one
-still image from it took about three minutes, and a live
-surface needs new frames in well under a second.
+The Surface tab draws ONE model's surface at a time. OST
+tests one model at a time, and the surface is that model:
+what it is strongest and weakest at. In the Skills view
+(the default), each point is one test category's score -
+the categories fill a two-dimensional patch field in the
+app's test order (row-major, ceil(sqrt(n)) patches
+across), the score (0 to 100) as the height of its patch -
+so the landscape reads as terrain: orange peaks are
+strong subjects, blue valleys are weak ones, neighbouring
+patches step up and down between heights, every measured
+point carries a satin orb, and a thin, faint wireframe
+cage boxes the plot. Tapping a patch names its category
+and score. It builds live while the model is tested: as
+each category finishes, its point lands and settles at
+the category's real score. A run that covered several
+models (a re-run, a resume) has one surface per model -
+the tab's model picker chooses whose, and during a run it
+follows the model being tested. The blocks stand on a
+fixed grid - 25 tiles to a side, each one the same small
+square on both axes - so the mesh reads like the
+reference video's uniform field of cubes, and the data
+only ever sets a cube's height and colour. The landscape
+fills the square edge to edge, and a single category is
+one patch spanning the whole square, its one score
+extending flat across it.
+The surface is rendered in real 3D by the Light Engine
+from Reblend (Joshua's own renderer), vendored into this
+app in the light_engine/ folder from Reblend v0.2-pkl -
+the app carries its own copy and never depends on the
+Reblend repo at runtime. The light on the blocks is real
+lighting and shadow, not a painted effect and not bloom;
+the blocks and orbs are finished matte, with a soft
+sheen. Live updates move the blocks that changed instead
+of rebuilding the scene, at most about twice a second, and
+a morph moves them frame by frame - so it never slows a
+run down. If OpenGL is not available on the machine (or
+OST_NO_GL=1 is set), the tab falls back to the app's own
+2D painting of the same surface - same data, same
+controls - so the tab is never dead. SKULLPT was tried for
+this surface and not used: one still image from it took
+about three minutes, and a live surface needs new frames
+in well under a second.
+
+The Show switch on the Surface tab picks the other view:
+Weights. The app reads the model's own file (its GGUF in
+Ollama's store, found through the model's manifest) and
+draws weight strength by layer: one row per layer - the
+embedding and the head as their own rows - and one point
+per part of the layer (attention q/k/v/out, the merged
+attention parts some models carry, MLP gate/up/down,
+norms), the height being that part's average |weight|,
+scaled so the model's strongest part is 100. It is the
+file's numbers, exactly as read - F32, F16, Q8_0, Q4_K and
+Q6_K tensors are dequantized and measured; a tensor in a
+format the reader cannot read is skipped and counted,
+never guessed. The caption under the weights view says
+what it is: it shows the file's numbers, not what the
+model is good at. A provider model, or a local model whose
+file cannot be found, gets a plain "no local model file"
+note instead - never a fake surface. Reading a file takes
+a little while (about half a minute for a 2B model) and
+happens off the window's thread.
+
+The grid goes on the report card too: when a report is
+saved, a PNG picture of each tested model's skills surface
+is saved next to the report - drawn by the painted
+renderer, so it needs no OpenGL - and the card names the
+picture in plain words. The Profiles tab (the in-app
+report card) shows the same surface with the model's card.
 
 Honest scope, the same rule the whole app follows: every
-point on the surface is a real measured score. The blocks
-between the points are interpolated so the shape is
-easy to read - they are a visual guide, not measured data, and
-the caption under the surface says exactly that. A cell that
-was not run, was not eligible, or could not be measured is
-left out: a gap in the surface, never a zero and never a
-guess. While a template is still running, its point is a
-pale ghost orb and its height is the pass share of the tasks
-finished so far; when the template finishes, the point
-settles at the template's real score.
+point on the skills surface is a real measured score. The
+blocks between the points are interpolated so the shape
+is easy to read - they are a visual guide, not measured
+data, and the caption under the surface says exactly
+that. A category that was not run, was not eligible, or
+could not be measured is left out: a gap in the surface,
+never a zero and never a guess. While a category is still
+running, its point is a pale ghost orb and its height is
+the pass share of the tasks finished so far; when the
+category finishes, the point settles at its real score.
 
-The morph's missing-cell rule: a cell measured in only one
-of the two runs never takes the other run's value. It fades
-toward the floor as the morph crosses (its height is its own
-score times the share of the morph still on its side) and is
-a gap at the far end, exactly as on the side that never
-measured it. At the two ends the morph is the two runs'
-surfaces exactly.
+The Compare tab's morph now blends two per-model profiles
+- the same model in two runs, or two models: pick the two
+runs and the two models, and play or drag the blend. The
+morph's missing-category rule: a category measured in only
+one of the two profiles never takes the other side's
+value. It fades toward the floor as the morph crosses (its
+height is its own score times the share of the morph still
+on its side) and is a gap at the far end, exactly as on
+the side that never measured it. At the two ends the
+morph is the two profiles exactly.
 
 ### The shared surface-data shape
 
@@ -467,23 +530,35 @@ widget:
 
 ```json
 {
-  "kind": "ost_scores",
-  "title": "Run 2026-11-20 10:00:00",
-  "x_labels": ["model-a:2b", "model-b:1b"],
-  "y_labels": ["Instruction", "Math"],
-  "values": [[90.0, 42.0], [0.0, null]],
-  "details": {"0,0": "model-a:2b - Instruction: 90% (9/10 tasks)"},
-  "partial": [[false, false], [false, false]]
+  "kind": "ost_skills",
+  "title": "fake-smart:2b - run 2026-11-20T10:00:00",
+  "model": "fake-smart:2b",
+  "x_labels": ["Patch row 1"],
+  "y_labels": ["Patch column 1", "Patch column 2"],
+  "values": [[90.0, null]],
+  "details": {"0,0": "fake-smart:2b - Instruction: 90% (9/10 tasks)"},
+  "partial": [[false, false]],
+  "category_order": ["Instruction", "Math"],
+  "patch_categories": {"0,0": "Instruction", "0,1": "Math"},
+  "patch_layout": {"rows": 1, "columns": 2}
 }
 ```
 
-- `kind`: a string naming what the values are ("ost_scores"
-  here; a producer with other values names its own).
+- `kind`: a string naming what the values are ("ost_skills"
+  for a model's category scores, "ost_weights" for the
+  weights view; a producer with other values names its own).
 - `title`: shown at the top of the surface.
+- `model`: the one model this surface belongs to.
 - `x_labels`, `y_labels`: one label per point along each
-  flat axis. In OST, x is models and y is templates.
-- `values`: `values[x][y]` is the measured score (0 to 100)
-  at that point, or `null` when it was not measured - a gap.
+  flat axis. A skills surface's axes are its patch rows and
+  columns; which category sits at each patch is carried by
+  `patch_categories` ("x,y" -> category name), with
+  `category_order` holding the categories in the app's
+  test order and `patch_layout` the field's rows/columns.
+  A weights surface's x labels are its rows (Embedding,
+  Layer 0..., Head) and its y labels the tensor groups.
+- `values`: `values[x][y]` is the value (0 to 100) at that
+  point, or `null` when it was not measured - a gap.
 - `details`: optional; `"x,y"` (the point's indexes) maps to
   the words shown when the point is tapped.
 - `partial`: optional; `partial[x][y]` is true while that
