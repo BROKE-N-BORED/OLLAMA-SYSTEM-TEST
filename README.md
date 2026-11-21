@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v27
+# OLLAMA SYSTEM TEST v28
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,16 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v28 fixes the decision surface's grid: the landscape is
+now drawn on a fixed grid of small square cubes - 25 tiles
+to a side, the same size on both axes - like the reference
+video's uniform mesh. In v27 the tiles were cut from the
+data itself, so a run with few models or templates drew a
+few enormous slabs, rectangular whenever the two axes'
+counts differed. The cube size no longer depends on how
+much data there is; the data only sets each cube's height
+and colour. Both renderers draw the identical grid.
 
 v27 fixes the decision surface's placement: the landscape
 now fills its plot square edge to edge, wall to wall
@@ -401,7 +411,12 @@ Each block's top sits at its height, so high scores form
 flat-topped plateaus with steep stepped sides and low
 scores read as valleys. Blue is low, orange is high, every
 measured point carries a satin orb, and a thin, faint
-wireframe cage boxes the plot. The landscape fills the
+wireframe cage boxes the plot. The blocks stand on a fixed
+grid - 25 tiles to a side, each one the same small square
+on both axes, however many models or templates the run
+covered - so the mesh reads like the reference video's
+uniform field of cubes, and the data only ever sets a
+cube's height and colour. The landscape fills the
 square edge to edge - the first point on one edge of the
 plot, the last on the other - and a run over a single
 template or a single model spans the whole square on that

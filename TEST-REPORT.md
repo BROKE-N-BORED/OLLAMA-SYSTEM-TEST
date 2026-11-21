@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v27
+# TEST-REPORT — OLLAMA SYSTEM TEST v28
 
 Verified 2026-11-20 in a Linux sandbox (x86_64, PySide6 6.12.0,
 Python 3.12.3) under the Qt test env from AGENTS.md:
@@ -6,6 +6,124 @@ QT_QPA_PLATFORM=offscreen for the suite, Xvfb + xcb for the GUI
 drive, LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-
 linux-gnu, venv ~/workspace/forge-v2-testenv/bin/python, default
 HOME, TMPDIR on tmpfs.
+
+v28 fixes the decision surface's grid. Joshua's verdict
+on the shipped v27 surface: "Thats not whats in the
+video, that grid is too fucking big" and "why are the
+fucking rectangles?" He was right on both, and the cause
+was measured, not guessed (probe on the shipped code,
+~/workspace/ost-v28-verify/before.log): the render tiles
+were subdivisions of the DATA steps - about 4 tiles per
+data step, each axis subdividing its own step size - so
+tile size was the data-step size divided by the
+subdivision. A 2x3 surface (the v27 drive's shape) drew
+32 tiles of 24.65 x 49.65 cm: enormous, and rectangular
+because the axes' step sizes differed. A 4x5 drew 192
+tiles of 12.15 x 16.32; a 2x2 drew 16 slabs of 49.65 cm.
+The video's surface is a uniform grid of many small
+SQUARE cubes - the same cube size in both directions,
+about 25 across - and the data only sets each cube's
+height and colour.
+
+The fix decouples the render grid from the data grid.
+SURFACE_GRID_N = 25: _surface_axis now returns 25 tile
+centres spread evenly across the axis's extent (the v27
+extents are unchanged - [0, count-1] for two or more
+nodes, the virtual span [-2, 2] for a single node, whose
+value the sampler's clamping still extends flat across
+the axis), and _surface_axis_extent is that extent stated
+directly. _surface_axis_subdiv is gone. Every tile is
+SURFACE_FIELD / 25 = 8 cm wide in scene space on BOTH
+axes (7.65 cm after the unchanged 0.35 cm gap), square by
+construction. surface_filled_values and
+surface_sample_filled are untouched - only the sample
+positions changed - and both renderers draw the
+identical sample set: the painter already read
+_surface_samples_from_filled, and still does. Orbs,
+node positions, picking, the cage, slab, camera, lights
+and colours are as v27 left them. The morph blends
+values only and re-derives each frame's description
+through the same builder, so it uses the fixed grid too;
+the GL scene still builds once per axis set (now 625
+column slots for any non-empty surface) and mutates
+afterwards. Probe after the fix
+(~/workspace/ost-v28-verify/after.log): 625 samples for
+every grid; fully measured 2x2, 2x3, 4x5, 2x1 and 1x1
+surfaces all produce exactly 625 columns of 7.65 x 7.65
+cm; outer edges 0.17..199.82 of the 200 field on both
+axes; the 3x3 corner-gap surface produces 481 columns
+(625 minus the 144 tiles whose blend touches the gap
+corner) and no orb at the gap node.
+
+Verification. Full suite, fresh copy of the final tree,
+offscreen Qt env: 1990 passed, 0 failed, exit 0 (log
+~/workspace/ost-v28-verify/full1.log) - the v27 suite's
+1987 checks plus 3 new v28 checks. (The fresh copy's code
+and test files are byte-identical to this tree; only
+README/CHANGELOG/TEST-REPORT text was finished after the
+copy, and the README diff touches no suite-pinned phrase.)
+Pins updated where v28 deliberately changes behaviour:
+the version pin (27 to 28, four places incl. both title
+bars), the window-level update story rolled one version
+forward (the fake GitHub server gained a fake v29 tree;
+the story now seeds a v28 install and pulls v29), and
+the surface sample counts (16 to 625: the lone-gap
+surface, the fully measured 2x2, and the single-template
+surface). The new v28 checks: every column of a fully
+measured 2x3 and of a 4x5 is square and exactly
+SURFACE_FIELD / SURFACE_GRID_N minus the gap on both
+axes; the sample and column counts of fully measured
+2x2, 2x3 and 4x5 surfaces are all 625 - independent of
+the data grid's size; a single measured point spans the
+full field on both axes with its orb at the centre. The
+v27 checks stand in spirit and pass: edge tiling, the
+2x1 span, and the corner gap (no column in the gap
+corner's quadrant, no orb at its node - with the fine
+grid the quadrant is the filled field's gap area, 144
+tiles). The surface section also passes standalone: 46
+passed, 0 failed (log ~/workspace/ost-v28-verify/
+tail1.log - the tail run's own scratch in this tree was
+cleaned afterwards; the tree ends clean, see below).
+
+GUI drive (Xvfb + xcb, 1366x768, fake-server runs; logs
+and screenshots in ~/workspace/ost-v28-verify/, all three
+drives exit 0, GL live throughout - uses_gl True, no
+fallback swap, no shader error). The GL drive re-ran the
+v27 drive's data (fake-smart and fake-dumb over
+instruction, math and coding, values all-100 over all-0):
+the finished surface (drive-gl-done.png) is now a
+fine-stepped ramp of small square cubes, about 25 across,
+filling the square wall to wall - where the v27 shot of
+the same data drew four giant slabs. (The ramp shape is
+the data: two models, 100 and 0, blend linearly; the
+steps are the 25 cube rows.) The multi drive
+(drive-gl-multi.png) ran three models by three templates
+with a mid-scoring model: an interior terrace on the
+same fine grid. The Compare morph at t=0.5
+(drive-gl-morph-t50.png) fills its square with the same
+small cubes, and Play/Pause was exercised. The
+forced-fallback drive (OST_NO_GL=1, drive-fallback.png)
+shows the painter drawing the identical 25-across grid
+of small square cubes on the same data. Drag rotate,
+wheel zoom and orb picking were re-verified on the new
+grid (picked detail "fake-smart:2b - Instruction: 100%
+(10/10 tasks)"). Performance: 625 columns plus orbs did
+not slow the drives under llvmpipe - all three drives,
+including two full fake runs and the morph in the GL
+one, completed at the same pace as v27's; no timeout was
+approached. Eyeball verdict against
+~/workspace/ost-v26-verify/ref-video-frame-1.png: the
+mesh is now the video's mesh - many small square cubes,
+uniform in both directions, roughly 25 across, data
+setting only height and colour.
+
+Left open, unchanged from v27: the GL view draws no axis
+labels (names come from tapping a point, as in the
+video; the painter fallback draws them), and GL is
+verified here under Mesa llvmpipe - the first verdict on
+Joshua's own PC is still his to give. Tree hygiene at
+the end: no capabilities.json, no tests/results-test,
+no tests/_v6_scratch, logs/ empty.
 
 v27 fixes the decision surface's placement. Joshua's
 verdict on the shipped v26 surface, looking at the

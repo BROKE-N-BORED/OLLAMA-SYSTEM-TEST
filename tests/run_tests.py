@@ -1,4 +1,4 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v27 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v28 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
 answers per model. All v25 checks are carried over (pins updated
 where v26 deliberately changes behavior - the version pin, the
@@ -19,7 +19,14 @@ the lone-gap surface's sample count, named in the TEST-REPORT);
 the v27 checks cover the full-square surface placement: columns
 tiling the field edge to edge, a single-node axis spanning the
 whole field with its orb at the axis centre, and an edge gap
-still yielding no column and no orb at its corner. All v24 checks are carried over (pins updated
+still yielding no column and no orb at its corner. All v27 checks are carried over (pins updated
+where v28 deliberately changes behavior - the version pin, the
+fake GitHub "newer release" story, and the surface sample
+counts, named in the TEST-REPORT); the v28 checks cover the
+fixed render grid: SURFACE_GRID_N tiles per axis, square tiles
+of one size on both axes of any data grid, a column count
+independent of the data grid's size, and a single measured
+point still spanning the whole field. All v24 checks are carried over (pins updated
 where v25 deliberately changes behavior - the version pin and the
 tab count, named in the TEST-REPORT); the v25 checks cover the
 Prompt Dialect Test: the six prompt wrappers (the task text
@@ -3648,7 +3655,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 27", app.__version__ == "27",
+    check("__version__ is 28", app.__version__ == "28",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3662,8 +3669,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v27",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v27",
+    check("title bar shows OLLAMA SYSTEM TEST v28",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v28",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -5109,10 +5116,10 @@ def main():
               and window9.template_list.count() == 20,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v27",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v27",
+        check("title bar shows v28",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v28",
               window9.windowTitle())
-        check("__version__ is 27", app.__version__ == "27", app.__version__)
+        check("__version__ is 28", app.__version__ == "28", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -11052,7 +11059,7 @@ def main():
         real_api22w = updates_module.API_BASE
         real_codeload22w = updates_module.CODELOAD_BASE
         server22w, port22w = fake_github.start_fake_github(
-            latest_tag="v28")
+            latest_tag="v29")
         base22w = "http://127.0.0.1:%d" % port22w
         updates_module.API_BASE = base22w
         updates_module.CODELOAD_BASE = base22w
@@ -11069,7 +11076,7 @@ def main():
             check("live declined check finishes", done22j)
             check("live declined update is asked",
                   len(asked22w) == 1
-                  and asked22w[0].get("latest") == "28",
+                  and asked22w[0].get("latest") == "29",
                   str(asked22w))
             check("live declined update downloads nothing",
                   not any("/zipball/" in path
@@ -11084,7 +11091,7 @@ def main():
             install22w = os.path.join(scratch22w, "install")
             os.makedirs(os.path.join(install22w, "results"),
                         exist_ok=True)
-            for rel, data in fake_github.FAKE_V27_FILES.items():
+            for rel, data in fake_github.FAKE_V28_FILES.items():
                 path = os.path.join(install22w, *rel.split("/"))
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "wb") as handle:
@@ -11102,16 +11109,16 @@ def main():
                 and window22k._update_check_worker is None,
                 timeout=30)
             check("live accepted pull finishes", done22k)
-            check("live pull installs v28 on disk",
+            check("live pull installs v29 on disk",
                   open(os.path.join(
                       install22w, "ollama_system_test.py"),
-                      encoding="utf-8").read().find('"28"') >= 0)
+                      encoding="utf-8").read().find('"29"') >= 0)
             check("live pull keeps results",
                   open(os.path.join(
                       install22w, "results", "keep.txt"),
                       encoding="utf-8").read() == "my results")
-            check("running copy still says v27",
-                  window22k.windowTitle().endswith("v27"),
+            check("running copy still says v28",
+                  window22k.windowTitle().endswith("v28"),
                   window22k.windowTitle())
             fresh22 = subprocess.run(
                 [sys.executable, "-c",
@@ -11120,9 +11127,9 @@ def main():
                  "print(ollama_system_test.__version__)"
                  % install22w],
                 capture_output=True, text=True, timeout=60)
-            check("a fresh launch runs v28",
+            check("a fresh launch runs v29",
                   fresh22.returncode == 0
-                  and fresh22.stdout.strip() == "28",
+                  and fresh22.stdout.strip() == "29",
                   "rc=%s out=%r err=%s" % (
                       fresh22.returncode, fresh22.stdout,
                       fresh22.stderr))
@@ -12344,11 +12351,11 @@ def main():
     check("v26 GL: a neighbourless gap makes no column and "
           "no orb",
           lone["columns"] == [] and lone["orbs"] == []
-          and len(lone["samples"]) == 16,
+          and len(lone["samples"]) == 625,
           f"samples={len(lone['samples'])}")
-    # (v27 pin: a single-node surface now samples a 4x4 spread
-    # across the field - see the v27 checks below - where v26
-    # sampled a single slot.)
+    # (v28 pin: the render grid is fixed at SURFACE_GRID_N x
+    # SURFACE_GRID_N slots - see the v28 checks below - where
+    # v27 sampled a 4x4 spread and v26 a single slot.)
     check("v26 GL: orbs rest on their columns, partial orbs "
           "are flagged, the cage is a whisper",
           desc_orbs[(0, 0)]["height"]
@@ -12378,7 +12385,7 @@ def main():
     cols27 = full27["columns"]
     check("v27 a fully measured 2x2 surface tiles the field "
           "edge to edge",
-          len(cols27) == len(full27["samples"]) == 16
+          len(cols27) == len(full27["samples"]) == 625
           and 0.0 <= min(c["cx"] - c["sx"] / 2 for c in cols27)
           <= gap27
           and field27 - gap27
@@ -12408,7 +12415,7 @@ def main():
     sorbs27 = {(o["xi"], o["yi"]): o for o in strip27["orbs"]}
     check("v27 a single-template surface spans the full field "
           "on both axes, orbs at the single axis's centre",
-          len(scols27) == len(strip27["samples"]) == 16
+          len(scols27) == len(strip27["samples"]) == 625
           and 0.0 <= min(c["cx"] - c["sx"] / 2 for c in scols27)
           <= gap27
           and field27 - gap27
@@ -12445,6 +12452,82 @@ def main():
                       for c in corner27["columns"]),
           f"cols={len(corner27['columns'])} "
           f"orbs={len(corner27['orbs'])}")
+    # --- v28: the fixed render grid ---
+    # Joshua's verdict on the shipped v27 surface: "that grid
+    # is too fucking big" and "why are the fucking
+    # rectangles?" He was right on both: the tiles were
+    # subdivisions of the DATA steps (about 4 per step, each
+    # axis subdividing its own step size), so the 2x3 drive
+    # surface drew 32 slabs of 24.65 x 49.65 cm and a 4x5 drew
+    # 192 tiles of 12.15 x 16.32 - the tile size, shape and
+    # count all changed with the data. The render grid is now
+    # FIXED: SURFACE_GRID_N tiles per axis (625 slots), each
+    # SURFACE_FIELD / SURFACE_GRID_N cm wide on BOTH axes,
+    # sampled from the same filled field at the tile centres -
+    # a uniform mesh of small square cubes like the reference
+    # video's, the data setting only height and colour.
+    def _full28(nx, ny):
+        return app.surface_scene_description({
+            "kind": "ost_scores", "title": "Grid",
+            "x_labels": [f"m{i}" for i in range(nx)],
+            "y_labels": [f"t{j}" for j in range(ny)],
+            "values": [[float((i * 31 + j * 17) % 101)
+                        for j in range(ny)] for i in range(nx)],
+            "details": {},
+            "partial": [[False] * ny for _ in range(nx)]})
+
+    grid22 = _full28(2, 2)
+    grid23 = _full28(2, 3)
+    grid45 = _full28(4, 5)
+    tile28 = field27 / app.SURFACE_GRID_N - gap27
+    check("v28 tiles are square and one size on a mixed-count "
+          "grid (2x3) and on a 4x5 grid",
+          len(grid23["columns"]) > 0
+          and len(grid45["columns"]) > 0
+          and all(abs(c["sx"] - c["sy"]) < 1e-6
+                  and abs(c["sx"] - tile28) < 1e-6
+                  for c in grid23["columns"])
+          and all(abs(c["sx"] - c["sy"]) < 1e-6
+                  and abs(c["sx"] - tile28) < 1e-6
+                  for c in grid45["columns"]),
+          "2x3 sx/sy="
+          f"{ {(c['sx'], c['sy']) for c in grid23['columns']} }"
+          " 4x5 sx/sy="
+          f"{ {(c['sx'], c['sy']) for c in grid45['columns']} }")
+    check("v28 the column count is the fixed grid's, "
+          "independent of the data grid's size",
+          len(grid22["samples"]) == len(grid23["samples"])
+          == len(grid45["samples"]) == app.SURFACE_GRID_N ** 2
+          and len(grid22["columns"]) == len(grid23["columns"])
+          == len(grid45["columns"]) == app.SURFACE_GRID_N ** 2,
+          f"2x2={len(grid22['columns'])}/"
+          f"{len(grid22['samples'])} "
+          f"2x3={len(grid23['columns'])}/"
+          f"{len(grid23['samples'])} "
+          f"4x5={len(grid45['columns'])}/"
+          f"{len(grid45['samples'])}")
+    one28 = app.surface_scene_description({
+        "kind": "ost_scores", "title": "One",
+        "x_labels": ["m"], "y_labels": ["t"],
+        "values": [[50.0]], "details": {}, "partial": [[False]]})
+    ocols28 = one28["columns"]
+    check("v28 a single measured point spans the full field "
+          "on both axes, its orb at the centre",
+          len(ocols28) == app.SURFACE_GRID_N ** 2
+          and 0.0 <= min(c["cx"] - c["sx"] / 2 for c in ocols28)
+          <= gap27
+          and field27 - gap27
+          <= max(c["cx"] + c["sx"] / 2 for c in ocols28)
+          <= field27
+          and 0.0 <= min(c["cy"] - c["sy"] / 2 for c in ocols28)
+          <= gap27
+          and field27 - gap27
+          <= max(c["cy"] + c["sy"] / 2 for c in ocols28)
+          <= field27
+          and len(one28["orbs"]) == 1
+          and one28["orbs"][0]["x"] == field27 / 2
+          and one28["orbs"][0]["y"] == field27 / 2,
+          f"cols={len(ocols28)} orbs={one28['orbs']}")
     # Fallback selection: this suite runs offscreen, where no GL
     # context can exist - the factory must hand back the painter,
     # and the window's surfaces must be painters.

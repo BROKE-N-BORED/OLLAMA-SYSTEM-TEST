@@ -1,5 +1,31 @@
 # Changelog
 
+## v28 (2026-11-20)
+
+The surface's grid is fixed: small square cubes.
+
+- Fixed the decision surface's tiles: in v27 they were cut
+  from the data - about four tiles per data step, each axis
+  subdividing its own step - so a run over two models and
+  three templates drew a handful of enormous slabs, wider
+  in one direction than the other, and a bigger run drew
+  smaller ones. The grid is now fixed, the way the
+  reference video draws it: 25 tiles to a side, every tile
+  the same small square on both axes, whatever the data
+  grid's size. The data only sets each cube's height and
+  colour.
+- The sample count is the grid's, not the data's: 625
+  tiles for any non-empty surface, minus the ones a gap
+  leaves out. A single measured point still spans the
+  whole field, and gaps still yield no cube and no orb -
+  including in a corner.
+- Both renderers - the real-3D surface and the painted
+  fallback - draw the identical fixed grid from the same
+  shared sampling. Nothing else changed: the placement
+  (wall to wall), the fill between points, the morph, the
+  picking, the colours, the cage, the data shape and the
+  benchmark are as v27 left them.
+
 ## v27 (2026-11-20)
 
 The surface fills its square.

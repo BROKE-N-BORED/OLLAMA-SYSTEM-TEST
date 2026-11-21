@@ -173,7 +173,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "27"
+__version__ = "28"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -8923,35 +8923,15 @@ def surface_sample_filled(filled, fx, fy):
             + c11 * tx * ty + c01 * (1 - tx) * ty)
 
 
-def _surface_axis_subdiv(count):
-    """Render-grid subdivisions per data step on one axis:
-    about 4 per step, thinned as the axis grows so the block
-    count stays near the roughly 26-per-axis cap."""
-    if count <= 1:
-        return 1
-    return max(1, min(4, 25 // (count - 1)))
-
-
-def _surface_axis(count):
-    """One axis of the render grid: (sample positions, step)
-    in data-index space. With two or more nodes the samples
-    are TILE CENTRES spanning the node-to-node field edge to
-    edge - the first tile starts at the first node and the
-    last tile ends at the last node, so the tiled field fills
-    the whole plot square wall to wall, like the reference
-    video's. A single-node axis has no span to tile: its
-    samples spread across a virtual span centred on the node
-    (four tiles of step 1.0), and surface_sample_filled's
-    clamping reads every one of them at the node itself - the
-    node's value extends flat across the whole axis, and a
-    gap on the other axis stays a gap at every spread sample
-    whose blend touches it."""
-    if count <= 1:
-        return [-1.5, -0.5, 0.5, 1.5], 1.0
-    subdiv = _surface_axis_subdiv(count)
-    tiles = (count - 1) * subdiv
-    return ([(k + 0.5) / subdiv for k in range(tiles)],
-            1.0 / subdiv)
+# The render grid is FIXED (v28): SURFACE_GRID_N tiles per
+# axis, whatever the data grid's size - the reference video's
+# surface is a uniform mesh of many small square cubes, and
+# the data only ever set each cube's height and colour.
+# (Before v28 the tiles were subdivisions of the data steps,
+# about 4 per step, so a small run drew a few enormous slabs -
+# rectangular whenever the two axes' counts differed, because
+# each axis subdivided its own step size.)
+SURFACE_GRID_N = 25
 
 
 def _surface_axis_extent(count):
@@ -8959,11 +8939,34 @@ def _surface_axis_extent(count):
     span its tiles cover, edge to edge. Nodes sit ON the
     edges - the first node at the low edge, the last at the
     high edge - and a single node sits at the centre of its
-    virtual span. Both renderers place everything (columns,
-    orbs, cage) from this one extent, so they can never
-    disagree about where the field ends."""
-    positions, step = _surface_axis(count)
-    return positions[0] - step / 2.0, positions[-1] + step / 2.0
+    virtual span [-2, 2]. Both renderers place everything
+    (columns, orbs, cage) from this one extent, so they can
+    never disagree about where the field ends."""
+    if count <= 1:
+        return -2.0, 2.0
+    return 0.0, float(count - 1)
+
+
+def _surface_axis(count):
+    """One axis of the render grid: (sample positions, step)
+    in data-index space. The grid is FIXED: SURFACE_GRID_N
+    tile centres spread evenly across the axis's extent (see
+    _surface_axis_extent) - the same tile count, and the same
+    scene size, on every axis of every surface, so the tiles
+    come out small and square like the reference video's
+    cubes however much or little data there is. A tile's
+    data coordinate is its centre mapped through the extent:
+    for two or more nodes, (i + 0.5) / SURFACE_GRID_N *
+    (count - 1); for a single node, spread across its
+    virtual span the same way, and surface_sample_filled's
+    clamping reads every one of them at the node itself -
+    the node's value extends flat across the whole axis, and
+    a gap on the other axis stays a gap at every sample
+    whose blend touches it."""
+    lo, hi = _surface_axis_extent(count)
+    step = (hi - lo) / SURFACE_GRID_N
+    return ([lo + (k + 0.5) * step
+             for k in range(SURFACE_GRID_N)], step)
 
 
 def _surface_samples_from_filled(filled, nx, ny):
@@ -9100,14 +9103,18 @@ def surface_scene_description(data):
     its column top; the widget rests the orb on it (centre =
     height + radius), never half-sunk.
 
-    Placement fills the square (v27): columns are centred on
-    their tile-centre samples and sized step minus the gap, in
-    the axis-extent mapping of _surface_axis_extent - so the
-    outermost columns' outer edges land on 0 and SURFACE_FIELD
-    (within the small inter-column gap), the landscape runs
-    wall to wall inside the cage like the reference video's,
-    and a single-node axis spans the whole field on that axis
-    with its orb at the axis centre."""
+    Placement fills the square (v27) with a FIXED grid of
+    small square cubes (v28): SURFACE_GRID_N tiles per axis,
+    each SURFACE_FIELD / SURFACE_GRID_N cm wide on BOTH axes,
+    centred on their tile-centre samples and sized step minus
+    the gap, in the axis-extent mapping of
+    _surface_axis_extent - so the outermost columns' outer
+    edges land on 0 and SURFACE_FIELD (within the small
+    inter-column gap), the landscape runs wall to wall inside
+    the cage like the reference video's, the cube size never
+    depends on how much data there is, and a single-node axis
+    spans the whole field on that axis with its orb at the
+    axis centre."""
     if not data:
         data = {}
     x_labels = list(data.get("x_labels") or [])
