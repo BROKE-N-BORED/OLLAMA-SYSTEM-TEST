@@ -1,5 +1,29 @@
 # Changelog
 
+## v27 (2026-11-20)
+
+The surface fills its square.
+
+- Fixed the decision surface's placement: in v26 the
+  landscape stopped half a cell short of every wall of its
+  cage, and a run over a single template drew one band
+  across the middle of an empty cage. The blocks now tile
+  the plot edge to edge, wall to wall inside the cage, the
+  way the reference video draws it: the first point sits on
+  one edge of the square, the last point on the other, and
+  the orbs rest on the field's edges and corners.
+- A run over a single template (or a single model) spans
+  the whole square on that axis too: the one score extends
+  flat across the axis, and its orb sits at the axis's
+  centre.
+- Both renderers - the real-3D surface and the painted
+  fallback - place the field the same way, from the same
+  shared maths. Nothing else changed: gaps are still gaps
+  (an unmeasured point makes no block and no orb, edges
+  included), and the morph, the picking, the colours, the
+  cage, the data shape and the benchmark are as v26 left
+  them.
+
 ## v26 (2026-11-20)
 
 The live 3D decision surface: the scores as a landscape you

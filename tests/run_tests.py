@@ -1,4 +1,4 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v26 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v27 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
 answers per model. All v25 checks are carried over (pins updated
 where v26 deliberately changes behavior - the version pin, the
@@ -13,7 +13,13 @@ a strongly orange pixel from a known matrix), the live hook (a
 real worker run feeding the tracker - partial while a template
 runs, settled at its score when it finishes), the Surface tab
 with its honesty caption, and the Compare tab's run pickers
-starting unpicked. All v24 checks are carried over (pins updated
+starting unpicked. All v26 checks are carried over (pins updated
+where v27 deliberately changes behavior - the version pin and
+the lone-gap surface's sample count, named in the TEST-REPORT);
+the v27 checks cover the full-square surface placement: columns
+tiling the field edge to edge, a single-node axis spanning the
+whole field with its orb at the axis centre, and an edge gap
+still yielding no column and no orb at its corner. All v24 checks are carried over (pins updated
 where v25 deliberately changes behavior - the version pin and the
 tab count, named in the TEST-REPORT); the v25 checks cover the
 Prompt Dialect Test: the six prompt wrappers (the task text
@@ -3642,7 +3648,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 26", app.__version__ == "26",
+    check("__version__ is 27", app.__version__ == "27",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3656,8 +3662,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v26",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v26",
+    check("title bar shows OLLAMA SYSTEM TEST v27",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v27",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -5103,10 +5109,10 @@ def main():
               and window9.template_list.count() == 20,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v26",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v26",
+        check("title bar shows v27",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v27",
               window9.windowTitle())
-        check("__version__ is 26", app.__version__ == "26", app.__version__)
+        check("__version__ is 27", app.__version__ == "27", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -11046,7 +11052,7 @@ def main():
         real_api22w = updates_module.API_BASE
         real_codeload22w = updates_module.CODELOAD_BASE
         server22w, port22w = fake_github.start_fake_github(
-            latest_tag="v27")
+            latest_tag="v28")
         base22w = "http://127.0.0.1:%d" % port22w
         updates_module.API_BASE = base22w
         updates_module.CODELOAD_BASE = base22w
@@ -11063,7 +11069,7 @@ def main():
             check("live declined check finishes", done22j)
             check("live declined update is asked",
                   len(asked22w) == 1
-                  and asked22w[0].get("latest") == "27",
+                  and asked22w[0].get("latest") == "28",
                   str(asked22w))
             check("live declined update downloads nothing",
                   not any("/zipball/" in path
@@ -11078,7 +11084,7 @@ def main():
             install22w = os.path.join(scratch22w, "install")
             os.makedirs(os.path.join(install22w, "results"),
                         exist_ok=True)
-            for rel, data in fake_github.FAKE_V26_FILES.items():
+            for rel, data in fake_github.FAKE_V27_FILES.items():
                 path = os.path.join(install22w, *rel.split("/"))
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "wb") as handle:
@@ -11096,16 +11102,16 @@ def main():
                 and window22k._update_check_worker is None,
                 timeout=30)
             check("live accepted pull finishes", done22k)
-            check("live pull installs v27 on disk",
+            check("live pull installs v28 on disk",
                   open(os.path.join(
                       install22w, "ollama_system_test.py"),
-                      encoding="utf-8").read().find('"27"') >= 0)
+                      encoding="utf-8").read().find('"28"') >= 0)
             check("live pull keeps results",
                   open(os.path.join(
                       install22w, "results", "keep.txt"),
                       encoding="utf-8").read() == "my results")
-            check("running copy still says v26",
-                  window22k.windowTitle().endswith("v26"),
+            check("running copy still says v27",
+                  window22k.windowTitle().endswith("v27"),
                   window22k.windowTitle())
             fresh22 = subprocess.run(
                 [sys.executable, "-c",
@@ -11114,9 +11120,9 @@ def main():
                  "print(ollama_system_test.__version__)"
                  % install22w],
                 capture_output=True, text=True, timeout=60)
-            check("a fresh launch runs v27",
+            check("a fresh launch runs v28",
                   fresh22.returncode == 0
-                  and fresh22.stdout.strip() == "27",
+                  and fresh22.stdout.strip() == "28",
                   "rc=%s out=%r err=%s" % (
                       fresh22.returncode, fresh22.stdout,
                       fresh22.stderr))
@@ -12338,7 +12344,11 @@ def main():
     check("v26 GL: a neighbourless gap makes no column and "
           "no orb",
           lone["columns"] == [] and lone["orbs"] == []
-          and len(lone["samples"]) == 1)
+          and len(lone["samples"]) == 16,
+          f"samples={len(lone['samples'])}")
+    # (v27 pin: a single-node surface now samples a 4x4 spread
+    # across the field - see the v27 checks below - where v26
+    # sampled a single slot.)
     check("v26 GL: orbs rest on their columns, partial orbs "
           "are flagged, the cage is a whisper",
           desc_orbs[(0, 0)]["height"]
@@ -12348,6 +12358,93 @@ def main():
           and desc_orbs[(0, 1)]["partial"] is True
           and desc_orbs[(0, 0)]["color"] == "#ff5c00"
           and desc["cage"]["bar"] == 0.4)
+    # --- v27: full-square placement ---
+    # Joshua's verdict on the shipped v26 surface: the
+    # landscape stopped half a cell short of every cage wall,
+    # and a one-template run drew a single band across the
+    # middle of the cage. Placement now tiles the field edge
+    # to edge: nodes on the field edges, columns centred on
+    # tile-centre samples at step minus the gap, a single-node
+    # axis spread across the whole field with its orbs at the
+    # axis centre. Gaps still yield nothing - no column, no
+    # orb - including at the edges.
+    gap27 = 0.35  # the scene builder's inter-column gap, cm
+    full27 = app.surface_scene_description({
+        "kind": "ost_scores", "title": "Full",
+        "x_labels": ["m1", "m2"], "y_labels": ["t1", "t2"],
+        "values": [[100.0, 50.0], [0.0, 25.0]],
+        "details": {}, "partial": [[False, False], [False, False]]})
+    field27 = full27["field"]
+    cols27 = full27["columns"]
+    check("v27 a fully measured 2x2 surface tiles the field "
+          "edge to edge",
+          len(cols27) == len(full27["samples"]) == 16
+          and 0.0 <= min(c["cx"] - c["sx"] / 2 for c in cols27)
+          <= gap27
+          and field27 - gap27
+          <= max(c["cx"] + c["sx"] / 2 for c in cols27)
+          <= field27
+          and 0.0 <= min(c["cy"] - c["sy"] / 2 for c in cols27)
+          <= gap27
+          and field27 - gap27
+          <= max(c["cy"] + c["sy"] / 2 for c in cols27)
+          <= field27,
+          f"cols={len(cols27)}")
+    orbs27 = {(o["xi"], o["yi"]): o for o in full27["orbs"]}
+    check("v27 node orbs sit on the field edges and corners",
+          orbs27[(0, 0)]["x"] == 0.0
+          and orbs27[(0, 0)]["y"] == field27
+          and orbs27[(0, 1)]["x"] == field27
+          and orbs27[(1, 0)]["y"] == 0.0
+          and orbs27[(1, 1)]["x"] == field27
+          and orbs27[(1, 1)]["y"] == 0.0,
+          str({k: (o["x"], o["y"]) for k, o in orbs27.items()}))
+    strip27 = app.surface_scene_description({
+        "kind": "ost_scores", "title": "Strip",
+        "x_labels": ["m1", "m2"], "y_labels": ["t1"],
+        "values": [[100.0], [0.0]],
+        "details": {}, "partial": [[False], [False]]})
+    scols27 = strip27["columns"]
+    sorbs27 = {(o["xi"], o["yi"]): o for o in strip27["orbs"]}
+    check("v27 a single-template surface spans the full field "
+          "on both axes, orbs at the single axis's centre",
+          len(scols27) == len(strip27["samples"]) == 16
+          and 0.0 <= min(c["cx"] - c["sx"] / 2 for c in scols27)
+          <= gap27
+          and field27 - gap27
+          <= max(c["cx"] + c["sx"] / 2 for c in scols27)
+          <= field27
+          and 0.0 <= min(c["cy"] - c["sy"] / 2 for c in scols27)
+          <= gap27
+          and field27 - gap27
+          <= max(c["cy"] + c["sy"] / 2 for c in scols27)
+          <= field27
+          and len(sorbs27) == 2
+          and all(o["x"] == field27 / 2
+                  for o in sorbs27.values())
+          and {o["y"] for o in sorbs27.values()}
+          == {0.0, field27},
+          f"cols={len(scols27)} orbs="
+          f"{ {k: (o['x'], o['y']) for k, o in sorbs27.items()} }")
+    corner27 = app.surface_scene_description({
+        "kind": "ost_scores", "title": "Corner",
+        "x_labels": ["m1", "m2", "m3"],
+        "y_labels": ["t1", "t2", "t3"],
+        "values": [[None, None, None],
+                   [None, 40.0, 70.0],
+                   [None, 80.0, 90.0]],
+        "details": {},
+        "partial": [[False] * 3 for _ in range(3)]})
+    check("v27 an edge gap yields no column and no orb at "
+          "its corner",
+          (0, 0) not in {(o["xi"], o["yi"])
+                         for o in corner27["orbs"]}
+          and len(corner27["columns"]) > 0
+          and not any(c["cx"] < field27 / 2
+                      and c["cy"] > field27 / 2
+                      for c in corner27["columns"]),
+          f"cols={len(corner27['columns'])} "
+          f"orbs={len(corner27['orbs'])}")
     # Fallback selection: this suite runs offscreen, where no GL
     # context can exist - the factory must hand back the painter,
     # and the window's surfaces must be painters.

@@ -173,7 +173,7 @@ except ImportError:
 APP_NAME = "OLLAMA SYSTEM TEST"
 # The one source of truth for the version: the title bar, the About
 # box, and anything else that names the version reads this.
-__version__ = "26"
+__version__ = "27"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WARMUP_PROMPT = "Say hello in one sentence."
 WARMUP_PREDICT = 64
@@ -8932,24 +8932,49 @@ def _surface_axis_subdiv(count):
     return max(1, min(4, 25 // (count - 1)))
 
 
+def _surface_axis(count):
+    """One axis of the render grid: (sample positions, step)
+    in data-index space. With two or more nodes the samples
+    are TILE CENTRES spanning the node-to-node field edge to
+    edge - the first tile starts at the first node and the
+    last tile ends at the last node, so the tiled field fills
+    the whole plot square wall to wall, like the reference
+    video's. A single-node axis has no span to tile: its
+    samples spread across a virtual span centred on the node
+    (four tiles of step 1.0), and surface_sample_filled's
+    clamping reads every one of them at the node itself - the
+    node's value extends flat across the whole axis, and a
+    gap on the other axis stays a gap at every spread sample
+    whose blend touches it."""
+    if count <= 1:
+        return [-1.5, -0.5, 0.5, 1.5], 1.0
+    subdiv = _surface_axis_subdiv(count)
+    tiles = (count - 1) * subdiv
+    return ([(k + 0.5) / subdiv for k in range(tiles)],
+            1.0 / subdiv)
+
+
+def _surface_axis_extent(count):
+    """The field extent of one axis in data-index space: the
+    span its tiles cover, edge to edge. Nodes sit ON the
+    edges - the first node at the low edge, the last at the
+    high edge - and a single node sits at the centre of its
+    virtual span. Both renderers place everything (columns,
+    orbs, cage) from this one extent, so they can never
+    disagree about where the field ends."""
+    positions, step = _surface_axis(count)
+    return positions[0] - step / 2.0, positions[-1] + step / 2.0
+
+
 def _surface_samples_from_filled(filled, nx, ny):
     """Every render-grid sample of a filled field: a list of
     (fx, fy, step_x, step_y, value) in data-index space - fx
-    over x, fy over y, the sample centres on a grid subdivided
-    about 4x per data step (a single-node axis still yields one
-    line of samples). value is None where the field is a gap:
+    over x, fy over y, the samples the tile centres of
+    _surface_axis. value is None where the field is a gap:
     the slot exists (its position in the list is stable) but
     nothing is drawn for it."""
-    def _axis(count):
-        if count <= 1:
-            return [0.0], 0.9
-        subdiv = _surface_axis_subdiv(count)
-        return ([i / subdiv
-                 for i in range((count - 1) * subdiv + 1)],
-                1.0 / subdiv)
-
-    xs, step_x = _axis(nx)
-    ys, step_y = _axis(ny)
+    xs, step_x = _surface_axis(nx)
+    ys, step_y = _surface_axis(ny)
     samples = []
     for fx in xs:
         for fy in ys:
@@ -9033,9 +9058,15 @@ def surface_node_position(xi, yi, nx, ny):
     template axis (the data's y), scene y the model axis (the
     data's x), with model 0 at the BACK of the field - so the
     first model reads as the far plateau, like the reference
-    video's trained frame."""
-    sx = (yi + 0.5) * (SURFACE_FIELD / ny)
-    sy = (nx - 1 - xi + 0.5) * (SURFACE_FIELD / nx)
+    video's trained frame. Nodes spread across the FULL field:
+    the first node on one edge (0), the last on the other
+    (SURFACE_FIELD), a single node at the field centre of its
+    axis - the same extent the columns tile, so every orb
+    rests on the field under it."""
+    lo_y, hi_y = _surface_axis_extent(ny)
+    lo_x, hi_x = _surface_axis_extent(nx)
+    sx = (yi - lo_y) * (SURFACE_FIELD / (hi_y - lo_y))
+    sy = (hi_x - xi) * (SURFACE_FIELD / (hi_x - lo_x))
     return sx, sy
 
 
@@ -9067,7 +9098,16 @@ def surface_scene_description(data):
     instead of rebuilding) but it is absent from "columns",
     and a gap node has no orb. A measured node's orb height is
     its column top; the widget rests the orb on it (centre =
-    height + radius), never half-sunk."""
+    height + radius), never half-sunk.
+
+    Placement fills the square (v27): columns are centred on
+    their tile-centre samples and sized step minus the gap, in
+    the axis-extent mapping of _surface_axis_extent - so the
+    outermost columns' outer edges land on 0 and SURFACE_FIELD
+    (within the small inter-column gap), the landscape runs
+    wall to wall inside the cage like the reference video's,
+    and a single-node axis spans the whole field on that axis
+    with its orb at the axis centre."""
     if not data:
         data = {}
     x_labels = list(data.get("x_labels") or [])
@@ -9093,17 +9133,25 @@ def surface_scene_description(data):
     columns = []
     if nx and ny:
         gap = 0.35  # cm between neighbouring columns
+        # The columns map through the VALUES grid's extents -
+        # the same counts the samples were generated from.
+        vnx = len(values)
+        vny = len(values[0]) if vnx else 0
+        lo_x, hi_x = _surface_axis_extent(vnx)
+        lo_y, hi_y = _surface_axis_extent(vny)
+        span_x = hi_x - lo_x
+        span_y = hi_y - lo_y
         for fx, fy, step_x, step_y, value in \
                 surface_block_samples(values):
             samples.append([fx, fy])
             if value is None:
                 continue
-            cx = (fy + 0.5) * (SURFACE_FIELD / ny)
-            cy = (nx - 1 - fx + 0.5) * (SURFACE_FIELD / nx)
+            cx = (fy - lo_y) * (SURFACE_FIELD / span_y)
+            cy = (hi_x - fx) * (SURFACE_FIELD / span_x)
             columns.append({
                 "fx": fx, "fy": fy, "cx": cx, "cy": cy,
-                "sx": step_y * (SURFACE_FIELD / ny) - gap,
-                "sy": step_x * (SURFACE_FIELD / nx) - gap,
+                "sx": step_y * (SURFACE_FIELD / span_y) - gap,
+                "sy": step_x * (SURFACE_FIELD / span_x) - gap,
                 "height": surface_height_of(value),
                 "value": value,
                 "color": _surface_hex(value),
@@ -11050,26 +11098,31 @@ class SurfaceView(QWidget):
         return sx, sy, depth
 
     @staticmethod
-    def _axis_subdiv(count):
-        """Render-grid subdivisions per data step on one axis:
-        about 4 per step like the old quad subdivision, thinned
-        as the axis grows so the block count stays near the
-        roughly 26-per-axis cap."""
+    def _grid_extent(count):
+        """One axis of the plot in the painter's grid space:
+        (low, high). A multi-node axis spans its nodes - the
+        first node on the low edge, the last on the high edge,
+        the same full-square placement as the GL scene. A
+        single-node axis gets the node's own plot width
+        centred on it: the shared sampling spreads that axis
+        over a virtual span (see _surface_axis), and the
+        painter compresses the spread back onto this width,
+        so the painted field stays the same filled square the
+        GL view draws."""
         if count <= 1:
-            return 1
-        return max(1, min(4, 25 // (count - 1)))
+            return -0.45, 0.45
+        return 0.0, float(count - 1)
 
     @classmethod
     def _axis_margin(cls, count):
-        """How far the cage stands off the data on one axis, in
-        grid units: clear of the edge blocks, with a floor so a
-        small surface still sits inside its cage like the
-        reference's plot box."""
+        """How far the cage stands off the field on one axis,
+        in grid units: just clear of the edge blocks, which
+        end at the grid extent since v27 (before that the
+        blocks overshot the node span and the margin was
+        measured from the nodes)."""
         if count <= 1:
-            step = 0.9
-        else:
-            step = 1.0 / cls._axis_subdiv(count)
-        return min(0.55, max(0.22, step * 0.47 + 0.05))
+            return 0.05
+        return 0.10
 
     def _layout(self):
         """The fit mapping for the current data, view and size:
@@ -11089,17 +11142,19 @@ class SurfaceView(QWidget):
         if self._layout_cache is not None \
                 and self._layout_cache[0] == key:
             return self._layout_cache[1]
-        span_x = max(nx - 1, 1)
-        span_y = max(ny - 1, 1)
+        lo_x, hi_x = self._grid_extent(nx)
+        lo_y, hi_y = self._grid_extent(ny)
+        span_x = hi_x - lo_x
+        span_y = hi_y - lo_y
         height_span = 0.55 * max(span_x, span_y)
         margin_x = self._axis_margin(nx)
         margin_y = self._axis_margin(ny)
         points = []
         corners = [(xi, yi) for xi in range(nx) for yi in range(ny)]
-        corners += [(-margin_x, -margin_y),
-                    (nx - 1 + margin_x, -margin_y),
-                    (-margin_x, ny - 1 + margin_y),
-                    (nx - 1 + margin_x, ny - 1 + margin_y)]
+        corners += [(lo_x - margin_x, lo_y - margin_y),
+                    (hi_x + margin_x, lo_y - margin_y),
+                    (lo_x - margin_x, hi_y + margin_y),
+                    (hi_x + margin_x, hi_y + margin_y)]
         for gx0, gy0 in corners:
             for value in (0.0, 100.0):
                 gx = gx0 - (nx - 1) / 2.0
@@ -11197,12 +11252,13 @@ class SurfaceView(QWidget):
 
     def _block_samples(self, filled, nx, ny):
         """The render grid: (fx, fy, step_x, step_y, value) for
-        every block, sampled from the filled field at block
-        centres on a grid subdivided about 4x per data step,
-        thinned to the roughly 26-per-axis cap. A single-node
-        axis still yields one line of blocks. Shared with the
-        GL scene builder (_surface_samples_from_filled); the
-        painter keeps only the samples that draw."""
+        every block, sampled from the filled field at the tile
+        centres of _surface_axis - spanning the field edge to
+        edge, a single-node axis spread across its virtual
+        span (paintEvent compresses that spread onto the
+        node's plot width). Shared with the GL scene builder
+        (_surface_samples_from_filled); the painter keeps only
+        the samples that draw."""
         return [sample for sample in
                 _surface_samples_from_filled(filled, nx, ny)
                 if sample[4] is not None]
@@ -11306,8 +11362,12 @@ class SurfaceView(QWidget):
         # sits inside.
         margin_x = self._axis_margin(nx)
         margin_y = self._axis_margin(ny)
-        cage_x0, cage_x1 = -margin_x, nx - 1 + margin_x
-        cage_y0, cage_y1 = -margin_y, ny - 1 + margin_y
+        grid_lo_x, grid_hi_x = self._grid_extent(nx)
+        grid_lo_y, grid_hi_y = self._grid_extent(ny)
+        cage_x0, cage_x1 = grid_lo_x - margin_x, \
+            grid_hi_x + margin_x
+        cage_y0, cage_y1 = grid_lo_y - margin_y, \
+            grid_hi_y + margin_y
         cage_pen = QPen(QColor(74, 94, 134), 1)
         wall_pen = QPen(QColor(74, 94, 134, 110), 1)
 
@@ -11375,6 +11435,25 @@ class SurfaceView(QWidget):
         face_x = 1 if view_x >= 0 else -1
         face_y = 1 if view_y >= 0 else -1
         blocks = self._block_samples(filled, nx, ny)
+        # Data space to the painter's grid space (see
+        # _grid_extent): the identity on multi-node axes; a
+        # single-node axis compresses its virtual spread onto
+        # the node's plot width, so the painted blocks tile
+        # the same filled square the GL scene builds.
+        def _to_grid(f, step, count):
+            if count <= 1:
+                lo, hi = _surface_axis_extent(count)
+                glo, ghi = self._grid_extent(count)
+                scale = (ghi - glo) / (hi - lo)
+                return glo + (f - lo) * scale, step * scale
+            return f, step
+
+        gridded = []
+        for fx, fy, step_x, step_y, value in blocks:
+            gfx, gstep_x = _to_grid(fx, step_x, nx)
+            gfy, gstep_y = _to_grid(fy, step_y, ny)
+            gridded.append((gfx, gfy, gstep_x, gstep_y, value))
+        blocks = gridded
         blocks.sort(key=lambda b: proj(b[0], b[1], 0.0)[2])
         for fx, fy, step_x, step_y, value in blocks:
             half_x = step_x * 0.47

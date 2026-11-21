@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v26
+# OLLAMA SYSTEM TEST v27
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -8,6 +8,17 @@ scores them, and builds a profile for each model — its strengths,
 weaknesses, and a plain-language verdict from the numbers.
 
 ![OLLAMA SYSTEM TEST window](screenshot.png)
+
+v27 fixes the decision surface's placement: the landscape
+now fills its plot square edge to edge, wall to wall
+inside the cage, the way the reference video draws it -
+in v26 it stopped short of the walls, and a run over a
+single template drew one band across the middle. A single
+template (or a single model) now spans the whole square on
+its axis too, its one score extending flat across it.
+Both the 3D surface and the painted fallback place the
+field the same way. Nothing else about the surface
+changed.
 
 v26 adds the live 3D decision surface, on its own Surface
 tab: the scores as a landscape of 3D blocks - one point for
@@ -390,7 +401,11 @@ Each block's top sits at its height, so high scores form
 flat-topped plateaus with steep stepped sides and low
 scores read as valleys. Blue is low, orange is high, every
 measured point carries a satin orb, and a thin, faint
-wireframe cage boxes the plot. The surface is rendered in
+wireframe cage boxes the plot. The landscape fills the
+square edge to edge - the first point on one edge of the
+plot, the last on the other - and a run over a single
+template or a single model spans the whole square on that
+axis too, the one score extending flat across it. The surface is rendered in
 real 3D by the Light Engine from Reblend (Joshua's own
 renderer), vendored into this app in the light_engine/
 folder from Reblend v0.2-pkl - the app carries its own

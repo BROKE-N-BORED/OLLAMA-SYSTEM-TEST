@@ -1,4 +1,4 @@
-# TEST-REPORT — OLLAMA SYSTEM TEST v26
+# TEST-REPORT — OLLAMA SYSTEM TEST v27
 
 Verified 2026-11-20 in a Linux sandbox (x86_64, PySide6 6.12.0,
 Python 3.12.3) under the Qt test env from AGENTS.md:
@@ -6,6 +6,108 @@ QT_QPA_PLATFORM=offscreen for the suite, Xvfb + xcb for the GUI
 drive, LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-
 linux-gnu, venv ~/workspace/forge-v2-testenv/bin/python, default
 HOME, TMPDIR on tmpfs.
+
+v27 fixes the decision surface's placement. Joshua's
+verdict on the shipped v26 surface, looking at the
+finished-run screenshot: "Why isn't the whole square
+filled up like it should be? Why is the colored area so
+small?" He was right, and the cause was measured, not
+guessed: placement was cell-centre based - a node's
+position was (index + 0.5) x (field / count), and the
+render samples ran only across the node-to-node span, so
+the tiled field stopped half a cell short of every cage
+wall (probe on the shipped code: a 2x3 surface's columns
+spanned x 33..167, y 50..150 of the 200 field; a 4x5
+spanned x 20..180, y 25..175). Worse, a single-node axis
+collapsed to one line of samples through the middle, so a
+two-model, one-template surface drew a single band across
+an empty cage - the screenshot he rejected.
+
+The fix is in the shared placement maths, so the GL scene
+and the QPainter fallback agree on placement as well as
+values. _surface_axis now returns tile-centre samples
+spanning the field edge to edge (the first tile starts at
+the first node, the last tile ends at the last node), and
+for a single-node axis a four-tile spread across a virtual
+span centred on the node, read at the node itself by
+surface_sample_filled's clamping - the node's value
+extends flat across the whole axis, and a gap on the other
+axis stays a gap at every spread sample whose blend
+touches it. _surface_axis_extent gives the one extent both
+renderers place from: surface_node_position puts the
+first node on 0 and the last on SURFACE_FIELD (a single
+node at the field centre of its axis), the scene builder
+centres columns on their tile centres at step minus the
+0.35 cm gap (probe after the fix: outermost outer edges at
+0.17..199.83 of 200 for 2x3, 4x5, 2x2 and 2x1 alike -
+within the gap of both walls), and the painter tiles the
+same samples inside its cage, compressing a single-node
+axis's spread onto the node's plot width so the painted
+square matches. The fill rule (surface_filled_values) did
+not change; gaps still produce no column and no orb,
+including at the edges; the cage, slab, camera, lights,
+colours, morph, picking and the data contract are
+untouched. The morph still interpolates between
+descriptions built by the same placement - nothing in the
+morph or the tracker assumed cell centres; both work on
+data values only. The benchmark itself is untouched.
+
+Verification. Full suite, fresh copy of the final tree,
+offscreen Qt env: 1987 passed, 0 failed (log
+~/workspace/ost-v27-verify/full2.log) - the v26 suite's
+1983 checks plus 4 new v27 checks. One earlier full run
+was killed mid-run by a sandbox restart (its log,
+~/workspace/ost-v27-verify/full1.log, stops mid-section at
+1459 passed, 0 failed, with no summary, and the process
+was gone; a monitoring command died with SIGTERM at the
+same minute) - the re-run above is the green one. Pins
+updated where v27 deliberately changes behaviour: the
+version pin (26 to 27, three places), the window-level
+update story rolled one version forward (the fake GitHub
+server gained a fake v28 tree; the story now seeds a v27
+install and pulls v28), and the lone-gap surface's sample
+count (1 to 16: a 1x1 surface now samples the 4x4 spread;
+it still makes no column and no orb). The new v27 checks:
+a fully measured 2x2 surface's columns tile to the field
+edges on both axes (minimum outer edge >= 0 and <= the
+gap, maximum within the gap of SURFACE_FIELD) with its
+orbs on the field corners; a 2x1 surface's columns span
+the full field on BOTH axes and its two orbs sit at the
+field centre of the single axis and on the edges of the
+other; a 3x3 with an unmeasured corner whose row and
+column are also unmeasured still yields no column in that
+corner's quadrant and no orb at that corner. The surface
+section also passes standalone: 43 passed, 0 failed (log
+~/workspace/ost-v27-verify/tail1.log).
+
+GUI drive (Xvfb + xcb, 1366x768, fake-server runs; logs
+and screenshots in ~/workspace/ost-v27-verify/). The GL
+drive (drive_gl_v27.py, exit 0) re-ran the v26 drive's
+data - fake-smart and fake-dumb over instruction, math and
+coding - and the finished surface (drive-gl-done.png) is
+now a full staircase square: the blue valley row reaches
+the front cage wall, the orange plateau the back wall,
+orbs on the field's edges and corners - side by side with
+the v26 shot of the same data, which drew a band across
+the middle of an empty cage. Rotation, wheel zoom and orb
+picking were verified again on the new placement (picked
+detail "fake-smart:2b - Instruction: 100% (10/10 tasks)").
+The multi drive (drive-gl-multi.png, exit 0) ran three
+models by three templates with a mid-scoring model between
+the extremes: a stepped landscape with an interior
+terrace, filling the square. The Compare morph at t=0.5
+(drive-gl-morph-t50.png) fills its square the same way.
+The forced-fallback drive (OST_NO_GL=1,
+drive-fallback.png, exit 0) shows the painter's field
+running wall to wall inside its cage on the same data.
+GL stayed live in both GL drives (uses_gl True
+throughout, no fallback swap, no shader error).
+
+Left open, unchanged from v26: the GL view draws no axis
+labels (names come from tapping a point, as in the video;
+the painter fallback draws them), and GL is verified here
+under Mesa llvmpipe - the first verdict on Joshua's own
+PC is still his to give.
 
 v26 adds the Live 3D Decision Surface Graph: the scores as a
 landscape - models along one axis, templates along the other,
