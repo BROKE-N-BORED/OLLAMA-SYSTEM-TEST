@@ -30,6 +30,7 @@ Set server.dead = True to refuse every new generate (server-died test).
 import base64
 import io
 import json
+import os
 import re
 import socket
 import struct
@@ -605,6 +606,126 @@ PARTIAL_IMAGE_PROMPTS = {"bicycle", "mountain lake", "lighthouse"}
 LOOPING_JSON_ANSWER = '{"city": "Paris", "population": 2140526}\n' * 40
 
 
+def _solve_math(prompt):
+    """(v28): the smart brain works generated math out from the
+    prompt's own numbers, like a smart model would — the canned
+    keys only carry the authored numbers, and v28's generated
+    repeats bring fresh ones. Returns an answer string, or None
+    when the prompt is not a form this solver knows (the canned
+    keys then decide, exactly as before). Every pattern is a
+    full-form match, so a partial resemblance never fires it."""
+    import re as _re
+
+    def num(value):
+        value = float(value)
+        return str(int(value)) if value == int(value) else str(value)
+
+    m = _re.search(r"(\d+(?:\.\d+)?) percent of (\d+(?:\.\d+)?)",
+                   prompt)
+    if m:
+        return f"The answer is {num(float(m.group(1)) * float(m.group(2)) / 100)}."
+    m = _re.search(r"(\d+)x \+ (\d+) = (\d+)", prompt)
+    if m:
+        a, b, c = (int(m.group(i)) for i in (1, 2, 3))
+        return f"x is {num((c - b) / a)}."
+    m = _re.search(
+        r"(\d+(?:\.\d+)?) miles per hour for (\d+(?:\.\d+)?) hours",
+        prompt)
+    if m:
+        return (f"It travels "
+                f"{num(float(m.group(1)) * float(m.group(2)))} miles.")
+    m = _re.search(
+        r"has (\d+) [a-z ]+?[.,].*?gives? away (\d+) and then "
+        r"buys? (\d+) more", prompt)
+    if m:
+        start, given, bought = (int(m.group(i)) for i in (1, 2, 3))
+        return f"The answer is {start - given + bought}."
+    m = _re.search(
+        r"had (\d+) [a-z ]+?[.,].*?shared them equally among (\d+)",
+        prompt)
+    if m:
+        total, friends = int(m.group(1)), int(m.group(2))
+        return (f"{total} shared among {friends} friends gives "
+                f"{num(total / friends)} each. The answer is "
+                f"{num(total / friends)}.")
+    m = _re.search(
+        r"rectangle is (\d+) cm long and (\d+) cm wide", prompt)
+    if m:
+        length, width = int(m.group(1)), int(m.group(2))
+        if "perimeter" in prompt:
+            return f"The perimeter is {2 * (length + width)} cm."
+        return f"The area is {length * width} square cm."
+    m = _re.search(
+        r"(?:makes|bakes) (\d+) trays of ([a-z]+) with (\d+) \2 "
+        r"on each tray[.,].*?sells? (\d+)", prompt)
+    if m:
+        trays, per, sold = int(m.group(1)), int(m.group(3)), \
+            int(m.group(4))
+        total = trays * per
+        # The task's step is the total made — say it, like the
+        # canned answer does, or the step check fails. And state
+        # the conclusion plainly: when the amount left equals a
+        # given (the amount sold), the app's number picker
+        # anchors on the novel total instead.
+        return (f"They make {total} {m.group(2)} and sell {sold}, "
+                f"so {total - sold} are left. The answer is "
+                f"{total - sold}.")
+    m = _re.search(
+        r"charges \$(\d+(?:\.\d+)?) to start and "
+        r"\$(\d+(?:\.\d+)?) for each mile.*?ride is (\d+) miles, "
+        r"and the rider leaves a \$(\d+(?:\.\d+)?)", prompt)
+    if m:
+        base, per, miles, tip = (
+            float(m.group(i)) for i in (1, 2, 3, 4))
+        subtotal = base + per * miles
+        # The task's step is the pre-tip subtotal — say it too.
+        return (f"The ride costs {num(subtotal)} before the tip, "
+                f"so {num(subtotal + tip)} in total. The answer "
+                f"is {num(subtotal + tip)}.")
+    m = _re.search(
+        r"cut into (\d+) equal slices[.,].*?eats (\d+) slices",
+        prompt)
+    if m:
+        slices, eaten = int(m.group(1)), int(m.group(2))
+        return f"{num(round((slices - eaten) / slices, 4))} is left."
+    m = _re.search(
+        r"holds (\d+(?:\.\d+)?) liters of water[.,].*?"
+        r"How many milliliters", prompt)
+    if m:
+        return f"That is {num(float(m.group(1)) * 1000)} milliliters."
+    m = _re.search(r"weighs (\d+(?:\.\d+)?) kilograms", prompt)
+    if m:
+        return f"That is {num(float(m.group(1)) * 1000)} grams."
+    return None
+
+
+_BANK_ANSWERS = None
+
+
+def _bank_answer(prompt):
+    """(v28): the smart brain knows the knowledge fact bank —
+    a generated knowledge question is one of the bank's own
+    phrasings, answered with the bank's fact. Loaded once from
+    the shipped template; None when the prompt is not a bank
+    phrasing."""
+    global _BANK_ANSWERS
+    if _BANK_ANSWERS is None:
+        _BANK_ANSWERS = {}
+        try:
+            path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "..",
+                "templates", "knowledge.json")
+            with open(path, encoding="utf-8") as handle:
+                bank = json.load(handle).get("fact_bank") or []
+            for entry in bank:
+                for ask in entry.get("ask") or []:
+                    _BANK_ANSWERS[ask.strip()] = str(
+                        entry["expected"])
+        except (OSError, ValueError):
+            pass
+    return _BANK_ANSWERS.get(prompt.strip())
+
+
 def answer_for(brain, prompt):
     """Canned answer for a brain type and prompt."""
     lowered = prompt.lower()
@@ -617,6 +738,15 @@ def answer_for(brain, prompt):
             key, smart = substring, answer
             break
     if brain == "smart":
+        # (v28): generated repeats carry fresh numbers and fresh
+        # facts — work those out first; the canned keys remain
+        # the answer for everything else, as before.
+        solved = _solve_math(prompt)
+        if solved is not None:
+            return solved
+        banked = _bank_answer(prompt)
+        if banked is not None:
+            return banked
         return smart if smart is not None else "A fine answer indeed."
     if brain == "partial":
         if key in PARTIAL_CORRECT:
@@ -673,6 +803,17 @@ def chat_reply(brain, system_text, last_user_text, user_count, tools):
                     index = 0 if user_count <= 1 else 1
                     return answers[index], []
                 return _dumb_answer(lowered), []
+    # (v28): the coding chat task's generated turns name fresh
+    # multiplier functions (triple, sextuple, ...) the canned
+    # keys never heard of — the smart brain writes the function
+    # the prompt asks for, like a smart model would.
+    if brain == "smart":
+        mult = re.search(
+            r"function named (\w+)\(x\) that returns (\d+) "
+            r"times x", last_user_text)
+        if mult:
+            return (f"```python\ndef {mult.group(1)}(x):\n"
+                    f"    return {mult.group(2)} * x\n```"), []
     return answer_for(brain, last_user_text), []
 
 
@@ -760,6 +901,10 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
         # untouched (no cap added on the way).
         self.server.generate_options.append(payload.get("options") or {})
         self.server.think_seen.append(payload.get("think"))
+        # (v28 tests): record the whole payload, so a check can
+        # prove the scaffold's system prompt and retrieved
+        # passages reached the server (and bare runs sent none).
+        self.server.generate_payloads.append(payload)
         if self.server.dead:
             self._close_without_answer()
             return
@@ -1064,6 +1209,8 @@ class FakeOllamaServer(ThreadingHTTPServer):
         self.generate_count = 0
         self.generate_done = 0
         self.generate_options = []
+        # (v28 tests): every /api/generate payload, in order.
+        self.generate_payloads = []
         self.show_count = 0
         self.chat_count = 0
         self.chat_done = 0

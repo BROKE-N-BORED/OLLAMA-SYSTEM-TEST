@@ -1,3 +1,128 @@
+# TEST-REPORT — OLLAMA SYSTEM TEST v30
+
+Verified 2026-11-21 in a Linux sandbox (x86_64, PySide6 6.12.0,
+Python 3.12.3) under the Qt test env from AGENTS.md:
+QT_QPA_PLATFORM=offscreen for the suite, Xvfb + xcb for the GUI
+drive, LD_LIBRARY_PATH=~/workspace/qt-libs/root/usr/lib/x86_64-
+linux-gnu, venv ~/workspace/forge-v2-testenv/bin/python, default
+HOME, TMPDIR on tmpfs.
+
+v30 is a reconciliation build. The procedural generators and
+the cognitive scaffold were built in a side tree (as its "v28",
+on a v27 base, suite 2063/0 there) after Joshua ordered OST's
+builds kept in this thread; v30 ports those FEATURES onto the
+shipped v29 tree by three-way merge against the v27 base
+(git 738e308d) - the side tree's app file was never copied over
+v29's. Everything v29 shipped survives intact and is covered
+by its own unweakened checks: the per-model patch-field
+surface and its subject labels, the weights view and its GGUF
+reader, the report-card surface picture, the uncapped warm-up
+(WARMUP_PREDICT = NO_CAP), and the equal authored counts.
+
+What ported, and where it lives in the app file: the generator
+engine (GENERATORS, ~60 recipes; generate_task_instance,
+deterministic from (seed, template, task, repeat_index) via
+random.Random - repeat 1 of a run is the authored task, later
+repeats are generated instances whose results record seed,
+recipe, drawn params, the exact generated prompt and the
+expected answer); the scaffold store (load_scaffold_store,
+scaffold_snapshot_hash, stdlib TF-IDF cosine retrieval over
+~500-char chunks, top-k 3, no new dependencies); the worker's
+scaffold plumbing (Bare legs keep the exact pre-scaffold call
+shape - the system prompt is passed only on scaffold legs);
+the setup tab's Cognitive scaffold control (Bare / Scaffold /
+Pair, Bare by default, nothing selected by default) and seed
+box (0 = fresh random seed); Pair legs sharing seed + pair_id
++ the store snapshot hash frozen before either leg; write-back
+of learned notes to scaffold/knowledge/learned/ only after a
+run or pair completes, logged in the run manifest; per-task
+RAG tracking in scaffold-leg records. Headless parity:
+--scaffold bare|scaffold|pair and --seed. The scaffold/
+folder ships in the repo (protocol.md, knowledge/README.md,
+knowledge/methods.md, knowledge/learned/.gitkeep). Generator
+specs live in the template JSONs, as in the side build.
+
+Reconciliation decisions, stated plainly:
+
+- Counts: the generators key off THIS tree's trimmed authored
+  sets - every scored subject at exactly 10 tasks. Anchor's
+  generators attach to the kept tasks only (the first five
+  MMLU-style + first five GSM8K-style ids); the dropped second
+  halves were NOT resurrected. Coding's generators attach to
+  its 10 tasks; the dropped standalone is_prime stays dropped
+  (its recipe went with it). The templates-test copies mirror
+  the merged templates, the side build's invariant, and
+  tests/templates-test/anchor.json is new for the same reason.
+- The one carried-over exception, not hidden: the three audio
+  TRANSCRIBE tasks (transcribe-hello, transcribe-count,
+  transcribe-weather) have no generator spec - the app is
+  stdlib-only and has no speech synthesis, so they keep the
+  shipped recordings. They are the only unspec'd tasks in the
+  tree (verified directly against the loaded templates), and
+  the suite's pin on exactly that list carried over unweakened.
+  The seven audio speech tasks do generate. Knowledge remains
+  sampling, not invention: the 124-fact bank, sampled WITHOUT
+  replacement, sampled ids recorded.
+- Update story rolled forward one version, as every version
+  does: tests/fake_github.py gained a fake v31 tree; the
+  window story now seeds a v30 install (FAKE_V30_FILES) and
+  pulls v31, the running copy still says v30, a fresh launch
+  runs v31. Version pins moved 29 -> 30 (app, two title-bar
+  checks, the running-copy check, the suite header).
+- tests/fake_ollama.py is the side build's version wholesale
+  (v29 had not touched it since the v27 base): its three
+  additive skills - working generated math from the prompt's
+  own numbers, answering the knowledge bank's own phrasings,
+  writing the multiplier a generated coding-chat prompt asks
+  for - plus full generate-payload recording, which the
+  scaffold wire checks read.
+- Where the two designs touched the same code, the merge
+  conflicts were few and small: the app file conflicted only
+  on the version string; the suite on version pins and the
+  update story; fake_github on the roll-forward; Anchor and
+  Coding templates on their task sets (resolved semantically:
+  v29's tasks, the side's generator specs matched by task id).
+
+Verification. Full suite on a fresh copy of the final tree:
+2089 passed, 0 failed (log ~/workspace/ost-v30-verify/
+full2.log) - v29's 2013 checks plus the side build's
+generator/scaffold checks adapted to v29 semantics (its 74,
+plus the version/story pins above). The only change after
+that green run is this TEST-REPORT block (documentation; the
+suite does not read it). The
+road, honestly: the first full run was killed at 1754 passed /
+0 failed by a sandbox runtime restart - no summary, process
+gone (log kept as full1-killed.log) - and the run above is the
+re-run from scratch on a re-copied tree. No check was weakened
+to pass; the pins that moved are the ones named above.
+
+Evidence drive (Xvfb + xcb, 1366x768, fake server;
+~/workspace/ost-v30-verify/drive_v30.py): the setup tab shows
+the Cognitive scaffold control at its defaults - Bare selected,
+seed "random", nothing ticked anywhere - screenshot
+drive-scaffold-control.png (every template listed at 10 tasks).
+One run, fake-smart:2b over Math with repeats = 2 and the seed
+pinned to 42: the run file's first task records repeat 1 as
+the authored prompt ("A farmer has 17 apples...") with no
+generation record, and repeat 2 as a generated instance
+("Ruby has 27 bottle caps...") whose record carries seed 42,
+recipe math_add_sub, the drawn params, the generated prompt
+and expected 42 - dump in drive-repeats-evidence.json.
+
+Not verified. Joshua's real-PC run is the closer, as always:
+nothing here has run on his Mint PC, against a real Ollama or
+real models. The scaffold path against a non-Ollama provider
+endpoint is code-complete (the protocol rides as a system
+message) but was not exercised end to end; the suite's pair
+runs use the Ollama path. The GUI pair flow is covered by the
+worker and headless pair checks and the window-default checks,
+but was not click-driven. Generated vision images are written
+into the app's images folder by design (named
+gen-<seed>-<task>-<repeat>.png) and accumulate there across
+runs, like run files do.
+
+---
+
 # TEST-REPORT — OLLAMA SYSTEM TEST v29
 
 Verified 2026-11-21 in a Linux sandbox (x86_64, PySide6 6.12.0,

@@ -1,4 +1,4 @@
-# OLLAMA SYSTEM TEST v29
+# OLLAMA SYSTEM TEST v30
 
 A desktop window that tests your Ollama models on this PC — and cloud
 providers' models too — with the same test templates, the same scoring,
@@ -583,6 +583,11 @@ resumes the latest one, `--headless --resume <run-id>` resumes a
 specific one. No `--models` or `--templates` needed — the run
 remembers what it was doing. Only the pairs it did not finish run.
 
+`--scaffold bare|scaffold|pair` picks the cognitive scaffold mode
+(see "Fresh tests and the cognitive scaffold" below) and `--seed N`
+pins the generated test set (0 or absent = a fresh random seed).
+Both are ignored on `--resume`, with a printed note.
+
 ## Capability screening
 
 When the model list loads, the app asks Ollama what each model can do
@@ -696,6 +701,53 @@ one question with no run at all, in the Try one model box.
 Pulls go to Ollama's own models folder. If you want models stored
 somewhere else, that is Ollama's own setting: set the OLLAMA_MODELS
 environment variable before starting Ollama.
+
+## Fresh tests and the cognitive scaffold
+
+Every run generates its test content fresh, from the run's seed.
+Repeat 1 of a template is the authored task; later repeats are
+generated instances of the same skill at the same difficulty -
+new numbers, names, orderings, passages, schemas and scenarios,
+with the expected answers computed by the generator or known by
+construction. A model cannot memorise the test by seeing it
+twice, and the same seed reproduces the same set exactly (a
+seed box on the setup tab pins it; 0 means a fresh random seed
+every run). Each generated task's result records the seed, the
+recipe, the drawn parameters, the exact generated prompt and
+the expected answer, so any score can be checked after the
+fact. Two honest limits: Knowledge cannot invent world facts,
+so it samples without replacement from a shipped bank of 124
+verified facts (the sampled ids are recorded); and the three
+audio transcription tasks cannot generate fresh clips - the
+app has no speech synthesis - so they keep the shipped
+recordings. The seven audio speech tasks do generate fresh
+lines to speak.
+
+The Cognitive scaffold control on the setup tab is Bare by
+default - nothing is on unless you choose it:
+
+- Bare: the run as it has always been.
+- Scaffold: the model gets the protocol document
+  (`scaffold/protocol.md`, plain text, yours to edit) as its
+  system prompt, and each question gains the best-matching
+  passages from the knowledge store in `scaffold/knowledge/`
+  (stdlib TF-IDF retrieval over ~500-character chunks, top 3;
+  no new dependencies).
+- Pair: runs the bare leg, then the scaffold leg, on the
+  identical generated set - same seed, one pair id, and the
+  store's snapshot hash frozen before either leg - so the two
+  legs can be compared fairly.
+
+Scaffold results carry per-task RAG tracking: the chunks
+retrieved (id, source file, score, tokens), the retrieval
+time, the context composition, and an answer-used-retrieval
+flag labelled as a heuristic. After a scaffold run (or a
+whole pair) fully completes - never mid-pair - the app
+appends a learned-notes document per model to
+`scaffold/knowledge/learned/` and logs the event in the run
+manifest, so later runs can retrieve what earlier runs
+learned. Headless, the same modes are `--scaffold
+bare|scaffold|pair` with `--seed`.
 
 ## The test templates
 

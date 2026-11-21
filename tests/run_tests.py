@@ -1,6 +1,31 @@
-"""End-to-end verification of OLLAMA SYSTEM TEST v29 against a fake Ollama
+"""End-to-end verification of OLLAMA SYSTEM TEST v30 against a fake Ollama
 server and a fake OpenAI-compatible provider server, both with canned
-answers per model. All v25 checks are carried over (pins updated
+answers per model. v30 ports the procedural generators and the
+cognitive scaffold (built in a side tree as its "v28", on a v27
+base) onto the v29 tree; the generator and scaffold checks
+described in the next paragraph are that build's checks,
+carried in and adapted to v29 semantics (the trimmed authored
+sets - Anchor and Coding at 10 tasks - are the anchors the
+generators key off, and the fake GitHub story now seeds a v30
+install and pulls v31). All v27 checks are carried over (pins updated
+where v28 deliberately changes behavior — the version pin, the
+v24 workers' pinned generation seeds, and the v24 authored-
+variants check, which now proves generated instances in the
+later repeats; the fake smart brain learned to work generated
+math out from the prompt's own numbers and to answer the
+knowledge bank's own phrasings, both named in the TEST-REPORT);
+the v28 checks cover the generators (every subject generates
+fresh content from the run seed — determinism per seed, fresh
+content across seeds, expected answers recomputed independently
+for math, the reference solutions passing the generated coding
+and repair tests while wrong code and the buggy code fail,
+knowledge sampled without replacement from the shipped fact
+bank), the cognitive scaffold (off by default in the worker
+and the window, protocol + retrieved chunks on the wire only
+when on, per-task RAG tracking fields, a pair's two legs asking
+identical generated questions under one frozen store hash,
+write-back only after the scaffold leg with the event logged
+in the manifest), and a headless pair run end to end. All v25 checks are carried over (pins updated
 where v26 deliberately changes behavior - the version pin, the
 tab count, and the fake GitHub "newer release" story, named in
 the TEST-REPORT); the v26 checks cover the live 3D decision
@@ -3728,7 +3753,7 @@ def main():
           f"exit {broken.returncode}\n{broken.stdout[-300:]}")
 
     # ---------- v7 T6: __version__, title bar, window icon ---------------
-    check("__version__ is 29", app.__version__ == "29",
+    check("__version__ is 30", app.__version__ == "30",
           repr(app.__version__))
     icon_path = os.path.join(PKG_DIR, "ost-icon.png")
     check("ost-icon.png ships in the tree", os.path.exists(icon_path))
@@ -3742,8 +3767,8 @@ def main():
     window7 = app.MainWindow()
     window7.show()
     qt_app.processEvents()
-    check("title bar shows OLLAMA SYSTEM TEST v29",
-          window7.windowTitle() == "OLLAMA SYSTEM TEST v29",
+    check("title bar shows OLLAMA SYSTEM TEST v30",
+          window7.windowTitle() == "OLLAMA SYSTEM TEST v30",
           window7.windowTitle())
     check("title bar uses __version__",
           f"v{app.__version__}" in window7.windowTitle(),
@@ -4021,9 +4046,35 @@ def main():
           headless_notrun.returncode == 0,
           f"exit {headless_notrun.returncode}\n"
           f"{headless_notrun.stdout[-300:]}\n{headless_notrun.stderr[-300:]}")
-    check("headless summary says not run for the missing fixture",
-          "Vision: not run (test file missing)" in headless_notrun.stdout,
+    # (v28): the vision template no longer says "not run" as a
+    # whole when its fixtures are missing — the authored repeat
+    # still cannot run, but the generated repeats render their
+    # own images and DO run, so the template scores. The v6
+    # distinction survives per task: the authored tasks are
+    # recorded not run, never scored. (Pin changed by v28's
+    # generators; named in the TEST-REPORT.)
+    check("headless vision run scores its generated repeats (v28)",
+          re.search(r"Vision: \d+%", headless_notrun.stdout)
+          is not None
+          and "Vision: not run" not in headless_notrun.stdout,
           headless_notrun.stdout[-500:])
+    vision_files7 = []
+    for root, _dirs, files in os.walk(headless_results):
+        if "_runs" in root.split(os.sep):
+            continue
+        for name in files:
+            if name.endswith("-vision.json"):
+                vision_files7.append(os.path.join(root, name))
+    vision_data7 = None
+    if vision_files7:
+        with open(sorted(vision_files7)[-1],
+                  encoding="utf-8") as handle:
+            vision_data7 = json.load(handle)
+    check("headless vision run marks the authored fixtures not run",
+          vision_data7 is not None
+          and vision_data7.get("not_run") == 10
+          and vision_data7.get("template_score") is not None,
+          str(vision_data7)[:200] if vision_data7 else "no file")
     bad_model = subprocess.run(
         [sys.executable, "-u", "ollama_system_test.py", "--headless",
          "--models", "no-such-model:9b", "--templates", "math"],
@@ -5211,10 +5262,10 @@ def main():
               and window9.template_list.count() == 20,
               f"{window9.model_list.count()} models, "
               f"{window9.template_list.count()} templates")
-        check("title bar shows v29",
-              window9.windowTitle() == "OLLAMA SYSTEM TEST v29",
+        check("title bar shows v30",
+              window9.windowTitle() == "OLLAMA SYSTEM TEST v30",
               window9.windowTitle())
-        check("__version__ is 29", app.__version__ == "29", app.__version__)
+        check("__version__ is 30", app.__version__ == "30", app.__version__)
 
         # ---------- v9 T13: filter boxes --------------------------------
         check("model filter box has its placeholder",
@@ -11159,7 +11210,7 @@ def main():
         real_api22w = updates_module.API_BASE
         real_codeload22w = updates_module.CODELOAD_BASE
         server22w, port22w = fake_github.start_fake_github(
-            latest_tag="v30")
+            latest_tag="v31")
         base22w = "http://127.0.0.1:%d" % port22w
         updates_module.API_BASE = base22w
         updates_module.CODELOAD_BASE = base22w
@@ -11176,7 +11227,7 @@ def main():
             check("live declined check finishes", done22j)
             check("live declined update is asked",
                   len(asked22w) == 1
-                  and asked22w[0].get("latest") == "30",
+                  and asked22w[0].get("latest") == "31",
                   str(asked22w))
             check("live declined update downloads nothing",
                   not any("/zipball/" in path
@@ -11191,7 +11242,7 @@ def main():
             install22w = os.path.join(scratch22w, "install")
             os.makedirs(os.path.join(install22w, "results"),
                         exist_ok=True)
-            for rel, data in fake_github.FAKE_V28_FILES.items():
+            for rel, data in fake_github.FAKE_V30_FILES.items():
                 path = os.path.join(install22w, *rel.split("/"))
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "wb") as handle:
@@ -11209,16 +11260,16 @@ def main():
                 and window22k._update_check_worker is None,
                 timeout=30)
             check("live accepted pull finishes", done22k)
-            check("live pull installs v30 on disk",
+            check("live pull installs v31 on disk",
                   open(os.path.join(
                       install22w, "ollama_system_test.py"),
-                      encoding="utf-8").read().find('"30"') >= 0)
+                      encoding="utf-8").read().find('"31"') >= 0)
             check("live pull keeps results",
                   open(os.path.join(
                       install22w, "results", "keep.txt"),
                       encoding="utf-8").read() == "my results")
-            check("running copy still says v29",
-                  window22k.windowTitle().endswith("v29"),
+            check("running copy still says v30",
+                  window22k.windowTitle().endswith("v30"),
                   window22k.windowTitle())
             fresh22 = subprocess.run(
                 [sys.executable, "-c",
@@ -11227,9 +11278,9 @@ def main():
                  "print(ollama_system_test.__version__)"
                  % install22w],
                 capture_output=True, text=True, timeout=60)
-            check("a fresh launch runs v30",
+            check("a fresh launch runs v31",
                   fresh22.returncode == 0
-                  and fresh22.stdout.strip() == "30",
+                  and fresh22.stdout.strip() == "31",
                   "rc=%s out=%r err=%s" % (
                       fresh22.returncode, fresh22.stdout,
                       fresh22.stderr))
@@ -11472,7 +11523,10 @@ def main():
             app.capabilities_from_show(
                 app.ollama_show("fake-smart:2b")))],
         [by24["math"], by24["refusal"]],
-        "sys24", machine24, results24)
+        "sys24", machine24, results24,
+        # (v28): a pinned seed — the generated repeats are the
+        # same set on every suite run.
+        seed=24)
     worker24a.model_done.connect(
         lambda name, result: results24a.__setitem__(name, result))
     worker24a.run_finished.connect(
@@ -11499,9 +11553,21 @@ def main():
           and {t.get("repeat") for t in math24.get("tasks", [])}
           == {1, 2, 3},
           str({k: math24.get(k) for k in ("passed", "total")}))
-    check("v24 later repeats ran the authored variants",
-          any("23 apples" in (t.get("prompt") or "")
-              for t in math24.get("tasks", [])))
+    # (v28): later repeats run generated instances, not the
+    # authored variants — each carries its generation info
+    # (seed + recipe), and the questions are fresh ones.
+    generated24 = [t for t in math24.get("tasks", [])
+                   if t.get("generated")]
+    check("v24 later repeats ran generated instances (v28)",
+          len(generated24) == 20
+          and all(t["generated"].get("seed") == 24
+                  for t in generated24)
+          and all(t["generated"].get("recipe")
+                  for t in generated24),
+          str(len(generated24)))
+    check("v24 generated repeats asked fresh questions",
+          len({t.get("prompt") for t in generated24}) >= 15,
+          str(len({t.get("prompt") for t in generated24})))
     check("v24 math ran with thinking on and recorded it",
           math24.get("thinking") is True
           and server24.think_seen.count(True) == 30,
@@ -11602,7 +11668,7 @@ def main():
         worker24c = app.BenchWorker(
             [app.ollama_target("fake-smart:2b")],
             [by24["knowledge"]],
-            "sys24", machine24, results24)
+            "sys24", machine24, results24, seed=24)
         worker24c.model_done.connect(
             lambda name, result: results24c.__setitem__(name, result))
         worker24c.run_finished.connect(
@@ -11638,7 +11704,7 @@ def main():
         worker24d = app.BenchWorker(
             [app.ollama_target("fake-smart:2b")],
             [by24["knowledge"]],
-            "sys24", machine24, results24)
+            "sys24", machine24, results24, seed=24)
         worker24d.model_done.connect(
             lambda name, result: results24d.__setitem__(name, result))
         worker24d.run_finished.connect(
@@ -13123,6 +13189,491 @@ def main():
     check("v26 GL: the vendored Light Engine imports",
           hasattr(_le_viewport, "Viewport")
           and hasattr(_le_scene, "new_scene"))
+
+    # ---------- v28: generators, scaffold toggle, RAG tracking ----------
+    # Every subject generates fresh content from the run seed;
+    # the scaffold (protocol + RAG) is off by default and pairs
+    # run bare-then-scaffold on the identical generated set.
+    templates28, _warns28 = _real_load_templates24()
+    by28 = {t["id"]: t for t in templates28}
+    check("v28 no generator spec was rejected at load",
+          not any("generator" in w or "fact bank" in w
+                  for w in _warns28),
+          str([w for w in _warns28 if "generator" in w]))
+
+    saved_images28 = os.environ.get("OST_IMAGES_DIR")
+    images28 = os.path.join(SCRATCH, "images28")
+    os.makedirs(images28, exist_ok=True)
+    os.environ["OST_IMAGES_DIR"] = images28
+
+    def _fingerprint28(template, task, repeat_index, seed, index):
+        inst, info = app.generate_task_instance(
+            template, task, repeat_index, seed, index)
+        return json.dumps(
+            {"instance": inst, "info": info},
+            sort_keys=True, default=str)
+
+    # Coverage: every scored task carries a generator spec,
+    # except the three audio transcription tasks — the app is
+    # stdlib-only and has no speech synthesis, so a fresh
+    # transcript clip cannot be produced in-app (named in the
+    # TEST-REPORT as the one blocked subject-part).
+    unspec28 = []
+    for template in templates28:
+        for task in template.get("tasks") or []:
+            if not task.get("generator"):
+                unspec28.append(task["id"])
+    check("v28 every task generates except audio transcription",
+          unspec28 == ["transcribe-hello", "transcribe-count",
+                       "transcribe-weather"],
+          str(unspec28))
+    check("v28 speed carries a template-level generator",
+          (by28["speed"].get("generator") or {}).get("recipe")
+          == "speed_fresh_text")
+
+    # Determinism + freshness, per subject, at the set level:
+    # the same seed reproduces the identical set; a different
+    # seed produces a different one.
+    for template in templates28:
+        tasks = [t for t in template.get("tasks") or []
+                 if t.get("generator")]
+        if not tasks:
+            continue
+        set_a = [_fingerprint28(template, t, 1, 28, i)
+                 for i, t in enumerate(tasks)]
+        set_a2 = [_fingerprint28(template, t, 1, 28, i)
+                  for i, t in enumerate(tasks)]
+        set_b = [_fingerprint28(template, t, 1, 29, i)
+                 for i, t in enumerate(tasks)]
+        check(f"v28 {template['id']}: same seed, identical set",
+              set_a == set_a2)
+        check(f"v28 {template['id']}: different seed, fresh set",
+              set_a != set_b)
+    fields_a, _info_a = app.generate_template_content(
+        by28["speed"], 28)
+    fields_b, _info_b = app.generate_template_content(
+        by28["speed"], 29)
+    check("v28 speed: fresh prompt text per seed",
+          fields_a != fields_b
+          and fields_a == app.generate_template_content(
+              by28["speed"], 28)[0])
+
+    # Generated records: the info block carries everything a
+    # score needs to be rechecked after the fact.
+    _inst28, info28 = app.generate_task_instance(
+        by28["math"], by28["math"]["tasks"][0], 1, 28, 0)
+    check("v28 generation info records seed, recipe, params, "
+          "prompt, expected",
+          info28["seed"] == 28 and info28["recipe"]
+          and isinstance(info28["params"], dict)
+          and info28["prompt"] and "expected" in info28,
+          str(info28)[:200])
+
+    # Math: expected answers recomputed independently from the
+    # recorded generation params, per recipe.
+    def _math_expected28(recipe, p):
+        if recipe == "math_add_sub":
+            return p["start"] - p["given_away"] + p["bought"]
+        if recipe == "math_distance":
+            return p["speed"] * p["hours"]
+        if recipe == "math_percent":
+            return p["percent"] * p["number"] / 100
+        if recipe == "math_share":
+            return p["total"] / p["friends"]
+        if recipe == "math_area":
+            return (p["length"] * p["width"] if p["ask"] == "area"
+                    else 2 * (p["length"] + p["width"]))
+        if recipe == "math_multistep_buy":
+            return p["total"] - p["sold"]
+        if recipe == "math_taxi":
+            return p["base"] + p["per_mile"] * p["miles"] + p["tip"]
+        if recipe == "math_fraction":
+            return round(p["left"], 4)
+        if recipe == "math_unit_convert":
+            return (p["milliliters"] if "milliliters" in p
+                    else p["grams"])
+        if recipe == "math_solve_x":
+            return (p["total"] - p["added"]) / p["coefficient"]
+        return None
+
+    math_bad28 = []
+    for idx, task in enumerate(by28["math"]["tasks"]):
+        inst, info = app.generate_task_instance(
+            by28["math"], task, 1, 28, idx)
+        want = _math_expected28(info["recipe"], info["params"])
+        got = info["expected"]
+        if want is None or abs(float(got) - float(want)) > 1e-9:
+            math_bad28.append((task["id"], info["recipe"], got, want))
+    check("v28 generated math expected answers recompute "
+          "independently", not math_bad28, str(math_bad28))
+
+    # The fake smart brain answers the generated set: authored
+    # tasks, their variants, and generated instances all score.
+    smart_bad28 = []
+    for idx, task in enumerate(by28["math"]["tasks"]):
+        for variant in [task] + (task.get("variants") or []):
+            merged = dict(task)
+            merged.update(variant)
+            answer = fake_ollama.answer_for(
+                "smart", merged["prompt"])
+            if not app.score_task(merged, answer)[0]:
+                smart_bad28.append(("authored", task["id"]))
+        inst, _info = app.generate_task_instance(
+            by28["math"], task, 1, 28, idx)
+        answer = fake_ollama.answer_for("smart", inst["prompt"])
+        if not app.score_task(inst, answer)[0]:
+            smart_bad28.append(("generated", task["id"]))
+    check("v28 the smart brain scores authored, variant and "
+          "generated math", not smart_bad28, str(smart_bad28))
+
+    # Coding: the reference solutions pass the generated tests;
+    # a wrong implementation fails them. Repair: the bank's
+    # reference passes, the injected buggy code fails.
+    REFS28 = {
+        "fib": "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a",
+        "fizzbuzz": app._REPAIR_BANK["fizzbuzz"][0],
+        "reverse_string": "def reverse_string(s):\n    return s[::-1]",
+        "is_prime": app._REPAIR_BANK["is_prime"][0],
+        "sort_numbers": "def sort_numbers(nums):\n    return sorted(nums)",
+        "count_vowels": "def count_vowels(s):\n    return sum(1 for ch in s if ch in 'aeiou')",
+        "max_number": "def max_number(nums):\n    return max(nums)",
+        "count_primes": "def count_primes(n):\n    total = 0\n    for i in range(2, n + 1):\n        if all(i % d for d in range(2, i)):\n            total += 1\n    return total",
+        "word_count": "def word_count(s):\n    return len(s.split())",
+        "celsius_to_fahrenheit": "def celsius_to_fahrenheit(c):\n    return c * 9 / 5 + 32",
+    }
+    coding_bad28 = []
+    for idx, task in enumerate(by28["coding"]["tasks"]):
+        inst, info = app.generate_task_instance(
+            by28["coding"], task, 1, 28, idx)
+        if task["id"] == "double-then-quadruple":
+            for turn in inst["turns"]:
+                mult = info["params"][
+                    "first_multiplier"
+                    if turn["function"] == info["params"]["first"]
+                    else "second_multiplier"]
+                ref = (f"def {turn['function']}(x):\n"
+                       f"    return {mult} * x")
+                if not app.score_task(turn, ref)[0]:
+                    coding_bad28.append(("chain-ref", turn["function"]))
+            continue
+        ref = REFS28[task["function"]]
+        if not app.score_task(inst, f"```python\n{ref}\n```")[0]:
+            coding_bad28.append(("ref", task["id"]))
+        wrong = (f"```python\ndef {task['function']}(*args):\n"
+                 f"    return None\n```")
+        if app.score_task(inst, wrong)[0]:
+            coding_bad28.append(("wrong-passed", task["id"]))
+    check("v28 generated coding tests pass the reference and "
+          "fail wrong code", not coding_bad28, str(coding_bad28))
+
+    repair_bad28 = []
+    for idx, task in enumerate(by28["code_repair"]["tasks"]):
+        inst, _info = app.generate_task_instance(
+            by28["code_repair"], task, 1, 28, idx)
+        ref = app._REPAIR_BANK[task["function"]][0]
+        if not app.score_task(inst, f"```python\n{ref}\n```")[0]:
+            repair_bad28.append(("ref", task["id"]))
+        buggy = re.search(
+            r"```python\n(.*?)```", inst["prompt"], re.S).group(1)
+        if app.score_task(inst, f"```python\n{buggy}\n```")[0]:
+            repair_bad28.append(("buggy-passed", task["id"]))
+    check("v28 generated repair tasks pass the reference and "
+          "fail the buggy code", not repair_bad28,
+          str(repair_bad28))
+
+    # Knowledge: a large bank, sampled without replacement, the
+    # sampled ids recorded; the smart brain knows the bank.
+    bank28 = by28["knowledge"].get("fact_bank") or []
+    check("v28 the knowledge fact bank is large",
+          len(bank28) >= 120, str(len(bank28)))
+    ids28 = []
+    knowledge_bad28 = []
+    for idx, task in enumerate(by28["knowledge"]["tasks"]):
+        inst, info = app.generate_task_instance(
+            by28["knowledge"], task, 1, 28, idx)
+        ids28.append(info.get("item_id"))
+        answer = fake_ollama.answer_for("smart", inst["prompt"])
+        if not app.score_task(inst, answer)[0]:
+            knowledge_bad28.append(task["id"])
+    check("v28 knowledge samples without replacement in a pass",
+          len(set(ids28)) == len(ids28) and all(ids28),
+          str(ids28))
+    check("v28 the smart brain answers generated knowledge",
+          not knowledge_bad28, str(knowledge_bad28))
+
+    # Refusal: generated harmful requests refuse, generated
+    # benign lookalikes comply, under the smart brain.
+    refusal_bad28 = []
+    for idx, task in enumerate(by28["refusal"]["tasks"]):
+        inst, _info = app.generate_task_instance(
+            by28["refusal"], task, 1, 28, idx)
+        answer = fake_ollama.answer_for("smart", inst["prompt"])
+        if not app.score_task(inst, answer)[0]:
+            refusal_bad28.append(task["id"])
+    check("v28 generated refusal set splits correctly",
+          not refusal_bad28, str(refusal_bad28))
+
+    # Vision: the generated image files exist and parse.
+    vision_bad28 = []
+    for idx, task in enumerate(by28["vision"]["tasks"]):
+        inst, _info = app.generate_task_instance(
+            by28["vision"], task, 1, 28, idx)
+        path = os.path.join(images28, inst["image"])
+        if not os.path.isfile(path):
+            vision_bad28.append((task["id"], "missing"))
+            continue
+        with open(path, "rb") as handle:
+            if app.image_info(handle.read()) is None:
+                vision_bad28.append((task["id"], "unparsable"))
+    check("v28 generated vision images exist and parse",
+          not vision_bad28, str(vision_bad28))
+
+    # The scaffold store, directly: chunking, retrieval, the
+    # usage heuristic, and the snapshot hash.
+    scaffold28_dir = os.path.join(SCRATCH, "scaffold28")
+    os.makedirs(os.path.join(scaffold28_dir, "knowledge"),
+                exist_ok=True)
+    with open(os.path.join(scaffold28_dir, "protocol.md"), "w",
+              encoding="utf-8") as handle:
+        handle.write("# Protocol\nWork step by step and check "
+                     "each step.\n")
+    with open(os.path.join(scaffold28_dir, "knowledge",
+                           "methods.md"), "w",
+              encoding="utf-8") as handle:
+        handle.write(
+            "# Methods\n\nTo find a percent of a number, "
+            "multiply the number by the percent and divide by "
+            "100. Example: 15 percent of 240 is 36.\n\n"
+            "Distance equals speed multiplied by time.\n")
+    store28 = app.load_scaffold_store(scaffold28_dir)
+    check("v28 the scaffold store loads protocol and chunks",
+          "step by step" in store28["protocol"]
+          and len(store28["chunks"]) >= 1,
+          str(store28)[:200])
+    hits28 = app.scaffold_retrieve(
+        store28["chunks"], "What is 15 percent of 240?")
+    check("v28 retrieval finds the percent method",
+          bool(hits28) and "percent" in hits28[0][0]["text"],
+          str(hits28)[:200])
+    check("v28 the usage heuristic labels overlap honestly",
+          app.answer_used_retrieval(
+              "To find a percent of a number, multiply by the "
+              "percent and divide by 100.",
+              [c["text"] for c, _s in hits28])["used"] is True
+          and app.answer_used_retrieval(
+              "The weather is nice today.",
+              [c["text"] for c, _s in hits28])["used"] is False)
+    hash28 = app.scaffold_snapshot_hash(scaffold28_dir)
+    with open(os.path.join(scaffold28_dir, "knowledge",
+                           "extra.md"), "w",
+              encoding="utf-8") as handle:
+        handle.write("Extra notes change the store.\n")
+    check("v28 the store hash moves when the store changes",
+          app.scaffold_snapshot_hash(scaffold28_dir) != hash28)
+    os.remove(os.path.join(scaffold28_dir, "knowledge",
+                           "extra.md"))
+    check("v28 the store hash is stable for the same store",
+          app.scaffold_snapshot_hash(scaffold28_dir) == hash28)
+
+    # Defaults: the worker starts bare, and the window's
+    # scaffold control starts on Bare with a random seed.
+    worker28_default = app.BenchWorker(
+        [], [], "sys28", app.machine_info(), RESULTS_DIR)
+    check("v28 the worker's scaffold mode defaults to bare",
+          worker28_default.scaffold_mode == "bare")
+    window28 = app.MainWindow()
+    check("v28 the window's scaffold control defaults to bare",
+          window28.scaffold_combo.currentIndex() == 0
+          and window28.seed_spin.value() == 0)
+    window28.close()
+
+    # End to end: a pair over Math at a pinned seed. The legs
+    # share the seed, the pair id, and the store hash taken
+    # before either leg ran; only the scaffold leg sends the
+    # protocol and passages, and only it writes back — after
+    # it finishes.
+    server28, _thread28 = fake_ollama.start_server()
+    host28, port28 = server28.server_address
+    os.environ["OLLAMA_HOST"] = f"http://{host28}:{port28}"
+    results28_dir = os.path.join(SCRATCH, "results28")
+    os.makedirs(results28_dir, exist_ok=True)
+    machine28 = app.machine_info()
+    math28 = json.loads(json.dumps(by28["math"]))
+    math28["repeats"] = 2
+    pair_hash28 = app.scaffold_snapshot_hash(scaffold28_dir)
+    learned28_dir = os.path.join(
+        scaffold28_dir, "knowledge", "learned")
+
+    def _run_leg28(mode):
+        got = {}
+        done = {"reason": None}
+        worker = app.BenchWorker(
+            [app.ollama_target("fake-smart:2b")], [math28],
+            "sys28", machine28, results28_dir,
+            scaffold_mode=mode, seed=28, pair_id="pair-28",
+            rag_hash=pair_hash28, scaffold_dir=scaffold28_dir)
+        worker.template_done.connect(
+            lambda label, data, path: got.__setitem__(
+                data["template"], (data, path)))
+        worker.run_finished.connect(
+            lambda reason: done.__setitem__("reason", reason))
+        worker.start()
+        ok = wait_until(lambda: done["reason"], timeout=300,
+                        app=qt_app)
+        worker.wait()
+        return ok, done["reason"], got, worker
+
+    payloads_before28 = len(server28.generate_payloads)
+    ok_bare28, reason_bare28, got_bare28, _w_bare28 = \
+        _run_leg28("bare")
+    payloads_bare28 = server28.generate_payloads[
+        payloads_before28:]
+    learned_after_bare28 = (
+        os.listdir(learned28_dir)
+        if os.path.isdir(learned28_dir) else [])
+    ok_scaf28, reason_scaf28, got_scaf28, worker_scaf28 = \
+        _run_leg28("scaffold")
+    payloads_scaf28 = server28.generate_payloads[
+        payloads_before28 + len(payloads_bare28):]
+
+    check("v28 pair legs both finish",
+          ok_bare28 and reason_bare28 == "done"
+          and ok_scaf28 and reason_scaf28 == "done",
+          f"{reason_bare28}/{reason_scaf28}")
+    bare_data28 = got_bare28["math"][0]
+    scaf_data28 = got_scaf28["math"][0]
+    check("v28 pair legs record the shared seed, pair id, hash",
+          bare_data28["seed"] == 28 and scaf_data28["seed"] == 28
+          and bare_data28["scaffold"]["pair_id"] == "pair-28"
+          and scaf_data28["scaffold"]["pair_id"] == "pair-28"
+          and bare_data28["scaffold"]["rag_snapshot_hash"]
+          == pair_hash28
+          and scaf_data28["scaffold"]["rag_snapshot_hash"]
+          == pair_hash28,
+          str(scaf_data28.get("scaffold")))
+    bare_prompts28 = {(t["id"], t["repeat"]): t["prompt"]
+                      for t in bare_data28["tasks"]}
+    scaf_prompts28 = {(t["id"], t["repeat"]): t["prompt"]
+                      for t in scaf_data28["tasks"]}
+    check("v28 pair legs asked identical generated questions",
+          bare_prompts28 == scaf_prompts28
+          and len(bare_prompts28) == 20,
+          str(len(bare_prompts28)))
+    check("v28 bare records say the scaffold is off, with the "
+          "timings present",
+          all(t["scaffold"]["mode"] == "off"
+              and t.get("ttft_s") is not None
+              and t.get("decode_tok_s") is not None
+              and t.get("total_s") is not None
+              for t in bare_data28["tasks"]))
+    scaf_records28 = scaf_data28["tasks"]
+    check("v28 scaffold records carry the RAG tracking",
+          all(t["scaffold"]["mode"] == "scaffold"
+              and isinstance(
+                  t["scaffold"]["chunks_retrieved"], list)
+              and t["scaffold"]["protocol_tokens"] > 0
+              and t["scaffold"]["question_tokens"] > 0
+              and 0 <= t["scaffold"]["rag_share_pct"] <= 100
+              and "answer_used_retrieval_heuristic"
+              in t["scaffold"]
+              and t.get("ttft_s") is not None
+              and t.get("total_s") is not None
+              for t in scaf_records28),
+          str(scaf_records28[0].get("scaffold"))[:300])
+    check("v28 retrieval actually retrieved for some tasks",
+          any(t["scaffold"]["chunks_retrieved"]
+              for t in scaf_records28))
+    check("v28 the bare leg sent no system prompt or passages",
+          all("system" not in p
+              and "Reference material" not in (p.get("prompt") or "")
+              for p in payloads_bare28),
+          str(len(payloads_bare28)))
+    # The warmup call is not a task and carries no scaffold;
+    # every task call must carry the protocol as its system.
+    task_payloads28 = [
+        p for p in payloads_scaf28
+        if p.get("prompt") != "Say hello in one sentence."]
+    check("v28 the scaffold leg sent the protocol as system",
+          len(task_payloads28) == 20
+          and all("step by step" in (p.get("system") or "")
+                  for p in task_payloads28),
+          str(len(payloads_scaf28)))
+    check("v28 the scaffold leg sent retrieved passages",
+          any("Reference material from your knowledge store:"
+              in (p.get("prompt") or "")
+              for p in payloads_scaf28))
+    check("v28 the bare leg wrote nothing back",
+          learned_after_bare28 == [], str(learned_after_bare28))
+    learned_files28 = (
+        sorted(os.listdir(learned28_dir))
+        if os.path.isdir(learned28_dir) else [])
+    events28 = worker_scaf28._manifest.get(
+        "scaffold_writeback") or []
+    check("v28 write-back fired after the scaffold leg and "
+          "was logged",
+          len(learned_files28) == 1
+          and learned_files28[0].startswith("learned-")
+          and len(events28) == 1
+          and os.path.basename(events28[0]["file"])
+          == learned_files28[0]
+          and events28[0]["bytes"] > 0
+          and events28[0]["chunks_added"] >= 1,
+          f"files={learned_files28} events={events28}")
+    check("v28 the store hash moved only after write-back",
+          app.scaffold_snapshot_hash(scaffold28_dir)
+          != pair_hash28)
+
+    # Headless parity: a pair run end to end from the CLI.
+    headless28_dir = os.path.join(SCRATCH, "headless28")
+    os.makedirs(headless28_dir, exist_ok=True)
+    env28 = dict(os.environ)
+    env28.pop("DISPLAY", None)
+    env28.pop("QT_QPA_PLATFORM", None)
+    env28["OLLAMA_HOST"] = f"http://{host28}:{port28}"
+    env28["OST_RESULTS_DIR"] = headless28_dir
+    env28["OST_SCAFFOLD_DIR"] = scaffold28_dir
+    headless28 = subprocess.run(
+        [sys.executable, "-u", "ollama_system_test.py",
+         "--headless", "--models", "fake-smart:2b",
+         "--templates", "math", "--scaffold", "pair",
+         "--seed", "28"],
+        cwd=PKG_DIR, env=env28, capture_output=True, text=True,
+        timeout=300)
+    check("v28 headless pair run exits 0",
+          headless28.returncode == 0,
+          f"exit {headless28.returncode}\n"
+          f"{headless28.stdout[-300:]}\n"
+          f"{headless28.stderr[-300:]}")
+    check("v28 headless pair ran both legs",
+          "Pair leg: bare" in headless28.stdout
+          and "Pair leg: scaffold" in headless28.stdout,
+          headless28.stdout[-300:])
+    pair_files28 = []
+    for root, _dirs, files in os.walk(headless28_dir):
+        if "_runs" in root.split(os.sep):
+            continue
+        for name in files:
+            if name.endswith("-math.json"):
+                pair_files28.append(os.path.join(root, name))
+    pair_modes28 = set()
+    pair_ids28 = set()
+    for path in pair_files28:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        pair_modes28.add((data.get("scaffold") or {}).get("mode"))
+        pair_ids28.add((data.get("scaffold") or {}).get("pair_id"))
+    check("v28 headless pair files carry both modes, one pair id",
+          len(pair_files28) == 2
+          and pair_modes28 == {"bare", "scaffold"}
+          and len(pair_ids28) == 1 and None not in pair_ids28,
+          f"files={pair_files28} modes={pair_modes28} "
+          f"ids={pair_ids28}")
+
+    if saved_images28 is None:
+        os.environ.pop("OST_IMAGES_DIR", None)
+    else:
+        os.environ["OST_IMAGES_DIR"] = saved_images28
+
 
     shutil.rmtree(SCRATCH, ignore_errors=True)
 

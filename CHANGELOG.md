@@ -1,5 +1,81 @@
 # Changelog
 
+## v30 (2026-11-21)
+
+Fresh tests every run, and a cognitive scaffold you can
+switch on, pair against bare, and learn from - ported
+onto the v29 tree, so the one-model surface, the weights
+view and the report-card picture all stay as they were.
+
+- Every test subject now GENERATES its content fresh for
+  each run, from the run's seed: math, coding and reasoning
+  draw new numbers, names, orderings and test cases with
+  the expected answers computed by the generator; vision
+  renders fresh images (ground truth is what was drawn);
+  summarization assembles fresh passages with known key
+  facts; role, refusal, instruction, planning, structured
+  output, tool calling, multi-turn, long context, grounded
+  QA, anchor, code repair, speed and image generation all
+  draw fresh instances from their slots; the audio speech
+  tasks speak fresh lines. Repeat 1 of a run is still the
+  authored task - the anchor; later repeats are generated
+  instances of the same skill at the same difficulty, not
+  the old authored-variant cycle. The one honest exception
+  is Knowledge: world facts cannot be invented, so it
+  samples WITHOUT replacement from a shipped bank of 124
+  verified facts, each with several phrasings, and records
+  the sampled item ids. (Audio transcription is the one
+  part that cannot generate: the app is stdlib-only and
+  has no speech synthesis, so its three tasks keep the
+  shipped recordings.)
+- The generators key off the current authored sets - the
+  v29 sets, every scored subject at exactly 10 tasks.
+  Nothing v29 trimmed came back: Anchor generates from
+  its kept five MMLU-style and five GSM8K-style tasks,
+  Coding from its 10 (the dropped standalone is_prime
+  stays dropped).
+- Every generated task's result records the seed, the
+  recipe, the drawn parameters, the exact generated prompt
+  and the expected answer, so a score stays checkable
+  after the fact. The same seed always reproduces the
+  same set; a pair's two legs share it exactly. Generator
+  specs live in the template JSON files (a recipe name
+  and parameters per task), ready to extend.
+- A Cognitive scaffold control on the setup tab - Bare by
+  default, nothing on unless you choose it. Scaffold mode
+  gives the model the protocol document
+  (scaffold/protocol.md, plain text, yours to edit) as its
+  system prompt and adds the best-matching passages from
+  the knowledge store (scaffold/knowledge/, chunked,
+  stdlib TF-IDF retrieval, top 3) to each question. Pair
+  mode runs the bare leg and then the scaffold leg on the
+  identical generated set, with the store frozen under
+  one snapshot hash recorded in both legs and a shared
+  pair id, so Compare can diff them. A seed box pins the
+  generated set (0 = a fresh random seed every run).
+  Headless parity: --scaffold bare|scaffold|pair and
+  --seed.
+- Per-task RAG tracking in scaffold results: the retrieved
+  chunks (id, source file, score, tokens), retrieval time,
+  the context composition (protocol / question / RAG token
+  counts and the RAG share), and an answer-used-retrieval
+  flag that is labelled as the heuristic it is. The usual
+  timings (TTFT, decode speed, total time, token counts,
+  RAM) are recorded per task on both legs, so the cost of
+  the scaffold is visible next to its benefit.
+- Write-back: after a scaffold run - or a whole pair -
+  fully completes, OST appends a learned-notes document
+  (per task: the question, pass or fail, the chunks used)
+  to scaffold/knowledge/learned/, one per model, and logs
+  the event (file, bytes, chunks added) in the run's
+  manifest. Never mid-pair: the store a pair started with
+  is the store both legs were measured against. The next
+  run can retrieve those notes on fresh questions.
+- Nothing else moved: the per-model patch-field surface,
+  the weights view, the report-card surface picture, the
+  uncapped warm-up and the equal 10-task subjects are
+  exactly as v29 shipped them.
+
 ## v29 (2026-11-21)
 
 The surface is one model's surface now - and it goes on
